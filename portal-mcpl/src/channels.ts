@@ -5,7 +5,7 @@
  * MCPL channel id is just `portal:<channelId>` — no guild prefix needed.
  * Threads carry their parent id in metadata.
  */
-import type { ChannelDescriptor } from '@connectome/mcpl-core';
+import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import type { PortalChannel } from '@connectome/portal-protocol';
 
 export function portalChannelId(channelId: string): string {

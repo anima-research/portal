@@ -21,7 +21,7 @@
   "mcpServers": {
     "portal": {
       "command": "node",
-      "args": ["/Users/antra/connectome-local/portal-mcpl/dist/src/server-cli.js"],
+      "args": ["/Users/antra/connectome-local/portal-stack/portal-mcpl/dist/src/server-cli.js"],
       "env": {
         "PORTAL_URL": "ws://127.0.0.1:8790",
         "PORTAL_TOKEN": "replace-with-the-persona-token-from-relay-identity",

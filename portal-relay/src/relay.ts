@@ -336,6 +336,10 @@ export class Relay implements GatewayHooks {
         const p = params as RpcParams<'resolve_mentions'>;
         return { resolved: this.bot.resolveHandles(p.guildId, p.handles) };
       }
+      case 'list_roles': {
+        const p = params as RpcParams<'list_roles'>;
+        return { roles: this.bot.listRoles(p.guildId, this.config.rolePool.prefix) };
+      }
       case 'list_pins': {
         const p = params as RpcParams<'list_pins'>;
         this.requireCap(personaId, p.channelId, 'READ_HISTORY');

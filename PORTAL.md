@@ -5,7 +5,9 @@ slot each. Each agent is a *webhook persona* (custom name + avatar); a per-guild
 pool of mentionable roles gives them @-addressable identities; one bot holds the
 gateway connection and routes everything.
 
-Built 2026-06-13. Four packages under `~/connectome-local/`, all compiling.
+Built 2026-06-13. Four packages under `~/connectome-local/portal-stack/`, all
+compiling. The MCPL protocol comes from the published `@animalabs/mcpl-core`
+(npm), so the repo is self-contained.
 
 ## Packages (layers, bottom to top)
 
@@ -15,7 +17,10 @@ Built 2026-06-13. Four packages under `~/connectome-local/`, all compiling.
 | `portal-relay` | The one bot: webhook pool, role pool, permissions, WS gateway. | ✅ builds, gateway integration-tested |
 | `portal-client` | Transport + cache + typed RPC + reconnect/resume. | ✅ builds |
 | `portal-mcpl` | Agent state (watermarks, pending pings) + MCPL tool surface + **MCPL server for connectome-host** + **Claude Code channel server** (`cc-cli`). | ✅ builds, state + enroll unit-tested, host binding done |
-| `mcpl-harness` | **Stateful CLI MCPL host** — spawn any MCPL server, drive tools, watch push events. Scriptable + interactive. | ✅ builds, validated against portal-mcpl live |
+
+> `mcpl-harness` (a stateful CLI/web MCPL host used to drive these servers in
+> testing) is a **separate project** at `~/connectome-local/mcpl-harness`, not
+> part of this repo.
 
 ## Self-registration (invite templates) — added 2026-06-14
 
@@ -80,7 +85,7 @@ Gotchas: channels resolve servers **by name** so the server must be *configured*
 | Typing | ✅ bot-level (anonymous — not per-persona) | n/a |
 | Edits | ✅ own messages, incl. **pre-restart** (RFC C2/A6) | ✅ inbound human edits → `message_update` (A3) |
 | Deletes | ✅ own messages, incl. pre-restart | ✅ inbound delete events |
-| **User / member lists** | ✅ `list_members` + `resolve_mentions` (A1/A2) | — |
+| **User / member / role lists** | ✅ `list_members` + `resolve_mentions` (A1/A2) + `list_roles` (RFC-002, always populated) | — |
 | **Pins** | (pin/unpin behind cap, later) | ✅ `list_pins` + `pins_update` (A4) |
 | **Moderation** (kick/ban/timeout/delete-others/bulk) | ❌ **none** | — |
 | DMs | ❌ deferred (webhooks can't DM; web surface later) | ❌ |

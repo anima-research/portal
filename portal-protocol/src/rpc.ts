@@ -1,7 +1,7 @@
 import type { PortalChannel, PortalGuild } from './channel.js';
 import type { ChannelId, GuildId, PersonaId, RelayMessageId, RpcId, ThreadId, UserId } from './ids.js';
 import type { PortalMessage } from './message.js';
-import type { PortalMember } from './members.js';
+import type { PortalMember, PortalRole } from './members.js';
 
 /** A file to upload, read from a local path on the host running the client. */
 export interface OutgoingFile {
@@ -134,6 +134,15 @@ export interface ResolveMentionsResult {
   resolved: Record<string, UserId | null>;
 }
 
+export interface ListRolesParams {
+  guildId: GuildId;
+}
+export interface ListRolesResult {
+  /** The guild's full role catalog. Always populated (roles arrive with the
+   *  base Guilds intent — no privileged intent or availability flag needed). */
+  roles: PortalRole[];
+}
+
 // ── Pinned messages (RFC A4) ──
 
 export interface ListPinsParams {
@@ -168,6 +177,7 @@ export interface RpcMethods {
   list_subscriptions: { params: Empty; result: ListSubscriptionsResult };
   list_members: { params: ListMembersParams; result: ListMembersResult };
   resolve_mentions: { params: ResolveMentionsParams; result: ResolveMentionsResult };
+  list_roles: { params: ListRolesParams; result: ListRolesResult };
   list_pins: { params: ListPinsParams; result: ListPinsResult };
 }
 

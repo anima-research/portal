@@ -32,7 +32,7 @@
  */
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { McplConnection } from '@connectome/mcpl-core';
+import { McplConnection } from '@animalabs/mcpl-core';
 import { PortalClient, loadOrEnrollCreds } from '@connectome/portal-client';
 import { PortalAgent } from './agent.js';
 import { PortalCcChannelServer } from './server-cc.js';

@@ -317,6 +317,20 @@ export class DiscordBot implements WebhookOps, RoleOps {
     return out;
   }
 
+  /** The guild's full role catalog (id + name + pooled flag). Roles arrive with
+   *  the base Guilds intent, so this is always populated — no availability flag.
+   *  `poolPrefix` flags the relay's persona-addressing pool roles. */
+  listRoles(guildId: string, poolPrefix: string): Array<{ id: string; guildId: string; name: string; pooled: boolean }> {
+    const guild = this.client.guilds.cache.get(guildId);
+    if (!guild) return [];
+    return [...guild.roles.cache.values()].map((r) => ({
+      id: r.id,
+      guildId,
+      name: r.name,
+      pooled: r.name.startsWith(poolPrefix),
+    }));
+  }
+
   /** Resolve bare handles to user ids (unique case-insensitive match, else null). */
   resolveHandles(guildId: string, handles: string[]): Record<string, string | null> {
     const guild = this.client.guilds.cache.get(guildId);

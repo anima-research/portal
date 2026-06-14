@@ -19,7 +19,6 @@
   "exclude": ["node_modules", "dist"],
   "references": [
     { "path": "../portal-protocol" },
-    { "path": "../portal-client" },
-    { "path": "../mcpl-core-ts" }
+    { "path": "../portal-client" }
   ]
 }

@@ -20,7 +20,7 @@
  *
  * The relay must be running and reachable at PORTAL_URL.
  */
-import { McplConnection } from '@connectome/mcpl-core';
+import { McplConnection } from '@animalabs/mcpl-core';
 import { PortalClient } from '@connectome/portal-client';
 import { PortalAgent } from './agent.js';
 import { PortalMcplServer } from './server.js';

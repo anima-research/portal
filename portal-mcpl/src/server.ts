@@ -27,7 +27,7 @@ import {
   type McplInitializeParams,
   type McplInitializeResult,
   type PushEventParams,
-} from '@connectome/mcpl-core';
+} from '@animalabs/mcpl-core';
 import type { PortalClient } from '@connectome/portal-client';
 import type { PortalMessage } from '@connectome/portal-protocol';
 import type { PortalAgent } from './agent.js';

@@ -168,6 +168,18 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'list_roles',
+    description:
+      'List a guild\'s role catalog (id + name + pooled flag). Always fully ' +
+      'populated (roles need no privileged intent) — use it to resolve the role ' +
+      'ids in list_members / message mentions to names for name-based authorization.',
+    inputSchema: {
+      type: 'object',
+      properties: { guildId: { type: 'string' } },
+      required: ['guildId'],
+    },
+  },
+  {
     name: 'list_pins',
     description: 'List pinned messages in a channel. Subscribe to receive pins_update events.',
     inputSchema: {

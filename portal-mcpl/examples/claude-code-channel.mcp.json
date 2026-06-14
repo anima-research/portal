@@ -3,7 +3,7 @@
   "mcpServers": {
     "portal": {
       "command": "node",
-      "args": ["/ABS/PATH/connectome-local/portal-mcpl/dist/src/cc-cli.js"],
+      "args": ["/ABS/PATH/connectome-local/portal-stack/portal-mcpl/dist/src/cc-cli.js"],
       "env": {
         "PORTAL_URL": "ws://127.0.0.1:8790",
         "PORTAL_INVITE": "replace-with-an-invite-code-from-mint-invite",

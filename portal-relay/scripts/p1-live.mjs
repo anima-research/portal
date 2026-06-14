@@ -57,6 +57,13 @@ async function main() {
       r.resolved[sample.username] === sample.userId ? '✅' : '⚠️ (ambiguous/none)');
   }
 
+  // RFC-002: list_roles — catalog with @everyone + pooled portal-* flagged.
+  const { roles } = await lena.call('list_roles', { guildId: GUILD });
+  const hasEveryone = roles.some((r) => r.name === '@everyone');
+  const pooledOk = roles.every((r) => r.pooled === r.name.startsWith('portal-')) && roles.some((r) => r.pooled);
+  const memberRolesResolve = sample ? sample.roles.every((id) => roles.some((r) => r.id === id)) : true;
+  log('RFC-002 list_roles:', `${roles.length} roles; @everyone:${hasEveryone ? '✅' : '❌'} pooled-flag:${pooledOk ? '✅' : '❌'} member-roleIds-resolve:${memberRolesResolve ? '✅' : '❌'}`);
+
   // External webhook post (so the relay sees a non-owned message it can edit-track).
   const wh = await api('POST', `/channels/${CH}/webhooks`, { name: 'P1Outsider' });
   try {

@@ -6,7 +6,7 @@
  * read-state is AgentState's; this class is the glue + the tool dispatch table.
  *
  * The remaining integration seam is binding this to an McplConnection (from
- * @connectome/mcpl-core): forward tools/list → `toolDefinitions`, tools/call →
+ * @animalabs/mcpl-core): forward tools/list → `toolDefinitions`, tools/call →
  * `handleToolCall`, and emit a PUSH_EVENT whenever `onPing` fires. That binding
  * is intentionally not done here so this package stays transport-agnostic and
  * unit-testable. See README for the ~30-line adapter sketch.
@@ -99,6 +99,8 @@ export class PortalAgent {
           guildId: str(args.guildId),
           handles: (args.handles as string[]) ?? [],
         });
+      case 'list_roles':
+        return this.client.call('list_roles', { guildId: str(args.guildId) });
       case 'list_pins':
         return this.client.call('list_pins', { channelId: str(args.channelId) });
       case 'get_pending_pings':

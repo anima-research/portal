@@ -1,16 +1,17 @@
+# build output & deps
 node_modules/
 dist/
-*.log
 *.tsbuildinfo
-.DS_Store
+*.log
 
-# Runtime secrets — NEVER commit. The relay's live identity/permissions/invites
-# files hold real persona tokens. Example configs (*.example.json) and test
-# fixtures (*.test.json, fake tokens) are intentionally tracked.
+# live config & secrets — *.test.json fixtures and *.example.json ARE committed
 identity.json
 permissions.json
 invites.json
-*creds*.json
-.creds/
-.relay/
-.env
+*attribution*.json
+*.creds.json
+.portal/
+
+# harness runtime state
+.xgate-state.json
+*-harness-state.json
