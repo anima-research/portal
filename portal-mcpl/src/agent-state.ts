@@ -144,6 +144,25 @@ export class AgentState {
     return this.unseen.get(channelId)?.length ?? 0;
   }
 
+  /** Flush all unseen messages (oldest first across channels), advancing
+   *  watermarks and clearing pending pings. Used to fold accumulated ambient
+   *  context into a single wake instead of one wake per message. */
+  drainUnread(): PortalMessage[] {
+    const all: PortalMessage[] = [];
+    for (const [channelId, list] of this.unseen) {
+      if (list.length === 0) continue;
+      all.push(...list);
+      const latest = list[list.length - 1].createdAt;
+      const prev = this.watermarks.get(channelId);
+      if (!prev || latest > prev) this.watermarks.set(channelId, latest);
+    }
+    this.unseen.clear();
+    this.pings = [];
+    all.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+    if (all.length) this.emitChange();
+    return all;
+  }
+
   toJSON(): SerializedState {
     return {
       watermarks: Object.fromEntries(this.watermarks),

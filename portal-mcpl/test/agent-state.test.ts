@@ -84,3 +84,15 @@ test('subscriptions survive serialize/restore', () => {
   const restored = AgentState.fromJSON(JSON.parse(JSON.stringify(s.toJSON())));
   assert.deepEqual(restored.subscriptionList().sort(), ['c1', 'c2']);
 });
+
+test('drainUnread returns time-ordered unseen, then clears state', () => {
+  const s = new AgentState();
+  s.ingest(msg('m1', 'c1', '2026-01-01T00:00:01Z'), false, []);
+  s.ingest(msg('m2', 'c2', '2026-01-01T00:00:00Z'), false, []);
+  s.ingest(msg('m3', 'c1', '2026-01-01T00:00:03Z'), true, ['role_mention']);
+  const drained = s.drainUnread();
+  assert.deepEqual(drained.map((m) => m.id), ['m2', 'm1', 'm3']); // sorted by createdAt
+  assert.equal(s.drainUnread().length, 0); // cleared
+  assert.equal(s.pendingPings().length, 0); // pings cleared
+  assert.equal(s.unreadCount('c1'), 0);
+});

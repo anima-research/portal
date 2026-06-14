@@ -36,6 +36,13 @@
  * subscribed via the in-session tools (subscribe_channel) are saved here and
  * reapplied on every (re)connect — so PORTAL_SUBSCRIPTIONS is just an optional
  * first-run seed, not a per-launch requirement.
+ *
+ * Attention model: only *addressed* messages (mentions/replies) wake the agent.
+ * Ambient messages in subscribed channels accumulate and are folded into the
+ * next wake as prepended context (with a first-contact history backfill), capped
+ * at PORTAL_CONTEXT_CAP messages (default 80; older are truncated — the agent can
+ * fetch_history to scroll back). So the agent sees non-mention traffic without a
+ * wake per message and without spending a turn on a fetch tool.
  */
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';

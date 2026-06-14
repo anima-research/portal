@@ -32,6 +32,11 @@ const CHANNEL_NOTIFY = 'notifications/claude/channel';
 
 export class PortalCcChannelServer {
   private conn: McplConnection | null = null;
+  /** Channels we've already backfilled history for (first-contact context). */
+  private seeded = new Set<string>();
+  /** Max messages to prepend per wake; older are truncated (scroll back via
+   *  fetch_history). Configurable via PORTAL_CONTEXT_CAP (default 80). */
+  private readonly contextCap = Math.max(1, Number(process.env.PORTAL_CONTEXT_CAP ?? '80') || 80);
 
   constructor(
     private client: PortalClient,
@@ -121,27 +126,105 @@ export class PortalCcChannelServer {
   // ── Portal inbound → Claude Code channel notification ──
 
   private wireClient(): void {
-    this.client.on('message', (e) => this.pushMessage(e.message, e.addressedToMe, e.reasons));
+    this.client.on('message', (e) => {
+      void this.pushMessage(e.message, e.addressedToMe, e.reasons).catch((err) =>
+        console.error('[portal-cc] push failed:', (err as Error).message),
+      );
+    });
   }
 
-  private pushMessage(message: PortalMessage, addressedToMe: boolean, reasons: string[]): void {
+  /**
+   * Only an *addressed* message (mention/reply) wakes Claude Code. Ambient
+   * messages accumulate in unread (ingested by PortalAgent) and are folded into
+   * the next wake as prepended context — so the agent sees non-mention traffic
+   * without a wake per message and without spending a turn on a fetch tool.
+   *
+   * The prepended context is capped at `contextCap` (most recent wins); on first
+   * contact with a channel we backfill recent history so the first ping carries
+   * real prior context, not just whatever arrived since connect.
+   */
+  private async pushMessage(message: PortalMessage, addressedToMe: boolean, reasons: string[]): Promise<void> {
     if (!this.conn) return;
-    // Claude Code channel payload: a string body + flat string-keyed meta used
-    // for routing/labeling. We thread channelId through so the model can reply
-    // with the send_message tool.
+    if (!addressedToMe) return; // ambient: surfaced as context on the next wake
+    const conn = this.conn;
+    const channelId = message.channelId;
+
+    // Flush everything unseen (includes this message), oldest first.
+    const drained = this.agent.state.drainUnread();
+
+    // First contact with this channel → backfill recent history for context.
+    let triggerCtx = drained.filter((m) => m.channelId === channelId);
+    if (!this.seeded.has(channelId)) {
+      this.seeded.add(channelId);
+      try {
+        const hist = await this.client.fetchHistory({ channelId, limit: this.contextCap });
+        triggerCtx = dedupeById([...hist.messages, ...triggerCtx]);
+      } catch {
+        /* best-effort backfill */
+      }
+    }
+
+    // Combine other channels' unread + this channel's context, time-ordered, capped.
+    const others = drained.filter((m) => m.channelId !== channelId);
+    let all = dedupeById([...others, ...triggerCtx]).sort((a, b) =>
+      a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0,
+    );
+    let omitted = 0;
+    if (all.length > this.contextCap) {
+      omitted = all.length - this.contextCap;
+      all = all.slice(all.length - this.contextCap);
+    }
+
     const meta: Record<string, string> = {
       source: 'discord',
-      channelId: message.channelId,
+      channelId,
       author: authorLabel(message),
       messageId: message.id,
-      addressed: String(addressedToMe),
+      addressed: 'true',
     };
     if (message.threadId) meta.threadId = message.threadId;
     if (message.guildId) meta.guildId = message.guildId;
     if (reasons.length) meta.reasons = reasons.join(',');
 
-    this.conn.sendNotification(CHANNEL_NOTIFY, { content: render(message), meta });
+    conn.sendNotification(CHANNEL_NOTIFY, { content: this.buildContent(all, message, omitted), meta });
   }
+
+  /** Render the wake payload: optional truncation note, channel-labeled lines,
+   *  with the triggering message marked. */
+  private buildContent(messages: PortalMessage[], trigger: PortalMessage, omitted: number): string {
+    const lines: string[] = [];
+    if (omitted > 0) {
+      lines.push(`[${omitted} earlier message(s) omitted — use fetch_history to scroll back]`);
+    }
+    let lastChannel = '';
+    for (const m of messages) {
+      const label = this.channelLabel(m.channelId);
+      if (label !== lastChannel) {
+        lines.push(`\n— ${label} —`);
+        lastChannel = label;
+      }
+      const line = render(m);
+      lines.push(m.id === trigger.id ? `» ${line}   ⟵ addressed to you` : line);
+    }
+    return lines.join('\n');
+  }
+
+  private channelLabel(channelId: string): string {
+    const name = this.client.cache.getChannel(channelId)?.name;
+    return name ? `#${name}` : channelId;
+  }
+}
+
+/** De-duplicate messages by id, keeping first occurrence. */
+function dedupeById(messages: PortalMessage[]): PortalMessage[] {
+  const seen = new Set<string>();
+  const out: PortalMessage[] = [];
+  for (const m of messages) {
+    if (seen.has(m.id)) continue;
+    seen.add(m.id);
+    out.push(m);
+  }
+  return out;
 }
 
 function authorLabel(m: PortalMessage): string {
