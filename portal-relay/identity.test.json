@@ -1,0 +1,6 @@
+{
+  "personas": [
+    { "id": "mythos", "displayName": "Mythos", "avatar": "", "token": "tok-mythos" },
+    { "id": "lena", "displayName": "Lena", "avatar": "", "token": "tok-lena" }
+  ]
+}

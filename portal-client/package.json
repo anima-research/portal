@@ -1,0 +1,27 @@
+{
+  "name": "@connectome/portal-client",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "description": "General-purpose portal client: WS transport, client-side cache, typed RPC, reconnect/resume.",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@connectome/portal-protocol": "file:../portal-protocol",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.5.0",
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

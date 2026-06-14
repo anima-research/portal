@@ -1,0 +1,32 @@
+{
+  "name": "@connectome/portal-relay",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "bin": {
+    "portal-relay": "./dist/src/index.js"
+  },
+  "description": "One Discord bot fronting many webhook personas: webhook + role pools, permission engine, WS gateway.",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "start": "node --import tsx src/index.ts",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@connectome/portal-protocol": "file:../portal-protocol",
+    "discord.js": "^14.16.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.5.0",
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

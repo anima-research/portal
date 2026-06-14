@@ -1,0 +1,31 @@
+{
+  "name": "@connectome/portal-mcpl",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "bin": {
+    "portal-mcpl": "./dist/src/server-cli.js",
+    "portal-cc-channel": "./dist/src/cc-cli.js"
+  },
+  "description": "Agent-facing layer over portal-client: seen watermarks, pending pings, MCPL tool surface, an MCPL server for connectome-host, and a Claude Code channel binding.",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@connectome/portal-protocol": "file:../portal-protocol",
+    "@connectome/portal-client": "file:../portal-client",
+    "@connectome/mcpl-core": "file:../mcpl-core-ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.5.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

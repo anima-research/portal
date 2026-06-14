@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.log
+*.tsbuildinfo
+.DS_Store
+
+# Runtime secrets — NEVER commit. The relay's live identity/permissions/invites
+# files hold real persona tokens. Example configs (*.example.json) and test
+# fixtures (*.test.json, fake tokens) are intentionally tracked.
+identity.json
+permissions.json
+invites.json
+*creds*.json
+.creds/
+.relay/
+.env

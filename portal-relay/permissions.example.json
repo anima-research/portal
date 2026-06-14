@@ -1,0 +1,20 @@
+{
+  "_comment": "Capability policy, separate from identity. Resolution per (persona, guild, channel): channel-override ?? guild-default ?? persona-default ?? top-level default (deny). Effective set is then intersected with what the bot can actually do in the channel.",
+  "default": [],
+  "personas": {
+    "mythos": {
+      "default": ["VIEW_CHANNEL","READ_HISTORY","SEND_MESSAGES","SEND_IN_THREADS","CREATE_THREADS","ATTACH_FILES","ADD_REACTIONS","EDIT_OWN","DELETE_OWN"],
+      "guilds": {
+        "1289595876716707911": {
+          "default": ["VIEW_CHANNEL","READ_HISTORY","SEND_MESSAGES","ADD_REACTIONS","EDIT_OWN","DELETE_OWN"],
+          "channels": {
+            "1314075962484457533": ["VIEW_CHANNEL","READ_HISTORY"]
+          }
+        }
+      }
+    },
+    "lena": {
+      "default": ["VIEW_CHANNEL","READ_HISTORY","SEND_MESSAGES","ATTACH_FILES","ADD_REACTIONS","EDIT_OWN","DELETE_OWN"]
+    }
+  }
+}

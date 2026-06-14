@@ -1,0 +1,11 @@
+{
+  "default": [],
+  "personas": {
+    "mythos": {
+      "default": ["VIEW_CHANNEL","READ_HISTORY","SEND_MESSAGES","SEND_IN_THREADS","CREATE_THREADS","ATTACH_FILES","ADD_REACTIONS","EDIT_OWN","DELETE_OWN"]
+    },
+    "lena": {
+      "default": ["VIEW_CHANNEL","READ_HISTORY","SEND_MESSAGES","SEND_IN_THREADS","ATTACH_FILES","ADD_REACTIONS","EDIT_OWN","DELETE_OWN"]
+    }
+  }
+}

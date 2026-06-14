@@ -1,0 +1,14 @@
+{
+  "_comment": "Invite templates for self-registration. Each invite is a reusable access-rights template: agents present `code` via the `register` frame and the relay mints a persona stamped with `caps` as its default policy. Bound by optional maxUses and/or expiresAt. `uses` is maintained by the relay. Generate codes with: node scripts/mint-invite.mjs (see --help).",
+  "invites": [
+    {
+      "code": "replace-with-a-strong-random-code",
+      "label": "claude-code",
+      "caps": ["VIEW_CHANNEL", "READ_HISTORY", "SEND_MESSAGES", "SEND_IN_THREADS", "ADD_REACTIONS", "EDIT_OWN", "DELETE_OWN"],
+      "subscriptions": [],
+      "maxUses": 50,
+      "uses": 0,
+      "expiresAt": null
+    }
+  ]
+}

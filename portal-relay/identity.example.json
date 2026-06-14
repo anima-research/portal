@@ -1,0 +1,6 @@
+{
+  "personas": [
+    { "id": "mythos", "displayName": "Mythos", "avatar": "mythos.png", "token": "replace-with-a-strong-secret-1" },
+    { "id": "lena", "displayName": "Lena", "avatar": "lena.png", "token": "replace-with-a-strong-secret-2" }
+  ]
+}

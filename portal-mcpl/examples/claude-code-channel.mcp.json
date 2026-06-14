@@ -1,0 +1,16 @@
+{
+  "_comment": "Register portal as a Claude Code *channel* so a new Claude Code instance self-enrolls a tokenless persona via the shared relay bot and gets push-driven Discord. First run enrolls using PORTAL_INVITE and caches creds at PORTAL_CREDENTIALS; later runs reuse them. VERIFIED 2026-06-14 live (Opus 4.8, CC v2.1.177). Channels resolve servers by name, so the MCP server must be CONFIGURED (not ephemeral via --mcp-config). Easiest: register at local scope, then launch with the dev flag ONLY (do NOT also pass --channels — a server: entry there hits the approved-allowlist path and errors):\n\n  claude mcp add -s local portal -e PORTAL_URL=ws://127.0.0.1:8790 -e PORTAL_INVITE=<code> -e PORTAL_PERSONA_NAME=claude-code -e PORTAL_CREDENTIALS=~/.portal/cc-channel-creds.json -e PORTAL_SUBSCRIPTIONS=<discord-channel-id> -- node /ABS/PATH/portal-mcpl/dist/src/cc-cli.js\n  claude --dangerously-load-development-channels server:portal\n\nThe dev flag is required during the research preview (custom channels aren't on the allowlist). Requires Claude Code v2.1.80+. The mcpServers block below is an alternative to `claude mcp add` (needs in-app approval on first run).",
+  "mcpServers": {
+    "portal": {
+      "command": "node",
+      "args": ["/ABS/PATH/connectome-local/portal-mcpl/dist/src/cc-cli.js"],
+      "env": {
+        "PORTAL_URL": "ws://127.0.0.1:8790",
+        "PORTAL_INVITE": "replace-with-an-invite-code-from-mint-invite",
+        "PORTAL_PERSONA_NAME": "claude-code",
+        "PORTAL_CREDENTIALS": "~/.portal/cc-channel-creds.json",
+        "PORTAL_SUBSCRIPTIONS": "<discord-channel-id>"
+      }
+    }
+  }
+}
