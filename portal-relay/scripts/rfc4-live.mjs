@@ -101,7 +101,9 @@ async function main() {
     identityPath: IDENT, permissionsPath: PERMS, invitesPath: INV,
     attributionPath: '/tmp/rfc4-attr.json',
     rolePool: { size: 50, prefix: 'portal-' }, webhookPoolSize: 1,
-    heartbeatIntervalMs: 30000, guildMembersIntent: true, watchConfig: false,
+    // Members intent is privileged + unneeded here; default off so we don't get
+    // a disallowed-intent disconnect on bots that haven't enabled it.
+    heartbeatIntervalMs: 30000, guildMembersIntent: process.env.RFC4_MEMBERS_INTENT === 'true', watchConfig: false,
     historyCacheTtlMs: 0, maxInlineFileBytes: 8 * 1024 * 1024, allowPathFiles: false, replyLink: true,
   });
 
