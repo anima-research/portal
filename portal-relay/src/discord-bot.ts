@@ -280,6 +280,15 @@ export class DiscordBot implements WebhookOps, RoleOps {
     if (channel && 'sendTyping' in channel) await (channel as TextChannel).sendTyping();
   }
 
+  /** Bot-level (moderation) delete of ANY message — needs the bot to hold
+   *  Manage Messages in the channel. Used for deleting non-persona messages
+   *  (e.g. a user's command) when the persona has the MANAGE_MESSAGES capability. */
+  async deleteAnyMessage(channelId: string, messageId: string): Promise<void> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel || !('messages' in channel)) throw new Error(`Channel ${channelId} not found`);
+    await (channel as TextChannel).messages.delete(messageId);
+  }
+
   // ── Reactions (native, from the bot) ──
 
   async addReaction(channelId: string, messageId: string, emoji: string): Promise<void> {
