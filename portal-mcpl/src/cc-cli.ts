@@ -48,7 +48,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { McplConnection } from '@animalabs/mcpl-core';
-import { PortalClient, loadOrEnrollCreds } from '@connectome/portal-client';
+import { PortalClient, loadOrEnrollCreds } from '@animalabs/portal-client';
 import { PortalAgent } from './agent.js';
 import { AgentState } from './agent-state.js';
 import { PortalCcChannelServer } from './server-cc.js';

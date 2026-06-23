@@ -6,7 +6,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
-import type { Persona } from '@connectome/portal-protocol';
+import type { Persona } from '@animalabs/portal-protocol';
 import type { IdentityFile, PersonaIdentity } from './config.js';
 import { WatchedFile } from './file-watch.js';
 

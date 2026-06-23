@@ -11,7 +11,7 @@
  * here is purely for *ordering* within a webhook.
  */
 
-import type { OutgoingFile } from '@connectome/portal-protocol';
+import type { OutgoingFile } from '@animalabs/portal-protocol';
 
 export interface WebhookSendOpts {
   threadId?: string;

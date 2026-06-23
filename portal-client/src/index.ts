@@ -1,5 +1,5 @@
 /**
- * @connectome/portal-client
+ * @animalabs/portal-client
  *
  * General-purpose client for the portal relay: WS transport, client-side cache,
  * typed RPC, and transport-level reconnect/resume. No agent semantics — that's

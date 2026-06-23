@@ -12,7 +12,7 @@
 import { WebSocket } from 'ws';
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { PORTAL_PROTOCOL_VERSION, isServerFrame } from '@connectome/portal-protocol';
+import { PORTAL_PROTOCOL_VERSION, isServerFrame } from '@animalabs/portal-protocol';
 
 export interface EnrollOptions {
   url: string;

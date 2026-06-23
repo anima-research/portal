@@ -11,8 +11,8 @@
  * is intentionally not done here so this package stays transport-agnostic and
  * unit-testable. See README for the ~30-line adapter sketch.
  */
-import type { PortalClient } from '@connectome/portal-client';
-import type { AddressReason, PortalMessage } from '@connectome/portal-protocol';
+import type { PortalClient } from '@animalabs/portal-client';
+import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
 import { AgentState, type PendingPing } from './agent-state.js';
 import { toolDefinitions } from './tools.js';
 

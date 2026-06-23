@@ -1,5 +1,5 @@
 /**
- * @connectome/portal-protocol
+ * @animalabs/portal-protocol
  *
  * The wire contract shared by the portal relay (one Discord bot fronting many
  * webhook personas) and the portal client. Pure types + lightweight guards,

@@ -11,7 +11,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { PermissionsBitField } from 'discord.js';
 import type { GuildBasedChannel, GuildMember } from 'discord.js';
-import type { Capability } from '@connectome/portal-protocol';
+import type { Capability } from '@animalabs/portal-protocol';
 import type {
   AccessRole,
   GuildPolicy,

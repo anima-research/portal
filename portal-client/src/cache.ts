@@ -9,7 +9,7 @@ import type {
   PortalGuild,
   Persona,
   ReadyData,
-} from '@connectome/portal-protocol';
+} from '@animalabs/portal-protocol';
 
 export class ClientCache {
   persona?: Persona;

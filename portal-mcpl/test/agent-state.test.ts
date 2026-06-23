@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentState } from '../src/agent-state.js';
-import type { PortalMessage } from '@connectome/portal-protocol';
+import type { PortalMessage } from '@animalabs/portal-protocol';
 
 function msg(id: string, channelId: string, createdAt: string, content = 'hi'): PortalMessage {
   return {

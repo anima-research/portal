@@ -8,7 +8,7 @@
  *
  * ISO-8601 timestamps sort lexically, so string comparison is a valid ordering.
  */
-import type { AddressReason, PortalMessage } from '@connectome/portal-protocol';
+import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
 
 export interface PendingPing {
   message: PortalMessage;

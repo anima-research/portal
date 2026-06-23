@@ -17,7 +17,7 @@ import type {
   RpcParams,
   RpcRequest,
   RpcResponse,
-} from '@connectome/portal-protocol';
+} from '@animalabs/portal-protocol';
 import type { InviteTemplate, PersonaIdentity, PersonaPolicy, RelayConfig, Scope } from './config.js';
 import { DiscordBot, type ChannelMeta, type IncomingMessage } from './discord-bot.js';
 import { Gateway, type GatewayHooks, Session } from './gateway.js';

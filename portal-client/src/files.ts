@@ -1,4 +1,4 @@
-import type { OutgoingFile } from '@connectome/portal-protocol';
+import type { OutgoingFile } from '@animalabs/portal-protocol';
 
 /**
  * Build an `OutgoingFile` from in-memory bytes (the portable way to attach a

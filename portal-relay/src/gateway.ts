@@ -19,7 +19,7 @@ import {
   type RegisteredData,
   type RpcRequest,
   type ServerFrame,
-} from '@connectome/portal-protocol';
+} from '@animalabs/portal-protocol';
 
 export interface GatewayHooks {
   /** Validate identify. Return a persona id on success, null to reject. */

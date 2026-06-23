@@ -7,7 +7,7 @@
  *
  * Both are hot-reloaded on edit and mutable at runtime via the stores' APIs.
  */
-import type { Capability } from '@connectome/portal-protocol';
+import type { Capability } from '@animalabs/portal-protocol';
 
 // ── Identity file ──
 

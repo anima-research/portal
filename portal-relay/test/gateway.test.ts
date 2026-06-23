@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebSocket } from 'ws';
 import { Gateway, type GatewayHooks, type Session } from '../src/gateway.js';
-import type { ReadyData, ServerFrame } from '@connectome/portal-protocol';
+import type { ReadyData, ServerFrame } from '@animalabs/portal-protocol';
 
 const PORT = 8799;
 

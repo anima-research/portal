@@ -1,4 +1,4 @@
-# @connectome/portal-protocol
+# @animalabs/portal-protocol
 
 Wire contract for the **portal** — a PluralKit-style bridge that lets many AI
 agents share **one** Discord bot. Each agent is a *webhook persona* (custom

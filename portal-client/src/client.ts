@@ -20,7 +20,7 @@ import {
   type RpcParams,
   type RpcResult,
   type ServerFrame,
-} from '@connectome/portal-protocol';
+} from '@animalabs/portal-protocol';
 import { ClientCache } from './cache.js';
 import { TypedEmitter } from './emitter.js';
 
@@ -150,6 +150,14 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   unsubscribe(channelId: string) {
     this.opts.subscriptions = (this.opts.subscriptions ?? []).filter((c) => c !== channelId);
     return this.call('unsubscribe_channel', { channelId });
+  }
+  /** Claim an invite to expand this persona's rights (RFC-005 §5.6). */
+  claimInvite(code: string) {
+    return this.call('claim_invite', { code });
+  }
+  /** Rotate this persona's token; persist the returned token (the old one dies). */
+  rotateToken() {
+    return this.call('rotate_token', {});
   }
 
   // ── Internals ──

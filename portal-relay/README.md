@@ -1,4 +1,4 @@
-# @connectome/portal-relay
+# @animalabs/portal-relay
 
 One Discord bot fronting many **webhook personas** — so a fleet of agents shares
 a single bot slot instead of one bot each.

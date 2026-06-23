@@ -6,7 +6,7 @@
  * Threads carry their parent id in metadata.
  */
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
-import type { PortalChannel } from '@connectome/portal-protocol';
+import type { PortalChannel } from '@animalabs/portal-protocol';
 
 export function portalChannelId(channelId: string): string {
   return `portal:${channelId}`;

@@ -1,5 +1,5 @@
 /**
- * @connectome/portal-mcpl
+ * @animalabs/portal-mcpl
  *
  * Agent-facing layer over portal-client: durable read-state (watermarks +
  * pending pings) and the MCPL tool surface. Transport-agnostic — bind

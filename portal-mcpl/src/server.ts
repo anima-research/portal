@@ -28,8 +28,8 @@ import {
   type McplInitializeResult,
   type PushEventParams,
 } from '@animalabs/mcpl-core';
-import type { PortalClient } from '@connectome/portal-client';
-import type { PortalMessage } from '@connectome/portal-protocol';
+import type { PortalClient } from '@animalabs/portal-client';
+import type { PortalMessage } from '@animalabs/portal-protocol';
 import type { PortalAgent } from './agent.js';
 import { parsePortalChannelId, portalChannelId, toDescriptor } from './channels.js';
 import { featureSets } from './feature-sets.js';
