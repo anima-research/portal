@@ -111,6 +111,10 @@ export class AdminServer {
 
     if (method === 'POST' && path === '/admin/logout') return this.onLogout(req, res, session);
     if (method === 'GET' && path === '/admin/me') return this.onMe(res, session);
+    // The guilds the user may manage AND the bot is actually in (named) — the
+    // scope selector uses this, so it lands on guilds that have data rather than
+    // every guild the admin happens to own on Discord.
+    if (method === 'GET' && path === '/admin/guilds') return this.onGuilds(res, session);
 
     // Global access-role catalog authoring — super-admin only (RFC-005 §5.3).
     if (path === '/admin/roles' || path.startsWith('/admin/roles/')) {
@@ -588,11 +592,18 @@ export class AdminServer {
       const id = decodeURIComponent(detail[1]);
       const p = this.deps.identity.get(id);
       if (!p) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
+      const entry = this.deps.permissions.getEntry(id);
+      // Resolve role names to their definitions so the UI can show *what* access
+      // each role confers (caps + scope + the guild it's bound to).
+      const roles = (entry?.roles ?? []).map((name) => ({ name, ...this.deps.permissions.getRole(name) }));
       return sendJson(res, 200, {
         id: p.id,
         displayName: p.displayName,
-        roles: this.deps.permissions.getRoleNames(id),
-        guilds: this.guildsWithAccess(id),
+        roles,
+        // Inline per-persona policy (ad-hoc grants), if any.
+        policy: entry?.policy ?? null,
+        // Guilds (named) where this persona can act, and how.
+        guilds: this.guildsWithAccess(id).map((gid) => ({ id: gid, name: this.guildName(gid) })),
       });
     }
     // POST /admin/personas/:id/token — rotate/revoke (CSRF-checked).
@@ -610,6 +621,22 @@ export class AdminServer {
       .listGuilds()
       .map((g) => g.id)
       .filter((gid) => this.deps.permissions.couldAccessGuild(personaId, gid, (cid) => this.deps.channelInGuild(gid, cid)));
+  }
+
+  /** Human guild name from the bot's view, falling back to the id. */
+  private guildName(guildId: string): string {
+    return this.deps.listGuilds().find((g) => g.id === guildId)?.name ?? guildId;
+  }
+
+  /** Guilds the bot is in that this admin may manage (named) — drives the scope
+   *  selector. Super-admins get every bot guild; guild-admins get the
+   *  intersection with their Discord-derived admin set. */
+  private onGuilds(res: ServerResponse, session: AdminSession): void {
+    const guilds = this.deps
+      .listGuilds()
+      .filter((g) => session.isSuper || session.adminGuilds.has(g.id))
+      .map((g) => ({ id: g.id, name: g.name }));
+    sendJson(res, 200, { guilds });
   }
 
   private nowMs(): number {

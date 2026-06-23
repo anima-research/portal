@@ -127,7 +127,12 @@ async function boot() {
   // Identities tab is super-admin only.
   $('.tab-super').classList.toggle('hidden', !me.isSuper);
 
-  setupScope(me);
+  // Scope the switcher to guilds the bot is actually in (named) — not every
+  // guild the admin owns on Discord — so it lands where data exists.
+  let guilds = [];
+  try { guilds = (await api('GET', '/admin/guilds')).guilds || []; }
+  catch { guilds = me.guilds || []; }
+  setupScope(me, guilds);
 
   for (const t of document.querySelectorAll('.tab')) t.addEventListener('click', () => selectTab(t.dataset.tab));
   $('#logout-btn').addEventListener('click', logout);
@@ -143,8 +148,8 @@ async function boot() {
   selectTab('personas');
 }
 
-function setupScope(me) {
-  const guilds = me.guilds || [];
+function setupScope(me, guilds) {
+  guilds = guilds || me.guilds || [];
   const sel = $('#guild-select');
   const stat = $('#guild-static');
   clear(sel);
@@ -628,10 +633,40 @@ async function openIdentityDrawer(id) {
   const body = el('div', { class: 'drawer-sections' });
 
   const guilds = d.guilds || [];
+  const gname = {}; guilds.forEach((g) => { gname[g.id] = g.name; });
+
   body.appendChild(section('Access in guilds', [
-    guilds.length ? el('ul', { class: 'plain' }, guilds.map((g) => el('li', {}, [el('code', { text: g })]))) : el('p', { class: 'muted', text: 'No guild access.' }),
+    guilds.length
+      ? el('ul', { class: 'plain' }, guilds.map((g) => el('li', {}, [g.name || g.id, el('span', { class: 'muted mono', text: ' ' + g.id })])))
+      : el('p', { class: 'muted', text: 'No guild access.' }),
   ]));
-  body.appendChild(section('Roles', [el('div', { class: 'cell-roles', text: (d.roles || []).join(', ') || '—' })]));
+
+  // Roles — show what each confers (caps + scope + bound guild).
+  const roles = d.roles || [];
+  body.appendChild(section('Roles', [
+    roles.length
+      ? el('ul', { class: 'plain' }, roles.map((r) => el('li', {}, [
+          el('strong', { text: r.name }),
+          r.scope ? el('span', { class: 'muted', text: ' — ' + scopeSummary(r.scope) + (r.guildId ? ' @ ' + (gname[r.guildId] || r.guildId) : '') }) : null,
+          el('div', { class: 'cell-roles', text: (r.caps || []).join(', ') }),
+        ])))
+      : el('p', { class: 'muted', text: 'No roles.' }),
+  ]));
+
+  // Ad-hoc per-persona grants (inline policy), if any.
+  const pol = d.policy;
+  const polGuilds = pol && pol.guilds ? Object.entries(pol.guilds) : [];
+  if ((pol && pol.default && pol.default.length) || polGuilds.length) {
+    const kids = [];
+    if (pol.default && pol.default.length) kids.push(el('div', { class: 'cell-roles', text: 'global default: ' + pol.default.join(', ') }));
+    for (const [gid, gp] of polGuilds) {
+      const lines = [];
+      if (gp.default && gp.default.length) lines.push(el('div', { class: 'cell-roles', text: 'guild default: ' + gp.default.join(', ') }));
+      for (const [cid, caps] of Object.entries(gp.channels || {})) lines.push(el('div', { class: 'cell-roles' }, [el('code', { text: cid }), ': ' + (caps || []).join(', ')]));
+      kids.push(el('div', { class: 'grant-guild' }, [el('strong', { text: gname[gid] || gid }), el('span', { class: 'muted mono', text: ' ' + gid }), ...lines]));
+    }
+    body.appendChild(section('Ad-hoc grants', kids));
+  }
 
   const rotate = el('button', { class: 'btn btn-sm', text: 'Rotate token' });
   rotate.addEventListener('click', () => tokenAction(id, 'rotate'));

@@ -443,6 +443,52 @@ test('integration: search + pagination + detail + global registry', async () => 
   }
 });
 
+test('integration: /admin/guilds is bot-guilds scoped + names; persona detail enriched', async () => {
+  const ctx = setupDeps(['admin1']); // super-admin
+  ctx.deps.listGuilds = () => [
+    { id: 'G1', name: 'Guild One', memberCount: 1 },
+    { id: 'G2', name: 'Guild Two', memberCount: 1 },
+  ];
+  const server = new AdminServer(ctx.deps, fakeDiscordFetch([{ id: 'G1', name: 'G1', permissions: '0' }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const session = await login(base, []);
+    const auth = { headers: { cookie: `portal_admin_session=${session}` } };
+    // Super sees ALL bot guilds, with names.
+    const g = await (await fetch(`${base}/admin/guilds`, auth)).json();
+    assert.deepEqual(g.guilds.map((x: { id: string }) => x.id).sort(), ['G1', 'G2']);
+    assert.equal(g.guilds.find((x: { id: string }) => x.id === 'G1').name, 'Guild One');
+    // Enriched detail: roles are objects (name+caps+scope), policy present, guilds named.
+    const d = await (await fetch(`${base}/admin/personas/p1`, auth)).json();
+    assert.ok('policy' in d);
+    assert.ok(d.guilds.every((x: any) => typeof x.id === 'string' && typeof x.name === 'string'));
+    if (d.roles.length) assert.ok('caps' in d.roles[0] && 'name' in d.roles[0]);
+  } finally {
+    await server.close();
+    ctx.cleanup();
+  }
+});
+
+test('integration: guild-admin /admin/guilds = bot guilds ∩ their admin set', async () => {
+  const ctx = setupDeps([]); // guild-admin only
+  ctx.deps.listGuilds = () => [
+    { id: 'G1', name: 'Guild One', memberCount: 1 },
+    { id: 'G2', name: 'Guild Two', memberCount: 1 },
+  ];
+  const server = new AdminServer(ctx.deps, fakeDiscordFetch([{ id: 'G1', name: 'G1', permissions: MANAGE_GUILD }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const session = await login(base, []);
+    const g = await (await fetch(`${base}/admin/guilds`, { headers: { cookie: `portal_admin_session=${session}` } })).json();
+    assert.deepEqual(g.guilds.map((x: { id: string }) => x.id), ['G1'], 'only the guild they admin AND bot is in');
+  } finally {
+    await server.close();
+    ctx.cleanup();
+  }
+});
+
 test('integration: global persona registry is super-admin only', async () => {
   const ctx = setupDeps([]); // guild-admin only
   const server = new AdminServer(ctx.deps, fakeDiscordFetch([{ id: 'G1', name: 'G1', permissions: MANAGE_GUILD }]));
