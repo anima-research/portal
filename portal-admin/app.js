@@ -480,7 +480,7 @@ function openMintDrawer(meta) {
   ]);
   const roleSel = multiSelect(Object.keys(meta.catalog || {}), 'No access roles defined.');
   const chanSel = multiSelect((meta.channels || []).map((c) => ({ value: c.id, text: '#' + (c.name || c.id) })), 'No channels.');
-  const mirrorSel = el('select', {}, (meta.discordRoles || []).map((r) => el('option', { value: r.id, text: r.name + (r.pooled ? ' (pool)' : '') })));
+  const mirrorSel = el('select', {}, [...(meta.discordRoles || [])].sort((a, b) => (a.name || '').localeCompare(b.name || '')).map((r) => el('option', { value: r.id, text: r.name + (r.pooled ? ' (pool)' : '') })));
   const caps = capsCheckboxes();
   const scopeArea = el('div', {});
   function sync() {
@@ -590,7 +590,7 @@ function openRoleDrawer(discordRoles) {
     el('option', { value: 'mirrorRoles', text: 'mirror several roles (comma ids)' }),
   ]);
   const scopeInput = el('input', { type: 'text', placeholder: 'channel/role ids, comma-separated' });
-  const mirrorSel = el('select', {}, (discordRoles || []).map((r) => el('option', { value: r.id, text: r.name })));
+  const mirrorSel = el('select', {}, [...(discordRoles || [])].sort((a, b) => (a.name || '').localeCompare(b.name || '')).map((r) => el('option', { value: r.id, text: r.name })));
   const scopeArea = el('div', { class: 'field' });
   function sync() { clear(scopeArea); if (kind.value === 'mirrorRole') scopeArea.appendChild(mirrorSel); else if (kind.value !== 'all') scopeArea.appendChild(scopeInput); }
   kind.addEventListener('change', sync); sync();
