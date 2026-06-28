@@ -681,7 +681,8 @@ async function openIdentityDrawer(id) {
   const clearAv = el('button', { class: 'btn btn-sm', text: 'Clear', onclick: () => { avInput.value = ''; saveAv.click(); } });
   body.appendChild(section('Profile picture', [
     el('div', { class: 'avatar-row' }, [avImg, el('div', { class: 'avatar-edit' }, [avInput, el('div', { class: 'inline' }, [saveAv, clearAv])])]),
-    el('p', { class: 'muted', text: 'Image URL (or a filename if the relay has an avatar base URL). Discord fetches it on the next message; past messages keep their old picture.' }),
+    avatarCropper(id, avImg, avInput),
+    el('p', { class: 'muted', text: 'Paste an image URL above, or upload + crop a file. Discord fetches it on the next message; past messages keep their old picture.' }),
   ]));
 
   const guilds = d.guilds || [];
@@ -749,6 +750,116 @@ function avatarThumb(url, alt, cls) {
   const img = el('img', { class: 'avatar-thumb' + (cls ? ' ' + cls : ''), alt: alt || '' });
   if (url) img.src = url; else img.classList.add('hidden');
   return img;
+}
+
+// Upload + square-crop control for a persona avatar. Reads a chosen image, lets
+// the admin pan/zoom inside a circular 240px viewport (Discord masks avatars to a
+// circle), renders the selected square to a 256×256 canvas, and POSTs the PNG to
+// /admin/personas/:id/avatar/upload. On success it updates the preview img and URL
+// field passed in. Pure client-side crop — no server image library needed.
+function avatarCropper(id, avImg, avInput) {
+  const fileInput = el('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp,image/gif', class: 'hidden' });
+  const pick = el('button', { class: 'btn btn-sm', text: 'Upload image…', onclick: () => fileInput.click() });
+  const stage = el('div', {}); // cropper renders here once a file is chosen
+  const wrap = el('div', { class: 'avatar-upload' }, [el('div', { class: 'inline' }, [pick, fileInput]), stage]);
+
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    if (!/^image\//.test(file.type)) { banner('Please choose an image file.', 'err'); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => buildCropper(img);
+      img.onerror = () => banner('Could not read that image.', 'err');
+      img.src = reader.result;
+    };
+    reader.onerror = () => banner('Could not read that file.', 'err');
+    reader.readAsDataURL(file);
+  });
+
+  function buildCropper(img) {
+    clear(stage);
+    const V = 240, O = 256;
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+    if (!iw || !ih) { banner('That image has no dimensions.', 'err'); return; }
+    const base = Math.max(V / iw, V / ih); // cover the viewport
+    let zoom = 1, scale = base, ox = 0, oy = 0;
+
+    const display = el('img', { class: 'cropper-img', src: img.src, alt: '' });
+    const viewport = el('div', { class: 'cropper' }, [display]);
+    const zoomInput = el('input', { type: 'range', min: '1', max: '3', step: '0.01', value: '1', class: 'cropper-zoom' });
+
+    function apply() {
+      const dw = iw * scale, dh = ih * scale;
+      ox = Math.min(0, Math.max(V - dw, ox));
+      oy = Math.min(0, Math.max(V - dh, oy));
+      display.style.width = dw + 'px';
+      display.style.height = dh + 'px';
+      display.style.left = ox + 'px';
+      display.style.top = oy + 'px';
+    }
+    ox = (V - iw * scale) / 2; oy = (V - ih * scale) / 2; apply();
+
+    zoomInput.addEventListener('input', () => {
+      const old = scale;
+      zoom = parseFloat(zoomInput.value) || 1;
+      scale = base * zoom;
+      // Keep the viewport centre fixed across zoom.
+      const cx = (-ox + V / 2) / old, cy = (-oy + V / 2) / old;
+      ox = V / 2 - cx * scale; oy = V / 2 - cy * scale;
+      apply();
+    });
+
+    let dragging = false, lx = 0, ly = 0;
+    viewport.addEventListener('pointerdown', (e) => { dragging = true; lx = e.clientX; ly = e.clientY; try { viewport.setPointerCapture(e.pointerId); } catch (x) {} });
+    viewport.addEventListener('pointermove', (e) => { if (!dragging) return; ox += e.clientX - lx; oy += e.clientY - ly; lx = e.clientX; ly = e.clientY; apply(); });
+    const end = (e) => { dragging = false; try { viewport.releasePointerCapture(e.pointerId); } catch (x) {} };
+    viewport.addEventListener('pointerup', end);
+    viewport.addEventListener('pointercancel', end);
+
+    const up = el('button', { class: 'btn btn-sm btn-primary', text: 'Upload' });
+    const cancel = el('button', { class: 'btn btn-sm', text: 'Cancel', onclick: () => { clear(stage); fileInput.value = ''; } });
+    up.addEventListener('click', () => {
+      up.disabled = true; up.textContent = 'Uploading…';
+      const canvas = el('canvas');
+      canvas.width = O; canvas.height = O;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, -ox / scale, -oy / scale, V / scale, V / scale, 0, 0, O, O);
+      canvas.toBlob(async (blob) => {
+        if (!blob) { up.disabled = false; up.textContent = 'Upload'; banner('Could not render the cropped image.', 'err'); return; }
+        try {
+          const res = await fetch('/admin/personas/' + encodeURIComponent(id) + '/avatar/upload', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'image/png', 'X-CSRF-Token': (state.me && state.me.csrf) || '' },
+            body: blob,
+          });
+          if (res.status === 401) { showLogin(); return; }
+          const text = await res.text();
+          let data = null; if (text) { try { data = JSON.parse(text); } catch (x) { /* non-JSON */ } }
+          if (!res.ok) { const e = (data && data.error) || {}; throw new Error(e.message || ('HTTP ' + res.status)); }
+          avInput.value = (data && data.avatar) || '';
+          if (data && data.avatarUrl) { avImg.src = data.avatarUrl; avImg.classList.remove('hidden'); }
+          banner('Avatar uploaded — applies to the persona’s next message.');
+          clear(stage); fileInput.value = '';
+        } catch (e) {
+          up.disabled = false; up.textContent = 'Upload';
+          banner('Upload failed: ' + e.message, 'err');
+        }
+      }, 'image/png');
+    });
+
+    stage.appendChild(el('div', { class: 'cropper-wrap' }, [
+      viewport,
+      el('div', { class: 'cropper-controls' }, [
+        el('label', { class: 'muted', text: 'Drag to position · zoom' }),
+        zoomInput,
+        el('div', { class: 'inline' }, [up, cancel]),
+      ]),
+    ]));
+  }
+
+  return wrap;
 }
 
 function capsCheckboxes(selected) {

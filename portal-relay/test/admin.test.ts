@@ -150,6 +150,7 @@ function setupDeps(superadmins: string[], guildAdmins: Record<string, string[]> 
     sessionTtlMs: 60_000,
     auditPath: join(dir, 'audit.jsonl'),
     cookieSecure: false,
+    avatarDir: join(dir, 'avatars'),
   };
   const identity = new IdentityStore(idPath, '');
   const permissions = new PermissionsStore(permPath);
@@ -633,6 +634,66 @@ test('integration: guild-admin cannot set avatar (global = super-admin only)', a
       method: 'PUT',
       headers: { cookie: `portal_admin_session=${session}`, 'content-type': 'application/json', 'x-csrf-token': me.csrf },
       body: JSON.stringify({ avatar: 'https://example.test/a.png' }),
+    });
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+    ctx.cleanup();
+  }
+});
+
+test('integration: super-admin uploads + serves a persona avatar', async () => {
+  const ctx = setupDeps(['admin1']);
+  const server = new AdminServer(ctx.deps, fakeDiscordFetch([{ id: 'G1', name: 'G1', permissions: '0' }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  // Minimal valid PNG (signature + padding to clear the 12-byte magic check).
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+  try {
+    const session = await login(base, []);
+    const me = await (await fetch(`${base}/admin/me`, { headers: { cookie: `portal_admin_session=${session}` } })).json();
+    const authHdr = { cookie: `portal_admin_session=${session}`, 'x-csrf-token': me.csrf };
+
+    // Upload.
+    const up = await fetch(`${base}/admin/personas/p1/avatar/upload`, {
+      method: 'POST', headers: { ...authHdr, 'content-type': 'image/png' }, body: png,
+    });
+    assert.equal(up.status, 200);
+    const { avatar } = await up.json();
+    assert.match(avatar, /^p1-[0-9a-f]+\.png$/);
+    assert.equal(ctx.identity.get('p1')!.avatar, avatar);
+
+    // Serve it back (public, no session) with the bytes intact.
+    const got = await fetch(`${base}/admin/avatars/${avatar}`);
+    assert.equal(got.status, 200);
+    assert.equal(got.headers.get('content-type'), 'image/png');
+    assert.deepEqual(Buffer.from(await got.arrayBuffer()), png);
+
+    // Wrong content-type → 400.
+    const badCt = await fetch(`${base}/admin/personas/p1/avatar/upload`, { method: 'POST', headers: { ...authHdr, 'content-type': 'text/plain' }, body: png });
+    assert.equal(badCt.status, 400);
+    // Not actually an image → 400.
+    const notImg = await fetch(`${base}/admin/personas/p1/avatar/upload`, { method: 'POST', headers: { ...authHdr, 'content-type': 'image/png' }, body: Buffer.from('hello world not a png') });
+    assert.equal(notImg.status, 400);
+    // Path traversal on serve → 400.
+    assert.equal((await fetch(`${base}/admin/avatars/..%2f..%2fetc%2fpasswd`)).status, 400);
+  } finally {
+    await server.close();
+    ctx.cleanup();
+  }
+});
+
+test('integration: guild-admin cannot upload avatar (global = super-admin only)', async () => {
+  const ctx = setupDeps([]);
+  const server = new AdminServer(ctx.deps, fakeDiscordFetch([{ id: 'G1', name: 'G1', permissions: MANAGE_GUILD }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+  try {
+    const session = await login(base, []);
+    const me = await (await fetch(`${base}/admin/me`, { headers: { cookie: `portal_admin_session=${session}` } })).json();
+    const res = await fetch(`${base}/admin/personas/p1/avatar/upload`, {
+      method: 'POST', headers: { cookie: `portal_admin_session=${session}`, 'x-csrf-token': me.csrf, 'content-type': 'image/png' }, body: png,
     });
     assert.equal(res.status, 403);
   } finally {

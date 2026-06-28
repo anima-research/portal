@@ -160,6 +160,15 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 .avatar-edit { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .avatar-edit input { width: 100%; }
 
+/* Avatar upload + square cropper (circular viewport = Discord's masked display). */
+.avatar-upload { margin-top: 10px; }
+.cropper-wrap { margin-top: 10px; display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+.cropper { position: relative; width: 240px; height: 240px; flex: 0 0 auto; overflow: hidden; border-radius: 50%; border: 1px solid var(--line); background: var(--zebra); cursor: grab; touch-action: none; }
+.cropper:active { cursor: grabbing; }
+.cropper-img { position: absolute; max-width: none; user-select: none; -webkit-user-drag: none; pointer-events: none; }
+.cropper-controls { display: flex; flex-direction: column; gap: 8px; min-width: 150px; }
+.cropper-zoom { width: 100%; }
+
 /* Grouped capability editor — vertical, fits the narrow drawer. */
 .caps-groups { display: flex; flex-direction: column; gap: 9px; }
 .cap-row { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--fg); }

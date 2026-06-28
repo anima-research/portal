@@ -175,6 +175,11 @@ export interface AdminConfig {
   auditPath: string;
   /** Set the `Secure` flag on cookies (default true; false only for local dev). */
   cookieSecure: boolean;
+  /** Directory for uploaded persona avatars. When set, the admin API accepts
+   *  avatar uploads and serves them at /admin/avatars/<file>. Pair with
+   *  PORTAL_AVATAR_BASE_URL = <public origin>/admin/avatars so stored filenames
+   *  resolve to Discord-fetchable URLs. Unset ⇒ uploads disabled (URL-only). */
+  avatarDir?: string;
 }
 
 export interface RelayConfig {
@@ -268,6 +273,7 @@ function loadAdminConfig(): AdminConfig | undefined {
     sessionTtlMs: parseInt(process.env.PORTAL_ADMIN_SESSION_TTL_MS ?? String(30 * 60 * 1000), 10),
     auditPath: requireEnv('PORTAL_ADMIN_AUDIT'),
     cookieSecure: process.env.PORTAL_ADMIN_COOKIE_INSECURE !== 'true',
+    avatarDir: process.env.PORTAL_AVATAR_DIR || undefined,
   };
 }
 

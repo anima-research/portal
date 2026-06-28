@@ -9,6 +9,9 @@
  * audit). Mutations land in P2; the route table is shaped to receive them.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { join, extname } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { AdminConfig } from '../config.js';
 import type { IdentityStore } from '../identity.js';
 import type { InviteStore } from '../invites.js';
@@ -104,6 +107,8 @@ export class AdminServer {
     if (method === 'GET' && path === '/admin/health') return sendJson(res, 200, { ok: true });
     if (method === 'GET' && path === '/admin/login') return this.onLogin(res);
     if (method === 'GET' && path === '/admin/callback') return this.onCallback(req, res, url);
+    // Uploaded avatars are public images (Discord fetches them) — unauthenticated.
+    if (method === 'GET' && path.startsWith('/admin/avatars/')) return this.serveAvatar(res, path);
 
     // Everything below requires a session.
     const session = this.sessions.get(getCookie(req, SESSION_COOKIE));
@@ -649,7 +654,52 @@ export class AdminServer {
       this.audit.append({ actor: this.actorOf(session), action: 'persona.avatar.set', target: id, ok: true, after: { avatar } });
       return sendJson(res, 200, { avatar: next.avatar, avatarUrl: this.deps.identity.avatarUrl(next) });
     }
+    // POST /admin/personas/:id/avatar/upload — store an uploaded image (raw bytes)
+    // and point the persona's avatar at it. Served back at /admin/avatars/<file>.
+    const upl = /^\/admin\/personas\/([^/]+)\/avatar\/upload$/.exec(path);
+    if (method === 'POST' && upl) {
+      if (!this.csrfOk(req, session)) return sendJson(res, 403, err('CSRF', 'missing or invalid CSRF token'));
+      const dir = this.deps.config.avatarDir;
+      if (!dir) return sendJson(res, 503, err('UNAVAILABLE', 'avatar uploads not configured (set PORTAL_AVATAR_DIR)'));
+      const id = decodeURIComponent(upl[1]);
+      const cur = this.deps.identity.get(id);
+      if (!cur) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
+      const ext = IMG_EXT[(req.headers['content-type'] ?? '').toString().split(';')[0].trim()];
+      if (!ext) return sendJson(res, 400, err('INVALID', 'content-type must be image/png, image/jpeg, image/webp or image/gif'));
+      let bytes: Buffer;
+      try {
+        bytes = await readBytes(req, 2 * 1024 * 1024);
+      } catch {
+        return sendJson(res, 400, err('INVALID', 'image too large (max 2 MiB)'));
+      }
+      if (!isImage(bytes, ext)) return sendJson(res, 400, err('INVALID', 'body is not a valid image'));
+      mkdirSync(dir, { recursive: true });
+      const fname = `${id.replace(/[^A-Za-z0-9._-]/g, '_')}-${randomBytes(6).toString('hex')}.${ext}`;
+      writeFileSync(join(dir, fname), bytes);
+      const prev = cur.avatar;
+      this.deps.identity.upsert({ ...cur, avatar: fname });
+      // Best-effort cleanup of the persona's previous uploaded file (our dir only).
+      if (prev && /^[A-Za-z0-9._-]+$/.test(prev) && prev !== fname && existsSync(join(dir, prev))) {
+        try { unlinkSync(join(dir, prev)); } catch { /* ignore */ }
+      }
+      const next = this.deps.identity.get(id)!;
+      this.audit.append({ actor: this.actorOf(session), action: 'persona.avatar.upload', target: id, ok: true, after: { avatar: fname, bytes: bytes.length } });
+      return sendJson(res, 200, { avatar: next.avatar, avatarUrl: this.deps.identity.avatarUrl(next) });
+    }
     sendJson(res, 404, err('NOT_FOUND', 'no such route'));
+  }
+
+  /** Serve an uploaded avatar (public — Discord fetches these). Filename is
+   *  validated to a flat safe set, so no path traversal out of the avatar dir. */
+  private serveAvatar(res: ServerResponse, path: string): void {
+    const dir = this.deps.config.avatarDir;
+    if (!dir) return sendJson(res, 404, err('NOT_FOUND', 'avatars not configured'));
+    const file = decodeURIComponent(path.slice('/admin/avatars/'.length));
+    if (!/^[A-Za-z0-9._-]+$/.test(file)) return sendJson(res, 400, err('INVALID', 'bad filename'));
+    const full = join(dir, file);
+    if (!existsSync(full)) return sendJson(res, 404, err('NOT_FOUND', 'no such avatar'));
+    res.writeHead(200, { 'content-type': IMG_CT[extname(file).toLowerCase()] ?? 'application/octet-stream', 'cache-control': 'public, max-age=300' });
+    res.end(readFileSync(full));
   }
 
   /** Guild ids a persona can possibly act in (across the bot's known guilds). */
@@ -716,6 +766,36 @@ function paginate<T>(items: T[], page: Page, key: string): Record<string, unknow
 function matches(q: string, ...fields: Array<string | undefined>): boolean {
   const needle = q.toLowerCase();
   return fields.some((f) => f != null && f.toLowerCase().includes(needle));
+}
+
+// Accepted upload content-types → file extension, and extension → served type.
+const IMG_EXT: Record<string, string> = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif',
+};
+const IMG_CT: Record<string, string> = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif',
+};
+
+/** Validate magic bytes so a wrong/forged content-type can't write arbitrary data. */
+function isImage(b: Buffer, ext: string): boolean {
+  if (b.length < 12) return false;
+  if (ext === 'png') return b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
+  if (ext === 'jpg') return b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+  if (ext === 'gif') return b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46;
+  if (ext === 'webp') return b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP';
+  return false;
+}
+
+/** Read a raw request body up to `max` bytes; throws if exceeded. */
+async function readBytes(req: IncomingMessage, max: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const c of req) {
+    size += (c as Buffer).length;
+    if (size > max) throw new Error('too large');
+    chunks.push(c as Buffer);
+  }
+  return Buffer.concat(chunks);
 }
 
 function err(code: string, message: string) {
