@@ -15,6 +15,11 @@
  *   PORTAL_WEBHOOK_POOL     Webhooks per hot channel (default 1).
  *   PORTAL_HEARTBEAT_MS     Heartbeat interval (default 30000).
  *   DISCORD_GUILD_ID        Optional comma-separated guild allow-list.
+ *   PORTAL_READSTATE        Optional path to persist per-persona read-state
+ *                           (watermarks, pending pings, ambient tallies). Enables
+ *                           offline catch-up surviving restarts. Tune retention with
+ *                           PORTAL_READSTATE_PINGS_CAP (default 500) and
+ *                           PORTAL_READSTATE_CHANNELS_CAP (default 1000).
  *
  *   Admin panel / HTTP API (RFC-005) — all gated on PORTAL_ADMIN_ENABLED=true:
  *   PORTAL_ADMIN_ENABLED         Set "true" to enable the admin HTTP API.

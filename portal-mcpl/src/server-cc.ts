@@ -34,6 +34,9 @@ export class PortalCcChannelServer {
   private conn: McplConnection | null = null;
   /** Channels we've already backfilled history for (first-contact context). */
   private seeded = new Set<string>();
+  /** Ping message ids we've already surfaced as a wake (live or catch-up), so a
+   *  reconnect doesn't re-wake for the same offline-accrued pings. */
+  private wokenPings = new Set<string>();
   /** Max messages to prepend per wake; older are truncated (scroll back via
    *  fetch_history). Configurable via PORTAL_CONTEXT_CAP (default 80). */
   private readonly contextCap = Math.max(1, Number(process.env.PORTAL_CONTEXT_CAP ?? '80') || 80);
@@ -127,6 +130,7 @@ export class PortalCcChannelServer {
 
   private wireClient(): void {
     this.client.on('message', (e) => {
+      if (e.addressedToMe) this.wokenPings.add(e.message.id); // live wake covers it
       if (process.env.PORTAL_DEBUG) {
         console.error(
           `[portal-cc] recv ch=${e.message.channelId} addressed=${e.addressedToMe} ` +
@@ -138,6 +142,51 @@ export class PortalCcChannelServer {
         console.error('[portal-cc] push failed:', (err as Error).message),
       );
     });
+    // On a fresh identify (reconnect after a gap, or first connect), the relay
+    // holds any pings that arrived while we were away. Surface them as a single
+    // catch-up wake — O(missed) from the relay, no Discord history scan.
+    this.client.on('ready', () => {
+      void this.catchUp().catch((err) =>
+        console.error('[portal-cc] catch-up failed:', (err as Error).message),
+      );
+    });
+  }
+
+  /** Wake once for pings accrued while offline (server-authoritative). */
+  private async catchUp(): Promise<void> {
+    if (!this.conn) return;
+    const pings = await this.agent.pendingPingsFromRelay();
+    const fresh = pings.filter((p) => !this.wokenPings.has(p.message.id));
+    if (fresh.length === 0) return;
+    for (const p of fresh) this.wokenPings.add(p.message.id);
+    fresh.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+
+    const lines = [`[catch-up] ${fresh.length} message(s) addressed to you while you were away:`];
+    let lastChannel = '';
+    for (const p of fresh) {
+      const label = this.channelLabel(p.message.channelId);
+      if (label !== lastChannel) {
+        lines.push(`\n— ${label} —`);
+        lastChannel = label;
+      }
+      const why = p.reasons.length ? ` (${p.reasons.join(',')})` : '';
+      lines.push(`» ${render(p.message)}${why}`);
+    }
+    lines.push('\n[use fetch_history / fetch_around to read surrounding context, then mark_read]');
+
+    const latest = fresh[fresh.length - 1].message;
+    const meta: Record<string, string> = {
+      source: 'discord',
+      channelId: latest.channelId,
+      author: authorLabel(latest),
+      messageId: latest.id,
+      addressed: 'true',
+      catchup: 'true',
+    };
+    if (process.env.PORTAL_DEBUG) {
+      console.error(`[portal-cc] CATCH-UP wake: ${fresh.length} missed ping(s)`);
+    }
+    this.conn.sendNotification(CHANNEL_NOTIFY, { content: lines.join('\n'), meta });
   }
 
   /**

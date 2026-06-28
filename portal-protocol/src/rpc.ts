@@ -2,6 +2,13 @@ import type { PortalChannel, PortalGuild } from './channel.js';
 import type { ChannelId, GuildId, PersonaId, RelayMessageId, RpcId, ThreadId, UserId } from './ids.js';
 import type { PortalMessage } from './message.js';
 import type { PortalMember, PortalRole } from './members.js';
+import type {
+  ChannelMissed,
+  ChannelMissedParams,
+  GetPendingPingsResult,
+  ListUnreadResult,
+  MarkReadParams,
+} from './read-state.js';
 
 /**
  * A file to upload. Provide EXACTLY ONE source:
@@ -211,6 +218,11 @@ export interface RpcMethods {
   list_pins: { params: ListPinsParams; result: ListPinsResult };
   claim_invite: { params: ClaimInviteParams; result: ClaimInviteResult };
   rotate_token: { params: RotateTokenParams; result: RotateTokenResult };
+  // ── Server-authoritative read-state (catch-up / unread) ──
+  get_pending_pings: { params: Empty; result: GetPendingPingsResult };
+  list_unread: { params: Empty; result: ListUnreadResult };
+  mark_read: { params: MarkReadParams; result: Empty };
+  channel_missed: { params: ChannelMissedParams; result: ChannelMissed };
 }
 
 export type RpcMethod = keyof RpcMethods;

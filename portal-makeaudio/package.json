@@ -1,0 +1,19 @@
+{
+  "name": "@animalabs/portal-makeaudio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Portal bot persona 'makeaudio': @-mention it with one or more Discord message links (+ optional prompt prefix) and it generates an audio clip via fal.ai seed-audio, posted back as a reply.",
+  "bin": {
+    "portal-makeaudio": "./src/index.mjs"
+  },
+  "scripts": {
+    "start": "node ./src/index.mjs"
+  },
+  "dependencies": {
+    "@fal-ai/client": "^1.2.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

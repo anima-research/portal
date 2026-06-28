@@ -17,14 +17,16 @@ export const featureSets: FeatureSetDeclaration[] = [
   },
   {
     name: 'portal.history',
-    description: 'Fetch message history',
+    description: 'Fetch message history (paginated; fetch_around for centred windows)',
     uses: ['tools'],
     rollback: false,
     hostState: false,
   },
   {
     name: 'portal.subscriptions',
-    description: 'Manage ambient channel subscriptions + read-state (pings, unread)',
+    description:
+      'Manage ambient channel subscriptions + server-authoritative read-state ' +
+      '(pending pings, unread, channel_missed) with offline catch-up',
     uses: ['tools'],
     rollback: false,
     hostState: false,

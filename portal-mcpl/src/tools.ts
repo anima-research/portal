@@ -86,14 +86,37 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'fetch_history',
-    description: 'Fetch recent messages from a channel or thread.',
+    description:
+      'Fetch recent messages from a channel or thread. Page with before/after ' +
+      '(exclusive cursors — a relay message id or a raw Discord snowflake): pass ' +
+      '`before` to scroll back, `after` to scroll forward.',
     inputSchema: {
       type: 'object',
       properties: {
         channelId: { type: 'string' },
+        threadId: { type: 'string', description: 'Target a thread under channelId' },
         limit: { type: 'number', description: 'Max messages (default 50)' },
+        before: { type: 'string', description: 'Only messages before this id/snowflake (scroll back)' },
+        after: { type: 'string', description: 'Only messages after this id/snowflake (scroll forward)' },
       },
       required: ['channelId'],
+    },
+  },
+  {
+    name: 'fetch_around',
+    description:
+      'Fetch a window of messages centred on a message id — the older and newer ' +
+      'halves of context around it. Useful to expand context around a missed ' +
+      'mention or a referenced message.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string' },
+        messageId: { type: 'string', description: 'Relay message id (or snowflake) to centre on' },
+        threadId: { type: 'string', description: 'Target a thread under channelId' },
+        limit: { type: 'number', description: 'Total window size (default 50, split before/after)' },
+      },
+      required: ['channelId', 'messageId'],
     },
   },
   {
@@ -193,20 +216,44 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'get_pending_pings',
-    description: 'List messages addressed to you (role mention or reply) that you have not marked read.',
+    description:
+      'List messages addressed to you (role mention or reply) that you have not ' +
+      'marked read. Server-authoritative and durable — includes pings that ' +
+      'arrived while you were offline.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'list_unread',
-    description: 'Summarize unread messages per channel.',
+    description:
+      'Summarize unread messages per channel (count + a preview of the latest). ' +
+      'Reflects traffic accrued while offline, across every channel you can read.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
-    name: 'mark_read',
-    description: 'Mark a channel read up to now, clearing its unread count and pending pings.',
+    name: 'channel_missed',
+    description:
+      'How much you missed in one channel since your last read: message count, ' +
+      'total characters, and the latest preview. Bodies are not stored — use ' +
+      'fetch_history to read them. Handy to decide whether a channel is worth ' +
+      'catching up on.',
     inputSchema: {
       type: 'object',
       properties: { channelId: { type: 'string' } },
+      required: ['channelId'],
+    },
+  },
+  {
+    name: 'mark_read',
+    description:
+      'Mark a channel read, clearing its unread count and pending pings. Durable ' +
+      '(advances the server watermark). Pass uptoCreatedAt to mark read only up ' +
+      'to a point; omit to mark read to now.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string' },
+        uptoCreatedAt: { type: 'string', description: 'ISO-8601; mark read only up to this time' },
+      },
       required: ['channelId'],
     },
   },

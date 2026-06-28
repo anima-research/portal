@@ -14,6 +14,7 @@ import {
   type ChannelDescriptor,
   type ChannelsCloseParams,
   type ChannelsCloseResult,
+  type ChannelsIncomingParams,
   type ChannelsListResult,
   type ChannelsOpenParams,
   type ChannelsOpenResult,
@@ -29,8 +30,9 @@ import {
   type PushEventParams,
 } from '@animalabs/mcpl-core';
 import type { PortalClient } from '@animalabs/portal-client';
-import type { PortalMessage } from '@animalabs/portal-protocol';
+import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
 import type { PortalAgent } from './agent.js';
+import type { PendingPing } from './agent-state.js';
 import { parsePortalChannelId, portalChannelId, toDescriptor } from './channels.js';
 import { featureSets } from './feature-sets.js';
 
@@ -38,6 +40,13 @@ export class PortalMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
   private registered = new Set<string>();
+  /** Portal channel ids the host has opened — routed via channels/incoming so
+   *  ambient traffic folds into the open conversation; closed channels use
+   *  push/event (which the host's wake gate evaluates). Mirrors discord-mcpl. */
+  private openChannels = new Set<string>();
+  /** Ping message ids already surfaced as a wake (live or catch-up), so a
+   *  reconnect doesn't re-wake for the same offline-accrued pings. */
+  private wokenPings = new Set<string>();
   private eventSeq = 0;
 
   constructor(
@@ -134,6 +143,7 @@ export class PortalMcplServer {
             break;
           }
           void this.client.subscribe(channelId).catch(() => {});
+          this.openChannels.add(channelId);
           const result: ChannelsOpenResult = { channel: toDescriptor(channel) };
           conn.sendResponse(req.id, result);
           break;
@@ -141,7 +151,10 @@ export class PortalMcplServer {
         case method.CHANNELS_CLOSE: {
           const close = params as unknown as ChannelsCloseParams;
           const channelId = parsePortalChannelId(close.channelId);
-          if (channelId) void this.client.unsubscribe(channelId).catch(() => {});
+          if (channelId) {
+            void this.client.unsubscribe(channelId).catch(() => {});
+            this.openChannels.delete(channelId);
+          }
           const result: ChannelsCloseResult = { closed: true };
           conn.sendResponse(req.id, result);
           break;
@@ -186,8 +199,14 @@ export class PortalMcplServer {
   private wireClient(): void {
     this.client.on('ready', () => {
       if (this.mcplEnabled) this.registerChannels();
+      void this.catchUp().catch((err) =>
+        console.error('[portal-mcpl] catch-up failed:', (err as Error).message),
+      );
     });
-    this.client.on('message', (e) => this.pushMessage(e.message));
+    this.client.on('message', (e) => {
+      if (e.addressedToMe) this.wokenPings.add(e.message.id); // live wake covers it
+      this.pushMessage(e.message, e.addressedToMe, e.reasons);
+    });
     this.client.on('messageDelete', (e) => {
       if (!this.conn || !this.mcplEnabled) return;
       this.conn
@@ -208,20 +227,108 @@ export class PortalMcplServer {
     });
   }
 
-  private pushMessage(message: PortalMessage): void {
+  /**
+   * Forward an inbound message to the host with discord-mcpl-parity addressing
+   * metadata so the host's wake gate fires the same way: an *open* channel uses
+   * channels/incoming (ambient folds into the conversation); a closed channel
+   * uses push/event (the gate decides whether to wake). The wake flags
+   * (isMention/isExplicitMention/isReplyToBot/isBot/isDM) are derived from the
+   * relay's per-persona AddressInfo — no client-side guessing.
+   */
+  private pushMessage(message: PortalMessage, addressedToMe: boolean, reasons: AddressReason[]): void {
     if (!this.conn || !this.mcplEnabled) return;
     const conn = this.conn;
+    const meta = wakeMetadata(message, addressedToMe, reasons);
+    const channelMcplId = portalChannelId(message.channelId);
     void buildContent(message).then((content) => {
-      conn
-        .sendRequest(method.PUSH_EVENT, {
-          featureSet: 'portal.messaging',
-          eventId: `portal_msg_${message.id}_${this.eventSeq++}`,
-          timestamp: message.createdAt,
-          origin: { source: 'portal', channelId: portalChannelId(message.channelId) },
-          payload: { content },
-        } satisfies PushEventParams)
-        .catch(() => {});
+      if (this.openChannels.has(message.channelId)) {
+        conn
+          .sendRequest(method.CHANNELS_INCOMING, {
+            messages: [
+              {
+                channelId: channelMcplId,
+                messageId: message.id,
+                threadId: message.threadId,
+                author: authorOf(message),
+                timestamp: message.createdAt,
+                content,
+                metadata: meta,
+              },
+            ],
+          } satisfies ChannelsIncomingParams)
+          .catch(() => {});
+      } else {
+        conn
+          .sendRequest(method.PUSH_EVENT, {
+            featureSet: 'portal.messaging',
+            eventId: `portal_msg_${message.id}_${this.eventSeq++}`,
+            timestamp: message.createdAt,
+            // Flat on origin (discord-mcpl parity) — the wake gate reads these.
+            origin: {
+              source: 'portal',
+              messageId: message.id,
+              channelId: channelMcplId,
+              channelName: this.channelLabel(message.channelId),
+              guildId: message.guildId,
+              threadId: message.threadId,
+              authorId: authorOf(message).id,
+              authorName: authorOf(message).name,
+              ...meta,
+            },
+            payload: { content },
+          } satisfies PushEventParams)
+          .catch(() => {});
+      }
     });
+  }
+
+  /** On (re)connect, wake once for pings the relay accrued while we were away.
+   *  Server-authoritative — an O(missed) read, no Discord history scan. */
+  private async catchUp(): Promise<void> {
+    if (!this.conn || !this.mcplEnabled) return;
+    const conn = this.conn;
+    let pings: PendingPing[];
+    try {
+      pings = await this.agent.pendingPingsFromRelay();
+    } catch {
+      return; // relay not ready yet; a later ready will retry
+    }
+    const fresh = pings.filter((p) => !this.wokenPings.has(p.message.id));
+    if (fresh.length === 0) return;
+    for (const p of fresh) this.wokenPings.add(p.message.id);
+    fresh.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+
+    const lines = [`[catch-up] ${fresh.length} message(s) addressed to you while you were away:`];
+    for (const p of fresh) {
+      lines.push(`— ${this.channelLabel(p.message.channelId)}: ${render(p.message)}`);
+    }
+    lines.push('[use fetch_history / fetch_around for context, then mark_read]');
+    const latest = fresh[fresh.length - 1].message;
+    conn
+      .sendRequest(method.PUSH_EVENT, {
+        featureSet: 'portal.messaging',
+        eventId: `portal_catchup_${latest.id}_${this.eventSeq++}`,
+        timestamp: latest.createdAt,
+        // isExplicitMention=true so the host's wake gate surfaces the catch-up.
+        origin: {
+          source: 'portal',
+          channelId: portalChannelId(latest.channelId),
+          messageId: latest.id,
+          isMention: true,
+          isExplicitMention: true,
+          isReplyToBot: false,
+          isBot: false,
+          isDM: false,
+          catchup: true,
+        },
+        payload: { content: [textContent(lines.join('\n'))] },
+      } satisfies PushEventParams)
+      .catch(() => {});
+  }
+
+  private channelLabel(channelId: string): string {
+    const name = this.client.cache.getChannel(channelId)?.name;
+    return name ? `#${name}` : channelId;
   }
 
   // ── Channels ──
@@ -237,6 +344,41 @@ export class PortalMcplServer {
     for (const d of added) this.registered.add(d.id);
     this.conn.sendNotification(method.CHANNELS_CHANGED, { added });
   }
+}
+
+/** discord-mcpl-parity wake flags, derived from the relay's AddressInfo. The
+ *  host's gate matches `metadataTrue` (any-of) against these. */
+function wakeMetadata(
+  message: PortalMessage,
+  addressedToMe: boolean,
+  reasons: AddressReason[],
+): Record<string, unknown> {
+  const isExplicitMention = reasons.includes('role_mention') || reasons.includes('name_mention');
+  const isReplyToBot = reasons.includes('reply');
+  const isDM = message.guildId === null || reasons.includes('dm');
+  const isMention = isExplicitMention || isReplyToBot;
+  // A persona author is one of our agents (posted via webhook → bot-like); a
+  // user author may be a real bot. Matches discord-mcpl's isBot semantics so the
+  // host's bot-skip policy behaves identically.
+  const isBot =
+    message.author.kind === 'persona' || (message.author.kind === 'user' && message.author.bot);
+  return {
+    addressed: addressedToMe,
+    reasons: reasons.join(','),
+    isMention,
+    isExplicitMention,
+    isReplyToBot,
+    isBot,
+    isDM,
+  };
+}
+
+/** Host-facing author {id, name} for channels/incoming. */
+function authorOf(message: PortalMessage): { id: string; name: string } {
+  const a = message.author;
+  if (a.kind === 'persona') return { id: a.personaId, name: a.displayName };
+  if (a.kind === 'user') return { id: a.userId, name: a.displayName || a.username };
+  return { id: 'system', name: 'system' };
 }
 
 /** Max image bytes to fetch + inline as a vision block. */

@@ -73,6 +73,33 @@ export class PortalAgent {
     return toolDefinitions;
   }
 
+  /** Server-authoritative pending pings, including any accrued while this
+   *  session was offline. Used by the channel binding for reconnect catch-up. */
+  async pendingPingsFromRelay(): Promise<PendingPing[]> {
+    const { pings } = await this.client.call('get_pending_pings', {});
+    return pings;
+  }
+
+  /** Fetch a window of messages centred on `messageId` (the relay returns the
+   *  older and newer halves; the anchor itself may not be included). */
+  private async fetchAround(
+    channelId: string,
+    messageId: string,
+    limit: number,
+    threadId?: string,
+  ): Promise<{ messages: PortalMessage[] }> {
+    const half = Math.max(1, Math.floor(limit / 2));
+    const [older, newer] = await Promise.all([
+      this.client.fetchHistory({ channelId, threadId, before: messageId, limit: half }),
+      this.client.fetchHistory({ channelId, threadId, after: messageId, limit: half }),
+    ]);
+    const seen = new Set<string>();
+    const messages = [...older.messages, ...newer.messages]
+      .filter((m) => (seen.has(m.id) ? false : (seen.add(m.id), true)))
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+    return { messages };
+  }
+
   /** Dispatch a tool call. Returns a plain JSON-able result. */
   async handleToolCall(name: string, args: Record<string, unknown>): Promise<unknown> {
     switch (name) {
@@ -93,8 +120,18 @@ export class PortalAgent {
       case 'fetch_history':
         return this.client.fetchHistory({
           channelId: str(args.channelId),
+          threadId: optStr(args.threadId),
           limit: typeof args.limit === 'number' ? args.limit : undefined,
+          before: optStr(args.before),
+          after: optStr(args.after),
         });
+      case 'fetch_around':
+        return this.fetchAround(
+          str(args.channelId),
+          str(args.messageId),
+          typeof args.limit === 'number' ? args.limit : 50,
+          optStr(args.threadId),
+        );
       case 'list_guilds':
         return this.client.call('list_guilds', {});
       case 'list_channels':
@@ -133,12 +170,21 @@ export class PortalAgent {
       case 'list_pins':
         return this.client.call('list_pins', { channelId: str(args.channelId) });
       case 'get_pending_pings':
-        return { pings: this.state.pendingPings() };
+        // Server-authoritative: includes pings accrued while this session was
+        // offline (the relay accumulates for every persona, online or not).
+        return this.client.call('get_pending_pings', {});
       case 'list_unread':
-        return { channels: this.state.unreadByChannel() };
-      case 'mark_read':
-        this.state.markRead(str(args.channelId));
+        return this.client.call('list_unread', {});
+      case 'channel_missed':
+        return this.client.call('channel_missed', { channelId: str(args.channelId) });
+      case 'mark_read': {
+        const channelId = str(args.channelId);
+        const uptoCreatedAt = optStr(args.uptoCreatedAt);
+        // Advance the server watermark (durable) and the local live-wake state.
+        this.state.markRead(channelId, uptoCreatedAt);
+        await this.client.call('mark_read', { channelId, uptoCreatedAt });
         return { ok: true };
+      }
       default:
         throw new Error(`unknown tool ${name}`);
     }

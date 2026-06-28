@@ -50,6 +50,14 @@ export interface IncomingAttachment {
   size: number;
 }
 
+/** A reaction summary as carried on a fetched/converted message (counts only;
+ *  reactor identities arrive via the live reaction_add/remove events). */
+export interface IncomingReactionSummary {
+  /** Unicode emoji or `name:id` for a custom emoji. */
+  emoji: string;
+  count: number;
+}
+
 export interface IncomingMessage {
   id: string;
   content: string;
@@ -72,6 +80,8 @@ export interface IncomingMessage {
   replyToId?: string;
   replyToUserId?: string | null;
   attachments: IncomingAttachment[];
+  /** Native reaction summaries (emoji + count). Empty when none / not cached. */
+  reactions: IncomingReactionSummary[];
   timestamp: Date;
 }
 
@@ -710,6 +720,10 @@ export class DiscordBot implements WebhookOps, RoleOps {
           contentType: a.contentType ?? null,
           size: a.size ?? 0,
         })) ?? [],
+      reactions: [...(msg.reactions?.cache?.values() ?? [])].map((r) => ({
+        emoji: r.emoji.id ? `${r.emoji.name}:${r.emoji.id}` : (r.emoji.name ?? '?'),
+        count: r.count ?? 0,
+      })),
       timestamp: msg.createdAt ?? new Date(),
     };
   }

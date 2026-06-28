@@ -7,6 +7,9 @@
 // v2 (RFC-005): additive `claim_invite` + `rotate_token` RPC methods. Backward
 // compatible — older clients simply never call them; the relay does not refuse a
 // lower client version.
-export const PORTAL_PROTOCOL_VERSION = 2 as const;
+// v3: additive server-authoritative read-state RPC — `get_pending_pings`,
+// `list_unread`, `mark_read`, `channel_missed`. Same compatibility contract:
+// older clients never call them; the relay still accepts lower client versions.
+export const PORTAL_PROTOCOL_VERSION = 3 as const;
 
 export type ProtocolVersion = typeof PORTAL_PROTOCOL_VERSION;

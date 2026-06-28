@@ -27,6 +27,7 @@ import { InviteStore } from './invites.js';
 import { MessageStore, makeRelayId, parseRelayId, type MessageRef } from './message-store.js';
 import { MirrorCache } from './mirror-cache.js';
 import { PermissionsStore, type PermissionChange, computeCapabilities } from './permissions.js';
+import { ReadStateStore } from './read-state.js';
 import { RolePool } from './role-pool.js';
 import { WebhookPool } from './webhook-pool.js';
 import { AdminServer, type AdminDeps } from './admin/server.js';
@@ -40,6 +41,7 @@ export class Relay implements GatewayHooks {
   private roles: RolePool;
   private webhooks: WebhookPool;
   private store: MessageStore;
+  private readState: ReadStateStore;
   private history: HistoryCache;
   private gateway: Gateway;
   private mirror: MirrorCache;
@@ -55,6 +57,11 @@ export class Relay implements GatewayHooks {
       allowPathFiles: config.allowPathFiles,
     });
     this.store = new MessageStore({ path: config.attributionPath });
+    this.readState = new ReadStateStore({
+      path: config.readStatePath,
+      pingsCap: config.readStatePingsCap,
+      channelsCap: config.readStateChannelsCap,
+    });
     this.history = new HistoryCache(config.historyCacheTtlMs);
     this.identity = new IdentityStore(config.identityPath, config.avatarBaseUrl);
     this.permissions = new PermissionsStore(config.permissionsPath);
@@ -141,6 +148,7 @@ export class Relay implements GatewayHooks {
     this.permissions.stopWatching();
     this.invites?.stopWatching();
     this.store.flush();
+    this.readState.flush();
     await this.admin?.close();
     await this.gateway.close();
     await this.bot.disconnect();
@@ -162,6 +170,7 @@ export class Relay implements GatewayHooks {
   private async onIdentityChange(c: IdentityChange): Promise<void> {
     if (c.kind === 'remove') {
       this.gateway.closePersona(c.id);
+      this.readState.forget(c.id);
       return;
     }
     const renamed = c.prev && c.prev.displayName !== c.next.displayName;
@@ -556,6 +565,19 @@ export class Relay implements GatewayHooks {
         await this.bot.sendTyping(p.threadId ?? p.channelId);
         return {};
       }
+      case 'get_pending_pings':
+        return { pings: this.readState.pendingPings(personaId) };
+      case 'list_unread':
+        return { channels: this.readState.unread(personaId) };
+      case 'mark_read': {
+        const p = params as RpcParams<'mark_read'>;
+        this.readState.markRead(personaId, p.channelId, p.uptoCreatedAt);
+        return {};
+      }
+      case 'channel_missed': {
+        const p = params as RpcParams<'channel_missed'>;
+        return this.readState.missed(personaId, p.channelId);
+      }
       case 'claim_invite': {
         const p = params as RpcParams<'claim_invite'>;
         const result = this.applyInviteAugment(personaId, p.code);
@@ -713,20 +735,64 @@ export class Relay implements GatewayHooks {
     message: PortalMessage,
     authorPersonaId?: string,
   ): void {
+    // Durable, server-authoritative accumulation for EVERY persona (online or
+    // not) — the substrate for offline catch-up. Only on create, so edits don't
+    // double-count.
+    if (type === 'message_create') this.accumulateReadState(message, authorPersonaId);
+
+    // Live dispatch: connected sessions only, addressed OR live-subscribed.
     for (const personaId of this.gateway.activePersonas()) {
       if (authorPersonaId && personaId === authorPersonaId) continue; // not your own message
-      const reasons: AddressReason[] = [];
-      if (message.mentions.personas.includes(personaId)) reasons.push('role_mention');
-      if (message.replyToId) {
-        const ref = this.store.getByRelayId(message.replyToId);
-        if (ref?.personaId === personaId) reasons.push('reply');
-      }
+      const reasons = this.reasonsFor(message, personaId);
       const addressedToMe = reasons.length > 0;
       const subscribed = this.gateway.personaSubscribed(personaId, message.channelId);
       if (!addressedToMe && !subscribed) continue;
       if (subscribed && !addressedToMe) reasons.push('subscription');
       this.gateway.dispatch(personaId, { type, message, addressedToMe, reasons });
     }
+  }
+
+  /** Why a message is addressed to a persona: role mention and/or reply. */
+  private reasonsFor(message: PortalMessage, personaId: string): AddressReason[] {
+    const reasons: AddressReason[] = [];
+    if (message.mentions.personas.includes(personaId)) reasons.push('role_mention');
+    if (message.replyToId) {
+      const ref = this.store.getByRelayId(message.replyToId);
+      if (ref?.personaId === personaId) reasons.push('reply');
+    }
+    return reasons;
+  }
+
+  /**
+   * Fold a new message into every persona's durable read-state. Addressed
+   * messages are recorded for any persona regardless of subscription; ambient
+   * messages only for personas that can actually view the channel (so an
+   * offline persona's unread reflects all channels it can read — the "all
+   * personas, all channels" policy — without leaking channels it can't see).
+   */
+  private accumulateReadState(message: PortalMessage, authorPersonaId?: string): void {
+    for (const cfg of this.identity.all()) {
+      const personaId = cfg.id;
+      if (authorPersonaId && personaId === authorPersonaId) continue;
+      const reasons = this.reasonsFor(message, personaId);
+      const addressedToMe = reasons.length > 0;
+      if (!addressedToMe && !this.personaCanViewChannel(personaId, message.channelId, message.guildId)) {
+        continue;
+      }
+      this.readState.record(personaId, message, addressedToMe, reasons);
+    }
+  }
+
+  /** Whether a persona can see a channel (gates ambient accumulation). Cheap
+   *  guild pre-filter first, then the VIEW_CHANNEL capability. */
+  private personaCanViewChannel(
+    personaId: string,
+    channelId: string,
+    guildId: string | null,
+  ): boolean {
+    if (!guildId) return false;
+    if (!this.personaCanAccessGuild(personaId, guildId)) return false;
+    return this.capsFor(personaId, channelId, guildId).includes('VIEW_CHANNEL');
   }
 
   /** Native (human) reaction add/remove → dispatch to channel subscribers + the
@@ -851,7 +917,12 @@ export class Relay implements GatewayHooks {
         everyone: inc.mentionsEveryone,
       },
       replyToId,
-      reactions: [],
+      reactions: inc.reactions.map((r) => ({
+        emoji: r.emoji,
+        count: r.count,
+        kind: 'native' as const,
+        by: [],
+      })),
       createdAt: inc.timestamp.toISOString(),
     };
     return { message, authorPersonaId };

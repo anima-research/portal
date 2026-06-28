@@ -189,6 +189,14 @@ export interface RelayConfig {
   /** Optional path to persist message attribution (id→persona/webhook). Enables
    *  per-persona edit/delete ownership of pre-restart messages. */
   attributionPath?: string;
+  /** Optional path to persist per-persona read-state (watermarks, pending pings,
+   *  ambient tallies). Enables offline catch-up that survives relay restarts. */
+  readStatePath?: string;
+  /** Max pending pings retained per persona (oldest dropped). Default 500. */
+  readStatePingsCap?: number;
+  /** Max channels with a live unread tally per persona (least-recent dropped).
+   *  Default 1000. */
+  readStateChannelsCap?: number;
   rolePool: RolePoolConfig;
   webhookPoolSize: number;
   heartbeatIntervalMs: number;
@@ -222,6 +230,13 @@ export function loadConfig(): RelayConfig {
     permissionsPath: requireEnv('PORTAL_PERMISSIONS'),
     invitesPath: process.env.PORTAL_INVITES || undefined,
     attributionPath: process.env.PORTAL_ATTRIBUTION || undefined,
+    readStatePath: process.env.PORTAL_READSTATE || undefined,
+    readStatePingsCap: process.env.PORTAL_READSTATE_PINGS_CAP
+      ? parseInt(process.env.PORTAL_READSTATE_PINGS_CAP, 10)
+      : undefined,
+    readStateChannelsCap: process.env.PORTAL_READSTATE_CHANNELS_CAP
+      ? parseInt(process.env.PORTAL_READSTATE_CHANNELS_CAP, 10)
+      : undefined,
     rolePool: {
       size: parseInt(process.env.PORTAL_ROLE_POOL_SIZE ?? '50', 10),
       prefix: process.env.PORTAL_ROLE_POOL_PREFIX ?? 'portal-',

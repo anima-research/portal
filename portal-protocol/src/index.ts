@@ -18,6 +18,7 @@ export * from './channel.js';
 export * from './message.js';
 export * from './members.js';
 export * from './events.js';
+export * from './read-state.js';
 export * from './rpc.js';
 export * from './frames.js';
 export * from './guards.js';
