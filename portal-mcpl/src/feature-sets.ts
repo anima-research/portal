@@ -7,6 +7,27 @@ export const featureSets: FeatureSetDeclaration[] = [
     uses: ['tools', 'channels.publish'],
     rollback: false,
     hostState: false,
+    // MCPL RFC-001 — tags carried on portal message events (emits umbrellas
+    // directly, so no host-side implication expansion is needed).
+    tagOntology: {
+      coreTags: [
+        'chat:addressed', 'chat:mention', 'chat:reply', 'chat:dm', 'chat:ambient',
+        'chat:from-human', 'chat:from-bot', 'chat:from-agent', 'chat:deleted',
+        'chat:has-image', 'chat:has-audio', 'chat:has-file', 'chat:thread',
+      ],
+      tags: {
+        'portal:role-mention': { desc: 'Addressed via the persona\'s pooled role mention', facet: 'addressing', implies: ['chat:mention'] },
+        'portal:name-mention': { desc: 'Addressed by display-name match', facet: 'addressing', implies: ['chat:mention'] },
+        'portal:subscription': { desc: 'Ambient message from a subscribed channel', facet: 'addressing', implies: ['chat:ambient'] },
+        'portal:persona': { desc: 'Authored by another portal persona/agent', facet: 'sender', implies: ['chat:from-agent'] },
+      },
+      defaultTreatment: [
+        { tagsAny: ['chat:addressed'], behavior: 'immediate' },
+        { tagsAny: ['chat:deleted'], behavior: 'mute' },
+        { tagsAny: ['chat:ambient', 'chat:from-bot'], behavior: { throttle: { perMs: 120000 } } },
+      ],
+      open: false,
+    },
   },
   {
     name: 'portal.channels',

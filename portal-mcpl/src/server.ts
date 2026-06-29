@@ -219,6 +219,7 @@ export class PortalMcplServer {
           eventId: `portal_del_${e.messageId}`,
           timestamp: new Date().toISOString(),
           origin: { source: 'portal', channelId: portalChannelId(e.channelId) },
+          tags: ['chat:deleted'],
           payload: { content: [textContent(`[message deleted] ${e.messageId}`)] },
         } satisfies PushEventParams)
         .catch(() => {});
@@ -243,6 +244,7 @@ export class PortalMcplServer {
     if (!this.conn || !this.mcplEnabled) return;
     const conn = this.conn;
     const meta = wakeMetadata(message, addressedToMe, reasons);
+    const tags = deriveTags(message, addressedToMe, reasons);
     const channelMcplId = portalChannelId(message.channelId);
     void buildContent(message).then((content) => {
       if (this.openChannels.has(message.channelId)) {
@@ -257,6 +259,7 @@ export class PortalMcplServer {
                 timestamp: message.createdAt,
                 content,
                 metadata: meta,
+                tags,
               },
             ],
           } satisfies ChannelsIncomingParams)
@@ -279,6 +282,7 @@ export class PortalMcplServer {
               authorName: authorOf(message).name,
               ...meta,
             },
+            tags, // MCPL RFC-001 — the host routes/gates on these
             payload: { content },
           } satisfies PushEventParams)
           .catch(() => {});
@@ -325,6 +329,7 @@ export class PortalMcplServer {
           isDM: false,
           catchup: true,
         },
+        tags: ['chat:addressed', 'chat:mention'],
         payload: { content: [textContent(lines.join('\n'))] },
       } satisfies PushEventParams)
       .catch(() => {});
@@ -375,6 +380,45 @@ function wakeMetadata(
     isBot,
     isDM,
   };
+}
+
+/**
+ * MCPL RFC-001 event tags for a portal message. Emits the reserved `chat:*` core
+ * (including umbrellas like `chat:addressed`, so no host-side implication
+ * expansion is required) plus the `portal:*` namespace. Derived from the relay's
+ * per-persona AddressInfo — authoritative, no guessing.
+ */
+function deriveTags(
+  message: PortalMessage,
+  addressedToMe: boolean,
+  reasons: AddressReason[],
+): string[] {
+  const t = new Set<string>();
+  const mention = reasons.includes('role_mention') || reasons.includes('name_mention');
+  if (mention) t.add('chat:mention');
+  if (reasons.includes('reply')) t.add('chat:reply');
+  if (message.guildId === null || reasons.includes('dm')) t.add('chat:dm');
+  t.add(addressedToMe ? 'chat:addressed' : 'chat:ambient');
+  // sender
+  if (message.author.kind === 'persona') {
+    t.add('chat:from-agent');
+    t.add('portal:persona');
+  } else if (message.author.kind === 'user') {
+    t.add(message.author.bot ? 'chat:from-bot' : 'chat:from-human');
+  }
+  // content modality
+  for (const a of message.attachments ?? []) {
+    const ct = (a.contentType ?? '').toLowerCase();
+    if (ct.startsWith('image/')) t.add('chat:has-image');
+    else if (ct.startsWith('audio/')) t.add('chat:has-audio');
+    else t.add('chat:has-file');
+  }
+  if (message.threadId) t.add('chat:thread');
+  // portal namespace specifics
+  if (reasons.includes('role_mention')) t.add('portal:role-mention');
+  if (reasons.includes('name_mention')) t.add('portal:name-mention');
+  if (reasons.includes('subscription')) t.add('portal:subscription');
+  return [...t];
 }
 
 /** Host-facing author {id, name} for channels/incoming. */
