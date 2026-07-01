@@ -529,6 +529,10 @@ export class Relay implements GatewayHooks {
       }
       case 'subscribe_channel': {
         const p = params as RpcParams<'subscribe_channel'>;
+        // Gate subscription on the same VIEW_CHANNEL capability every other
+        // channel RPC enforces. Without this a persona could subscribe to a
+        // channel it cannot view and receive its live dispatch — an info leak.
+        this.requireCap(personaId, p.channelId, 'VIEW_CHANNEL');
         session.subscriptions.add(p.channelId);
         return {};
       }
@@ -747,6 +751,14 @@ export class Relay implements GatewayHooks {
       const addressedToMe = reasons.length > 0;
       const subscribed = this.gateway.personaSubscribed(personaId, message.channelId);
       if (!addressedToMe && !subscribed) continue;
+      // Defense-in-depth: a subscription can outlive the persona's access (e.g.
+      // a role revoked after subscribe). Re-check VIEW_CHANNEL on the ambient
+      // branch so live dispatch never leaks a channel the persona can no longer
+      // view — mirroring the durable read-state gate in accumulateReadState.
+      if (subscribed && !addressedToMe &&
+          !this.personaCanViewChannel(personaId, message.channelId, message.guildId)) {
+        continue;
+      }
       if (subscribed && !addressedToMe) reasons.push('subscription');
       this.gateway.dispatch(personaId, { type, message, addressedToMe, reasons });
     }
@@ -795,6 +807,14 @@ export class Relay implements GatewayHooks {
     return this.capsFor(personaId, channelId, guildId).includes('VIEW_CHANNEL');
   }
 
+  /** Same view-gate as personaCanViewChannel, but derives the guild from the
+   *  channel (for subscription-driven dispatch paths that only hold a channelId,
+   *  e.g. reactions/pins/deletes). Mirrors how requireCap resolves the guild. */
+  private personaCanViewChannelId(personaId: string, channelId: string): boolean {
+    const guildId = this.bot.channelForPerms(channelId)?.guildId ?? null;
+    return this.personaCanViewChannel(personaId, channelId, guildId);
+  }
+
   /** Native (human) reaction add/remove → dispatch to channel subscribers + the
    *  reacted message's author persona. */
   private onReactionEvent(kind: 'add' | 'remove', r: import('./discord-bot.js').IncomingReaction): void {
@@ -802,7 +822,10 @@ export class Relay implements GatewayHooks {
     const ownerRef = this.store.getByRelayId(relayId);
     const targets = new Set<string>();
     for (const p of this.gateway.activePersonas()) {
-      if (this.gateway.personaSubscribed(p, r.channelId)) targets.add(p);
+      // Subscription-driven reaction delivery must respect VIEW_CHANNEL; the
+      // reacted message's author (ownerRef, added below) is notified regardless.
+      if (this.gateway.personaSubscribed(p, r.channelId) &&
+          this.personaCanViewChannelId(p, r.channelId)) targets.add(p);
     }
     if (ownerRef?.personaId) targets.add(ownerRef.personaId);
     const actor = { kind: 'user' as const, id: r.userId, name: r.userName };
@@ -830,7 +853,8 @@ export class Relay implements GatewayHooks {
 
   private onPinsUpdate(channelId: string): void {
     for (const personaId of this.gateway.activePersonas()) {
-      if (this.gateway.personaSubscribed(personaId, channelId)) {
+      if (this.gateway.personaSubscribed(personaId, channelId) &&
+          this.personaCanViewChannelId(personaId, channelId)) {
         this.gateway.dispatch(personaId, { type: 'pins_update', channelId });
       }
     }
@@ -850,6 +874,10 @@ export class Relay implements GatewayHooks {
       const subscribed = this.gateway.personaSubscribed(personaId, targetChannel);
       const owner = ref?.personaId === personaId;
       if (!subscribed && !owner) continue;
+      // Owner is always told their own message was deleted; subscription-driven
+      // delete notices respect VIEW_CHANNEL like every other ambient signal.
+      if (subscribed && !owner &&
+          !this.personaCanViewChannelId(personaId, targetChannel)) continue;
       this.gateway.dispatch(personaId, {
         type: 'message_delete',
         channelId: targetChannel,

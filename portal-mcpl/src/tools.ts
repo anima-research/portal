@@ -12,8 +12,11 @@ export interface ToolDefinition {
 const FILES_PROP = {
   type: 'array',
   description:
-    'Optional file attachments (up to 10; ~8 MiB total). Provide each file as ' +
-    'inline base64 `bytes` (preferred — works from anywhere) with a `name`.',
+    'Optional file attachments (up to 10; ~8 MiB total). This (portal) surface ' +
+    'takes inline base64 BYTES: provide each file as `bytes` (preferred — works ' +
+    'from anywhere) with a `name`. A host `path` works only if the relay is ' +
+    'configured to read path files. (The discord-mcpl surface is the opposite — ' +
+    'it uploads by host file PATH and does NOT accept base64 bytes.)',
   items: {
     type: 'object',
     properties: {
@@ -26,6 +29,24 @@ const FILES_PROP = {
   },
 };
 
+/**
+ * Shared param descriptions that spell out how this surface's ids differ from
+ * the discord-mcpl surface, so an agent that learned one does not silently
+ * mis-call the other. portal/portal-mcpl talks to a relay (not Discord
+ * directly) and uses durable, globally-unique message ids.
+ */
+const RELAY_MESSAGE_ID_DESC =
+  'Durable RELAY message id — globally unique across all channels. Do NOT pass a ' +
+  'channelId with it. (The discord-mcpl surface differs: its message ids are ' +
+  'Discord snowflakes, unique only within a channel, and its edit/delete/react ' +
+  'tools need channelId+messageId together.)';
+
+const PORTAL_CHANNEL_ID_DESC =
+  'Portal channel (or thread) id. Surface marker: portal namespaces its MCPL ' +
+  'channels as `portal:<channelId>` (no guild segment; the snowflake is globally ' +
+  'unique) — a different id space from the discord-mcpl surface ' +
+  '(`discord:<guildId>:<channelId>`).';
+
 export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'send_message',
@@ -35,7 +56,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string', description: 'Channel or thread id' },
+        channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC },
         content: { type: 'string', description: 'Message content (optional if files attached)' },
         files: FILES_PROP,
         replyToId: { type: 'string', description: 'Relay message id to reply to (rendered as a quoted link)' },
@@ -54,7 +75,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        messageId: { type: 'string', description: 'Relay message id' },
+        messageId: { type: 'string', description: RELAY_MESSAGE_ID_DESC },
         content: { type: 'string' },
       },
       required: ['messageId', 'content'],
@@ -65,7 +86,7 @@ export const toolDefinitions: ToolDefinition[] = [
     description: 'Delete one of your own messages.',
     inputSchema: {
       type: 'object',
-      properties: { messageId: { type: 'string', description: 'Relay message id' } },
+      properties: { messageId: { type: 'string', description: RELAY_MESSAGE_ID_DESC } },
       required: ['messageId'],
     },
   },
@@ -77,7 +98,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        messageId: { type: 'string' },
+        messageId: { type: 'string', description: RELAY_MESSAGE_ID_DESC },
         emoji: { type: 'string', description: 'Unicode emoji or name:id' },
         visible: { type: 'boolean', description: 'Also post a visible reaction line (default false)' },
       },
@@ -93,7 +114,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string' },
+        channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC },
         threadId: { type: 'string', description: 'Target a thread under channelId' },
         limit: { type: 'number', description: 'Max messages (default 50)' },
         before: { type: 'string', description: 'Only messages before this id/snowflake (scroll back)' },
@@ -111,7 +132,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string' },
+        channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC },
         messageId: { type: 'string', description: 'Relay message id (or snowflake) to centre on' },
         threadId: { type: 'string', description: 'Target a thread under channelId' },
         limit: { type: 'number', description: 'Total window size (default 50, split before/after)' },
@@ -138,7 +159,7 @@ export const toolDefinitions: ToolDefinition[] = [
     description: 'Create a thread under a channel.',
     inputSchema: {
       type: 'object',
-      properties: { channelId: { type: 'string' }, name: { type: 'string' } },
+      properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC }, name: { type: 'string' } },
       required: ['channelId', 'name'],
     },
   },
@@ -147,7 +168,7 @@ export const toolDefinitions: ToolDefinition[] = [
     description: 'Receive ambient (non-addressed) messages from a channel.',
     inputSchema: {
       type: 'object',
-      properties: { channelId: { type: 'string' } },
+      properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },
       required: ['channelId'],
     },
   },
@@ -156,7 +177,7 @@ export const toolDefinitions: ToolDefinition[] = [
     description: 'Stop receiving ambient messages from a channel.',
     inputSchema: {
       type: 'object',
-      properties: { channelId: { type: 'string' } },
+      properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },
       required: ['channelId'],
     },
   },
@@ -210,7 +231,7 @@ export const toolDefinitions: ToolDefinition[] = [
     description: 'List pinned messages in a channel. Subscribe to receive pins_update events.',
     inputSchema: {
       type: 'object',
-      properties: { channelId: { type: 'string' } },
+      properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },
       required: ['channelId'],
     },
   },
@@ -232,13 +253,16 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: 'channel_missed',
     description:
-      'How much you missed in one channel since your last read: message count, ' +
-      'total characters, and the latest preview. Bodies are not stored — use ' +
-      'fetch_history to read them. Handy to decide whether a channel is worth ' +
-      'catching up on.',
+      'How much you missed in one channel since your last-read WATERMARK: message ' +
+      'count, total characters, and the latest preview. Note the baseline is your ' +
+      'read watermark (see mark_read), NOT an unsubscribe point; the discord-mcpl ' +
+      'surface exposes a same-named `channel_missed` that instead counts since you ' +
+      'UNSUBSCRIBED, so do not assume identical semantics across surfaces. Bodies ' +
+      'are not stored — use fetch_history to read them. Handy to decide whether a ' +
+      'channel is worth catching up on.',
     inputSchema: {
       type: 'object',
-      properties: { channelId: { type: 'string' } },
+      properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },
       required: ['channelId'],
     },
   },
@@ -251,7 +275,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string' },
+        channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC },
         uptoCreatedAt: { type: 'string', description: 'ISO-8601; mark read only up to this time' },
       },
       required: ['channelId'],
