@@ -27,6 +27,9 @@ export interface RoleOps {
 interface GuildPool {
   /** roleId → personaId (null = free/available). */
   bindings: Map<string, string | null>;
+  /** roleId → current Discord role name (kept in sync on discover/rename/create).
+   *  Lets a returning persona re-adopt the role already named for it. */
+  names: Map<string, string>;
   /** personaId → roleId. */
   byPersona: Map<string, string>;
   /** personaIds in LRU order, most-recently-used last. */
@@ -36,6 +39,19 @@ interface GuildPool {
 
 export class RolePool {
   private guilds = new Map<string, GuildPool>();
+  /** Per-guild serialization tail. bind() mutates a guild's pool across awaits
+   *  (scan free → renameRole → assign); without this, simultaneous reconnects
+   *  interleave and double-pick a role or spuriously create/duplicate one. */
+  private guildLocks = new Map<string, Promise<unknown>>();
+
+  /** Run `fn` after any in-flight op for `guildId`, serialized. */
+  private withGuildLock<T>(guildId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.guildLocks.get(guildId) ?? Promise.resolve();
+    const result = prev.then(fn);
+    // Store an error-swallowing tail so one failed bind doesn't poison the chain.
+    this.guildLocks.set(guildId, result.then(() => {}, () => {}));
+    return result;
+  }
 
   constructor(
     private ops: RoleOps,
@@ -51,18 +67,24 @@ export class RolePool {
   private async ensureDiscovered(guildId: string): Promise<GuildPool> {
     let pool = this.guilds.get(guildId);
     if (pool?.discovered) return pool;
-    pool ??= { bindings: new Map(), byPersona: new Map(), lru: [], discovered: false };
+    pool ??= { bindings: new Map(), names: new Map(), byPersona: new Map(), lru: [], discovered: false };
     this.guilds.set(guildId, pool);
     const existing = await this.ops.discoverPooledRoles(guildId, this.prefix);
     for (const r of existing) {
       if (!pool.bindings.has(r.id)) pool.bindings.set(r.id, null);
+      pool.names.set(r.id, r.name);
     }
     pool.discovered = true;
     return pool;
   }
 
-  /** Ensure `personaId` has a bound, mentionable role in `guildId`; return it. */
-  async bind(guildId: string, personaId: string, displayName: string): Promise<string> {
+  /** Ensure `personaId` has a bound, mentionable role in `guildId`; return it.
+   *  Serialized per guild so concurrent reconnects don't race the pool. */
+  bind(guildId: string, personaId: string, displayName: string): Promise<string> {
+    return this.withGuildLock(guildId, () => this.bindLocked(guildId, personaId, displayName));
+  }
+
+  private async bindLocked(guildId: string, personaId: string, displayName: string): Promise<string> {
     const pool = await this.ensureDiscovered(guildId);
 
     const existing = pool.byPersona.get(personaId);
@@ -71,19 +93,32 @@ export class RolePool {
       return existing;
     }
 
-    // 1) reuse a free role
+    const wanted = this.roleName(displayName);
+
+    // 1) reuse a free role — prefer one ALREADY named for this persona so a
+    //    returning persona re-adopts its own role across restarts (no rename, no
+    //    duplicate churn). Fall back to the first free role otherwise.
+    let fallback: string | null = null;
     for (const [roleId, owner] of pool.bindings) {
-      if (owner === null) {
-        await this.ops.renameRole(guildId, roleId, this.roleName(displayName));
-        this.assign(pool, roleId, personaId);
+      if (owner !== null) continue;
+      if (pool.names.get(roleId) === wanted) {
+        this.assign(pool, roleId, personaId); // already correctly named — no rename
         return roleId;
       }
+      if (fallback === null) fallback = roleId;
+    }
+    if (fallback !== null) {
+      await this.ops.renameRole(guildId, fallback, wanted);
+      pool.names.set(fallback, wanted);
+      this.assign(pool, fallback, personaId);
+      return fallback;
     }
 
     // 2) create a new role if under cap
     if (pool.bindings.size < this.size) {
-      const roleId = await this.ops.createRole(guildId, this.roleName(displayName));
+      const roleId = await this.ops.createRole(guildId, wanted);
       pool.bindings.set(roleId, null);
+      pool.names.set(roleId, wanted);
       this.assign(pool, roleId, personaId);
       return roleId;
     }
@@ -97,7 +132,8 @@ export class RolePool {
     pool.byPersona.delete(victim);
     pool.lru.shift();
     pool.bindings.set(victimRole, null);
-    await this.ops.renameRole(guildId, victimRole, this.roleName(displayName));
+    await this.ops.renameRole(guildId, victimRole, wanted);
+    pool.names.set(victimRole, wanted);
     this.assign(pool, victimRole, personaId);
     return victimRole;
   }
@@ -106,7 +142,10 @@ export class RolePool {
   async rename(personaId: string, displayName: string): Promise<void> {
     for (const [guildId, pool] of this.guilds) {
       const roleId = pool.byPersona.get(personaId);
-      if (roleId) await this.ops.renameRole(guildId, roleId, this.roleName(displayName));
+      if (roleId) {
+        await this.ops.renameRole(guildId, roleId, this.roleName(displayName));
+        pool.names.set(roleId, this.roleName(displayName));
+      }
     }
   }
 
