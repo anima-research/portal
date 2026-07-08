@@ -186,6 +186,16 @@ export class PortalAgent {
           ? `Reaction visibility ON for ${channelId}. Reactions there now appear in your context as they happen (they never wake you). Subscribe to the channel if you aren't already, so its reactions reach you.`
           : `Reaction visibility OFF for ${channelId}.`;
       }
+      case 'set_audio_visibility': {
+        const channelId = str(args.channelId);
+        const enabled = Boolean(args.enabled);
+        // Durable per-channel opt-in; persisted via onChange. Content-shaping
+        // only — delivery/wake behavior is unchanged (see server.ts buildContent).
+        this.state.setAudioVisibility(channelId, enabled);
+        return enabled
+          ? `Inline audio ON for ${channelId}. Audio attachments there now arrive as playable audio blocks (oversized clips still degrade to URL notes).`
+          : `Inline audio OFF for ${channelId}.`;
+      }
       case 'list_pins':
         return this.client.call('list_pins', { channelId: str(args.channelId) });
       case 'get_pending_pings':

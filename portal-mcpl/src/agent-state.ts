@@ -32,6 +32,8 @@ interface SerializedState {
   subscriptions?: string[];
   /** Channels opted into live reaction visibility (durable, default off). */
   reactionChannels?: string[];
+  /** Channels opted into inline audio delivery (durable, default off). */
+  audioChannels?: string[];
 }
 
 const PREVIEW_LEN = 140;
@@ -50,6 +52,10 @@ export class AgentState {
    *  Reactions from these channels surface in context but NEVER wake the agent
    *  (tagged `chat:reaction`, which matches no wake policy). Durable. */
   private reactionChannels = new Set<string>();
+  /** Channels opted into inline audio (per-channel, default off). When ON,
+   *  audio attachments from the channel are fetched and delivered as MCPL
+   *  audio blocks instead of URL notes. Durable. */
+  private audioChannels = new Set<string>();
   private listeners: Array<() => void> = [];
 
   /** Notify on any persistence-relevant change (watermark / ping / subscription). */
@@ -124,6 +130,26 @@ export class AgentState {
     return [...this.reactionChannels];
   }
 
+  // ── Inline audio (durable, per-channel opt-in; default off) ──
+
+  /** Opt a channel in/out of inline audio delivery. Returns true if changed. */
+  setAudioVisibility(channelId: string, enabled: boolean): boolean {
+    const changed = enabled ? !this.audioChannels.has(channelId) : this.audioChannels.has(channelId);
+    if (!changed) return false;
+    if (enabled) this.audioChannels.add(channelId);
+    else this.audioChannels.delete(channelId);
+    this.emitChange();
+    return true;
+  }
+
+  isAudioVisible(channelId: string): boolean {
+    return this.audioChannels.has(channelId);
+  }
+
+  audioVisibilityList(): string[] {
+    return [...this.audioChannels];
+  }
+
   /** Advance the watermark for a channel (optionally only up to a message),
    *  clearing unseen + pending pings at/under that point. */
   markRead(channelId: string, uptoCreatedAt?: string): void {
@@ -195,6 +221,7 @@ export class AgentState {
       pings: this.pings,
       subscriptions: [...this.subscriptions],
       reactionChannels: [...this.reactionChannels],
+      audioChannels: [...this.audioChannels],
     };
   }
 
@@ -204,6 +231,7 @@ export class AgentState {
     s.pings = data.pings ?? [];
     s.subscriptions = new Set(data.subscriptions ?? []);
     s.reactionChannels = new Set(data.reactionChannels ?? []);
+    s.audioChannels = new Set(data.audioChannels ?? []);
     return s;
   }
 }

@@ -44,7 +44,12 @@ export interface SendMessageParams {
   mentionPersonaIds?: PersonaId[];
 }
 export interface SendMessageResult {
+  /** The sent message — the FIRST part when the relay split an over-long send. */
   messageId: RelayMessageId;
+  /** All parts, in channel order, when `content` exceeded Discord's 2000-char
+   *  limit and the relay split it (markdown-preserving). Absent for a single
+   *  message. Editing/deleting `messageId` operates on the whole set. */
+  messageIds?: RelayMessageId[];
 }
 
 export interface EditMessageParams {

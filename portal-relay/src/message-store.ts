@@ -31,6 +31,16 @@ export interface MessageRef {
   personaId?: string;
   /** Which pooled webhook (id) carried it — needed to edit/delete it. */
   webhookId?: string;
+  /** Synthetic markdown reopener the relay prepended when this message is a
+   *  continuation part of a split send (stripped when serving agents). */
+  bridgeOpen?: string;
+  /** Synthetic markdown closer the relay appended at a split boundary. */
+  bridgeClose?: string;
+  /** First part only: Discord msg ids of ALL parts of a split send, in order
+   *  (includes this message). Edit/delete fan out across these. */
+  parts?: string[];
+  /** Continuation parts only: Discord msg id of the FIRST part. */
+  partOf?: string;
 }
 
 /** The message's immediate channel (where `messages.fetch(id)` lives). */
@@ -59,6 +69,10 @@ interface AttributionRow {
   guildId: string | null;
   personaId?: string;
   webhookId?: string;
+  bridgeOpen?: string;
+  bridgeClose?: string;
+  parts?: string[];
+  partOf?: string;
 }
 
 export class MessageStore {
@@ -87,6 +101,10 @@ export class MessageStore {
       // Upgrade with authoritative fields a prior (e.g. echo-derived) ref lacked.
       if (ref.personaId && !existing.personaId) existing.personaId = ref.personaId;
       if (ref.webhookId && !existing.webhookId) existing.webhookId = ref.webhookId;
+      if (ref.bridgeOpen && !existing.bridgeOpen) existing.bridgeOpen = ref.bridgeOpen;
+      if (ref.bridgeClose && !existing.bridgeClose) existing.bridgeClose = ref.bridgeClose;
+      if (ref.parts && !existing.parts) existing.parts = ref.parts;
+      if (ref.partOf && !existing.partOf) existing.partOf = ref.partOf;
       if (existing.personaId) this.persist(existing);
       return existing;
     }
@@ -125,6 +143,22 @@ export class MessageStore {
     return ref;
   }
 
+  /** Overwrite split-send metadata on a ref (re-splitting an edit changes the
+   *  bridges, and may shrink or dissolve the part set). Unlike `record()` this
+   *  SETS the fields — including back to undefined. */
+  setSplitMeta(
+    discordMsgId: string,
+    meta: { bridgeOpen?: string; bridgeClose?: string; parts?: string[]; partOf?: string },
+  ): void {
+    const ref = this.getByDiscordId(discordMsgId);
+    if (!ref) return;
+    ref.bridgeOpen = meta.bridgeOpen;
+    ref.bridgeClose = meta.bridgeClose;
+    ref.parts = meta.parts;
+    ref.partOf = meta.partOf;
+    if (ref.personaId) this.persist(ref);
+  }
+
   /** Relay id for a Discord message, minting a bare ref if unseen. */
   ensureForDiscord(discordMsgId: string, derive: () => Omit<MessageRef, 'relayId'>): MessageRef {
     return this.getByDiscordId(discordMsgId) ?? this.record(derive());
@@ -161,6 +195,10 @@ export class MessageStore {
       guildId: ref.guildId,
       personaId: ref.personaId,
       webhookId: ref.webhookId,
+      bridgeOpen: ref.bridgeOpen,
+      bridgeClose: ref.bridgeClose,
+      parts: ref.parts,
+      partOf: ref.partOf,
     });
     while (this.persisted.size > this.persistCap) {
       const oldest = this.persisted.keys().next().value;

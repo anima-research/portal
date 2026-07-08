@@ -160,6 +160,23 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'set_audio_visibility',
+    description:
+      'Opt a channel in or out of inline audio. When ON, audio attachments ' +
+      '(voice messages, audio files) from that channel are fetched and delivered ' +
+      'to you as playable audio blocks instead of URL notes — use it only if your ' +
+      'model can hear audio. Oversized clips (>12MB) still arrive as URL notes. ' +
+      'Default OFF, persisted across restarts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC },
+        enabled: { type: 'boolean', description: 'true = deliver audio from this channel inline; false = stop.' },
+      },
+      required: ['channelId', 'enabled'],
+    },
+  },
+  {
     name: 'fetch_history',
     description:
       'Fetch recent messages from a channel or thread. Page with before/after ' +

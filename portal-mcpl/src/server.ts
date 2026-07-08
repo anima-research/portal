@@ -259,7 +259,21 @@ export class PortalMcplServer {
     const meta = wakeMetadata(message, addressedToMe, reasons);
     const tags = deriveTags(message, addressedToMe, reasons);
     const channelMcplId = portalChannelId(message.channelId);
-    void buildContent(message).then((content) => {
+    const inlineAudio = this.agent.state.isAudioVisible(message.channelId);
+    // A clip too large to inline can't be heard by anyone — flag it in Discord
+    // with a native 🐘 so the sender knows (idempotent: the shared bot reacts
+    // once even if several opted-in agents notice it).
+    if (inlineAudio) {
+      for (const att of message.attachments) {
+        if (audioMimeFor(att) && att.size > AUDIO_INLINE_CAP) {
+          void this.client.react(message.id, '🐘', false, true).catch((err: Error) => {
+            console.error(`[portal-mcpl] oversized-audio flag failed (needs ADD_REACTIONS): ${err.message}`);
+          });
+          break;
+        }
+      }
+    }
+    void buildContent(message, { inlineAudio }).then((content) => {
       if (this.openChannels.has(message.channelId)) {
         conn
           .sendRequest(method.CHANNELS_INCOMING, {
@@ -463,7 +477,7 @@ function deriveTags(
   for (const a of message.attachments ?? []) {
     const ct = (a.contentType ?? '').toLowerCase();
     if (ct.startsWith('image/')) t.add('chat:has-image');
-    else if (ct.startsWith('audio/')) t.add('chat:has-audio');
+    else if (audioMimeFor(a)) t.add('chat:has-audio');
     else t.add('chat:has-file');
   }
   if (message.threadId) t.add('chat:thread');
@@ -484,30 +498,101 @@ function authorOf(message: PortalMessage): { id: string; name: string } {
 
 /** Max image bytes to fetch + inline as a vision block. */
 const IMAGE_INLINE_CAP = 5 * 1024 * 1024;
+/** Max audio bytes to fetch + inline as an audio block (raw; ~16MB as base64,
+ *  under typical provider inline-media ceilings with headroom for images). */
+const AUDIO_INLINE_CAP = 12 * 1024 * 1024;
+/** Max audio blocks inlined per message (each is large in tokens/bytes). */
+const MAX_AUDIO_PER_MESSAGE = 2;
+
+/** Extension → MIME fallback: Discord's attachment `contentType` is optional. */
+const AUDIO_EXTENSION_MIME: Record<string, string> = {
+  mp3: 'audio/mp3',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  oga: 'audio/ogg',
+  opus: 'audio/opus',
+  flac: 'audio/flac',
+  aac: 'audio/aac',
+  m4a: 'audio/mp4',
+  aiff: 'audio/aiff',
+  aif: 'audio/aiff',
+};
+
+/** Collapse MP3 MIME aliases (Discord reports `audio/mpeg`; legacy uploaders
+ *  use `audio/mpeg3`/`audio/x-mpeg-3`) to the widely-expected `audio/mp3`. */
+export function normalizeAudioMime(mime: string): string {
+  const bare = mime.split(';')[0].trim().toLowerCase();
+  return ['audio/mpeg', 'audio/mpg', 'audio/mpeg3', 'audio/x-mpeg-3'].includes(bare)
+    ? 'audio/mp3'
+    : bare;
+}
+
+/** Resolve an attachment's audio MIME: content-type first, else extension.
+ *  Returns undefined when the attachment isn't audio (or isn't recognizable). */
+export function audioMimeFor(att: { name: string; contentType: string | null }): string | undefined {
+  const ct = (att.contentType ?? '').toLowerCase();
+  if (ct.startsWith('audio/')) return normalizeAudioMime(ct);
+  const ext = att.name.split('.').pop()?.toLowerCase() ?? '';
+  return AUDIO_EXTENSION_MIME[ext];
+}
+
+/** Fetch an attachment body with a bounded timeout. */
+async function fetchAttachment(url: string, timeoutMs = 15000): Promise<Buffer> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const res = await fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(timer));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+function attachmentNote(att: PortalMessage['attachments'][number]): string {
+  const dur = att.duration !== undefined ? `, ${Math.round(att.duration)}s` : '';
+  return `[attachment "${att.name}" (${att.contentType ?? 'unknown'}, ${att.size}B${dur}) — ${att.url}]`;
+}
 
 /** Build MCPL content blocks for a message: the text line, plus inlined image
- *  attachments (so the agent can actually see them) and notes for the rest.
- *  Best-effort — a failed fetch degrades to a text note, never drops the msg. */
-async function buildContent(m: PortalMessage): Promise<ContentBlock[]> {
-  const blocks: ContentBlock[] = [textContent(render(m))];
-  for (const att of m.attachments) {
+ *  attachments (so the agent can actually see them), inlined audio when the
+ *  channel is opted in (so it can hear them), and notes for the rest.
+ *  Best-effort — a failed fetch degrades to a text note, never drops the msg.
+ *  Exported for live verification (scripts drive a real model with its output). */
+export async function buildContent(
+  m: PortalMessage,
+  opts: { inlineAudio?: boolean } = {},
+): Promise<ContentBlock[]> {
+  // Decide each attachment's treatment synchronously (audio slots are ordered),
+  // then fetch the inlined ones concurrently — outcomes are independent.
+  let audioSlots = MAX_AUDIO_PER_MESSAGE;
+  const jobs: Promise<ContentBlock>[] = m.attachments.map((att) => {
     const ct = (att.contentType ?? '').toLowerCase();
+    const audioMime = opts.inlineAudio ? audioMimeFor(att) : undefined;
     if (ct.startsWith('image/') && att.size > 0 && att.size <= IMAGE_INLINE_CAP) {
-      try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 15000);
-        const res = await fetch(att.url, { signal: ctrl.signal }).finally(() => clearTimeout(timer));
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = Buffer.from(await res.arrayBuffer()).toString('base64');
-        blocks.push({ type: 'image', data, mimeType: ct });
-      } catch (err) {
-        blocks.push(textContent(`[image "${att.name}" unavailable: ${(err as Error).message} — ${att.url}]`));
-      }
-    } else if (m.attachments.length) {
-      blocks.push(textContent(`[attachment "${att.name}" (${att.contentType ?? 'unknown'}, ${att.size}B) — ${att.url}]`));
+      return fetchAttachment(att.url).then(
+        (buf): ContentBlock => ({ type: 'image', data: buf.toString('base64'), mimeType: ct }),
+        (err: Error) => textContent(`[image "${att.name}" unavailable: ${err.message} — ${att.url}]`),
+      );
     }
-  }
-  return blocks;
+    if (audioMime && att.size > 0 && att.size <= AUDIO_INLINE_CAP && audioSlots > 0) {
+      audioSlots--;
+      return fetchAttachment(att.url).then(
+        (buf): ContentBlock => ({ type: 'audio', data: buf.toString('base64'), mimeType: audioMime }),
+        (err: Error) => textContent(`[audio "${att.name}" unavailable: ${err.message} — ${att.url}]`),
+      );
+    }
+    // Audio that WOULD inline but can't — say why, so the agent can tell it
+    // apart from a generic file.
+    if (audioMime && att.size > AUDIO_INLINE_CAP) {
+      return Promise.resolve(
+        textContent(`[audio "${att.name}" too large to inline (${att.size}B > ${AUDIO_INLINE_CAP}B) — ${att.url}]`),
+      );
+    }
+    if (audioMime && audioSlots <= 0) {
+      return Promise.resolve(
+        textContent(`[audio "${att.name}" not inlined (max ${MAX_AUDIO_PER_MESSAGE} per message) — ${att.url}]`),
+      );
+    }
+    return Promise.resolve(textContent(attachmentNote(att)));
+  });
+  return [textContent(render(m)), ...(await Promise.all(jobs))];
 }
 
 function render(m: PortalMessage): string {

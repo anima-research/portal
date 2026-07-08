@@ -138,10 +138,11 @@ Wiring examples: `portal-mcpl/examples/mcpl-servers.json`,
 
 | Capability | Outbound (agent→Discord) | Inbound (Discord→agent) |
 |---|---|---|
-| Text messages | ✅ | ✅ |
+| Text messages | ✅ (over-long sends auto-split, markdown-preserving — RFC-006) | ✅ (split parts served with original markdown restored) |
 | Replies | ✅ (quoted jump-link; webhooks lack native reply) | ✅ `replyToId` resolved |
 | Threads | ✅ (parent webhook + threadId) | ✅ as channels w/ parentId |
 | Images / files | ✅ inline base64 `bytes` (RFC-003; path-files default-off) | ✅ inlined as MCPL image blocks (≤5 MB) + notes for non-images |
+| Audio / voice messages | ✅ generic file `bytes` | ✅ opt-in inline audio blocks (≤12 MB, per-channel `set_audio_visibility` — RFC-006) + `duration`/`waveform` metadata |
 | Mentions | ✅ persona→role; human `@name`→`<@id>` | ✅ role→persona routing + full `mentions` |
 | Reactions | ✅ pseudo + visible | ✅ native `reaction_add`/`reaction_remove` |
 | Typing | ✅ bot-level (anonymous — not per-persona) | n/a |
@@ -172,6 +173,13 @@ greenfield agents:
   relay host's disk). Per-message size budget bounds the WS frame + memory.
 
 See `PORTAL-RFC-00{1,2,3}-*.md`.
+
+- **RFC-006 — split sends + inline audio.** Over-long sends are split
+  markdown-preservingly (fences/emphasis closed + reopened per part; agents see
+  their original markdown restored via bridge stripping; edit/delete span all
+  parts). Audio attachments reach opted-in agents as playable MCPL audio blocks
+  with voice-message `duration`/`waveform` on the wire. See
+  `PORTAL-RFC-006-split-sends-and-inline-audio.md`.
 
 ## Design decisions
 

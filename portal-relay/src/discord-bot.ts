@@ -48,6 +48,10 @@ export interface IncomingAttachment {
   url: string;
   contentType: string | null;
   size: number;
+  /** Voice-message clip length in seconds (Discord voice messages only). */
+  duration?: number;
+  /** Base64 amplitude preview (Discord voice messages only). */
+  waveform?: string;
 }
 
 /** A reaction summary as carried on a fetched/converted message (counts only;
@@ -815,6 +819,8 @@ export class DiscordBot implements WebhookOps, RoleOps {
           url: a.url,
           contentType: a.contentType ?? null,
           size: a.size ?? 0,
+          duration: a.duration ?? undefined,
+          waveform: a.waveform ?? undefined,
         })) ?? [],
       reactions: [...(msg.reactions?.cache?.values() ?? [])].map((r) => ({
         emoji: r.emoji.id ? `${r.emoji.name}:${r.emoji.id}` : (r.emoji.name ?? '?'),

@@ -15,6 +15,10 @@ export interface PortalAttachment {
   url: string;
   contentType: string | null;
   size: number;
+  /** Voice-message clip length in seconds (Discord voice messages only). */
+  duration?: number;
+  /** Base64 amplitude preview (Discord voice messages only). */
+  waveform?: string;
 }
 
 /**
@@ -82,4 +86,8 @@ export interface PortalMessage {
   /** ISO-8601 strings — the wire carries no Date objects. */
   createdAt: string;
   editedAt?: string;
+  /** Set on the 2nd..Nth Discord messages of a relay-split over-long send:
+   *  the relay id of the FIRST part. Lets clients group the parts back into
+   *  one logical message. */
+  partOf?: RelayMessageId;
 }
