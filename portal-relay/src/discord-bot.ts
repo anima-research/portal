@@ -28,6 +28,8 @@ import {
 } from 'discord.js';
 import { existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
+import type { Capability } from '@animalabs/portal-protocol';
+import { capsFromPerms } from './permissions.js';
 import type { RoleOps } from './role-pool.js';
 import type { WebhookOps, WebhookSendOpts } from './webhook-pool.js';
 
@@ -457,18 +459,27 @@ export class DiscordBot implements WebhookOps, RoleOps {
     return out;
   }
 
-  /** Channel ids the given Discord role can VIEW (RFC-004 mirrorRole scope).
-   *  Reads the warm gateway cache, so it's cheap on a resolve miss. Unknown
-   *  guild/role → empty set (deny). */
-  channelsVisibleToRole(guildId: string, roleId: string): Set<string> {
-    const out = new Set<string>();
+  /** Per-channel portal caps the given Discord role holds (RFC-004 mirror
+   *  scopes). Keys = channels the role can VIEW; values = the caps its
+   *  permission bits support there (post-overwrite), for full-fidelity
+   *  `mirrorCaps` mirroring. Reads the warm gateway cache, so it's cheap on a
+   *  resolve miss. Unknown guild/role → empty map (deny). */
+  roleCapsByChannel(guildId: string, roleId: string): Map<string, Set<Capability>> {
+    const out = new Map<string, Set<Capability>>();
     const guild = this.client.guilds.cache.get(guildId);
     const role = guild?.roles.cache.get(roleId);
     if (!guild || !role) return out;
     for (const ch of guild.channels.cache.values()) {
-      if (ch.permissionsFor(role).has(PermissionsBitField.Flags.ViewChannel)) out.add(ch.id);
+      const perms = ch.permissionsFor(role);
+      if (!perms.has(PermissionsBitField.Flags.ViewChannel)) continue;
+      out.set(ch.id, capsFromPerms(perms));
     }
     return out;
+  }
+
+  /** Channel ids the given Discord role can VIEW (RFC-004 mirrorRole scope). */
+  channelsVisibleToRole(guildId: string, roleId: string): Set<string> {
+    return new Set(this.roleCapsByChannel(guildId, roleId).keys());
   }
 
   /** The @everyone role id for a guild (its baseline visibility role). */

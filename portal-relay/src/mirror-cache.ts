@@ -1,6 +1,8 @@
 /**
- * Mirror cache (RFC-004 §5.5) — per-(guild, role) set of channel ids a Discord
- * role can view, backing `mirrorRole` access-role scopes.
+ * Mirror cache (RFC-004 §5.5) — per-(guild, role) map of channel id → the
+ * portal caps that Discord role holds there, backing `mirrorRole` access-role
+ * scopes. Keys double as the role's visible-channel set (scope membership);
+ * values back full-fidelity `mirrorCaps` roles.
  *
  * Fail-closed by construction: a miss recomputes synchronously from Discord's
  * warm gateway cache rather than serving a stale allow. Push events
@@ -8,20 +10,22 @@
  * the first resolve after a gateway gap always recomputes. The periodic
  * re-sync (if any) is then a backstop, not the primary freshness mechanism.
  */
+import type { Capability } from '@animalabs/portal-protocol';
 import type { DiscordBot } from './discord-bot.js';
 
 export class MirrorCache {
-  /** guildId → roleId → visible channel ids */
-  private cache = new Map<string, Map<string, Set<string>>>();
+  /** guildId → roleId → (channelId → caps the role holds there) */
+  private cache = new Map<string, Map<string, Map<string, Set<Capability>>>>();
 
   constructor(private bot: DiscordBot) {}
 
-  /** Channels `roleId` can view in `guildId`. Recomputes (and caches) on a miss. */
-  visible(guildId: string, roleId: string): Set<string> {
+  /** Per-channel caps `roleId` holds in `guildId` (keys = channels it can
+   *  view). Recomputes (and caches) on a miss. */
+  lookup(guildId: string, roleId: string): Map<string, Set<Capability>> {
     let byRole = this.cache.get(guildId);
     let entry = byRole?.get(roleId);
     if (!entry) {
-      entry = this.bot.channelsVisibleToRole(guildId, roleId);
+      entry = this.bot.roleCapsByChannel(guildId, roleId);
       if (!byRole) this.cache.set(guildId, (byRole = new Map()));
       byRole.set(roleId, entry);
     }

@@ -76,7 +76,7 @@ export class Relay implements GatewayHooks {
     // Mirror cache backs `mirrorRole` access-role scopes; inject the live lookup
     // so resolve() can ask Discord which channels a role can see (RFC-004 §5.5).
     this.mirror = new MirrorCache(this.bot);
-    this.permissions.setMirrorVisibility((g, r) => this.mirror.visible(g, r));
+    this.permissions.setMirrorLookup((g, r) => this.mirror.lookup(g, r));
     if (config.invitesPath) this.invites = new InviteStore(config.invitesPath);
     this.roles = new RolePool(this.bot, config.rolePool.size, config.rolePool.prefix);
     this.webhooks = new WebhookPool(this.bot, config.webhookPoolSize);

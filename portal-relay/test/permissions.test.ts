@@ -4,7 +4,12 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PermissionsStore } from '../src/permissions.js';
+import type { Capability } from '@animalabs/portal-protocol';
 import type { PermissionsFile } from '../src/config.js';
+
+/** Visibility-only mirror entry: channels in scope, per-channel caps unused. */
+const chans = (...ids: string[]): Map<string, Set<Capability>> =>
+  new Map(ids.map((id) => [id, new Set<Capability>()]));
 
 function tmpFile(contents: PermissionsFile): string {
   const dir = mkdtempSync(join(tmpdir(), 'portal-perms-'));
@@ -84,8 +89,8 @@ test('mirrorRole scope: fail-closed without lookup, then gated by visibility', (
   assert.deepEqual(sorted(store.resolve('s', 'g1', 'c1')), []);
 
   // Inject a fake visibility: role-staff sees c1, c2 (but not c3).
-  const visible = new Map([['g1:role-staff', new Set(['c1', 'c2'])]]);
-  store.setMirrorVisibility((g, r) => visible.get(`${g}:${r}`) ?? new Set());
+  const visible = new Map([['g1:role-staff', chans('c1', 'c2')]]);
+  store.setMirrorLookup((g, r) => visible.get(`${g}:${r}`) ?? new Map());
 
   assert.deepEqual(sorted(store.resolve('s', 'g1', 'c1')), [...RW].sort());
   assert.deepEqual(sorted(store.resolve('s', 'g1', 'c2')), [...RW].sort());
@@ -107,16 +112,56 @@ test('mirrorRoles scope: union of several roles; fail-closed without lookup', ()
 
   // r-a sees c1,c2; r-b sees c2,c3 → union = c1,c2,c3 (not c4).
   const vis = new Map([
-    ['g1:r-a', new Set(['c1', 'c2'])],
-    ['g1:r-b', new Set(['c2', 'c3'])],
+    ['g1:r-a', chans('c1', 'c2')],
+    ['g1:r-b', chans('c2', 'c3')],
   ]);
-  store.setMirrorVisibility((g, r) => vis.get(`${g}:${r}`) ?? new Set());
+  store.setMirrorLookup((g, r) => vis.get(`${g}:${r}`) ?? new Map());
 
   assert.deepEqual(sorted(store.resolve('t', 'g1', 'c1')), [...RW].sort()); // via r-a
   assert.deepEqual(sorted(store.resolve('t', 'g1', 'c3')), [...RW].sort()); // via r-b
   assert.deepEqual(sorted(store.resolve('t', 'g1', 'c2')), [...RW].sort()); // both
   assert.deepEqual(sorted(store.resolve('t', 'g1', 'c4')), []); // neither
   assert.deepEqual(sorted(store.resolve('t', 'g2', 'c1')), []); // per-guild → cross-guild deny
+  rmSync(path, { force: true });
+});
+
+test('mirrorCaps: caps act as a mask over what the mirrored role can do per channel', () => {
+  const path = tmpFile({
+    roles: {
+      everyone: {
+        caps: [...RW, 'ADD_REACTIONS'],
+        scope: { mirrorRole: 'r-everyone' },
+        guildId: 'g1',
+        mirrorCaps: true,
+      },
+    },
+    personas: { m: { roles: ['everyone'] } },
+  });
+  const store = new PermissionsStore(path);
+
+  // No lookup → deny (fail-closed), same as visibility-only mirrors.
+  assert.deepEqual(sorted(store.resolve('m', 'g1', 'open')), []);
+
+  // open: role can do everything incl. MANAGE_MESSAGES; readonly: view/history only.
+  const caps = new Map<string, Map<string, Set<Capability>>>([
+    [
+      'g1:r-everyone',
+      new Map([
+        ['open', new Set<Capability>([...RW, 'ADD_REACTIONS', 'MANAGE_MESSAGES'])],
+        ['readonly', new Set<Capability>(['VIEW_CHANNEL', 'READ_HISTORY'])],
+      ]),
+    ],
+  ]);
+  store.setMirrorLookup((g, r) => caps.get(`${g}:${r}`) ?? new Map());
+
+  // open: full mask granted — but NOT MANAGE_MESSAGES (outside the mask).
+  assert.deepEqual(sorted(store.resolve('m', 'g1', 'open')), [...RW, 'ADD_REACTIONS'].sort());
+  // readonly: visible, but caps clamp to what the mirrored role can do there.
+  assert.deepEqual(sorted(store.resolve('m', 'g1', 'readonly')), ['READ_HISTORY', 'VIEW_CHANNEL']);
+  // invisible channel: deny.
+  assert.deepEqual(sorted(store.resolve('m', 'g1', 'hidden')), []);
+  // cross-guild: deny.
+  assert.deepEqual(sorted(store.resolve('m', 'g2', 'open')), []);
   rmSync(path, { force: true });
 });
 
@@ -142,7 +187,7 @@ test('couldAccessGuild: gates addressing-role minting per guild', () => {
   });
   const store = new PermissionsStore(path);
   // mirror role rA can see a channel only in gA
-  store.setMirrorVisibility((g, r) => (g === 'gA' && r === 'rA' ? new Set(['cA']) : new Set()));
+  store.setMirrorLookup((g, r) => (g === 'gA' && r === 'rA' ? chans('cA') : new Map()));
 
   // mirror persona: access in gA, not gB
   assert.equal(store.couldAccessGuild('mirror', 'gA', inGuild('gA')), true);

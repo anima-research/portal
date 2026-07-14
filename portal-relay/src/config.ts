@@ -61,6 +61,15 @@ export interface AccessRole {
   scope: Scope;
   /** Bind to a guild — required for `mirrorRole`; omit for global. */
   guildId?: string;
+  /**
+   * Full-fidelity mirroring (mirror scopes only). When true, `caps` acts as a
+   * *mask*: the effective grant in a channel is `caps ∩ what the mirrored
+   * Discord role(s) can actually do there` (per-channel permission bits), not
+   * the flat `caps` list. So a persona mirroring @everyone can't post in a
+   * channel @everyone can only read. Default false: `caps` applies uniformly
+   * wherever the mirrored role can VIEW (visibility-only mirroring).
+   */
+  mirrorCaps?: boolean;
 }
 
 /**

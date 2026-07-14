@@ -23,8 +23,13 @@ import type {
 } from './config.js';
 import { WatchedFile } from './file-watch.js';
 
-/** Mirror-visibility lookup: channel ids a Discord role can view in a guild. */
-export type MirrorVisibility = (guildId: string, roleId: string) => Set<string>;
+/**
+ * Mirror lookup: per-channel capabilities of a Discord role in a guild, keyed
+ * by channel id. Keys = channels the role can VIEW (scope membership); values =
+ * the caps the role's permission bits support there (full-fidelity mirroring,
+ * used only by `mirrorCaps` roles — visibility-only roles just test `.has`).
+ */
+export type MirrorLookup = (guildId: string, roleId: string) => ReadonlyMap<string, ReadonlySet<Capability>>;
 
 /** A bare PersonaPolicy on disk (legacy) lacks `roles`/`policy` keys. Normalise
  *  it to the entry shape so the store always holds `PersonaEntry`. */
@@ -54,16 +59,17 @@ export class PermissionsStore {
   private fileDefault: Capability[] = [];
   private listeners: Array<(c: PermissionChange) => void> = [];
   private file?: WatchedFile;
-  private mirrorVisibility?: MirrorVisibility;
+  private mirrorLookup?: MirrorLookup;
 
   constructor(private path: string) {
     this.reload();
   }
 
-  /** Inject the live mirror-visibility lookup used to resolve `mirrorRole`
-   *  scopes. Absent ⇒ mirrorRole scopes resolve to deny (fail-closed). */
-  setMirrorVisibility(fn: MirrorVisibility): void {
-    this.mirrorVisibility = fn;
+  /** Inject the live mirror lookup used to resolve `mirrorRole` scopes (and
+   *  per-channel caps for `mirrorCaps` roles). Absent ⇒ mirror scopes resolve
+   *  to deny (fail-closed). */
+  setMirrorLookup(fn: MirrorLookup): void {
+    this.mirrorLookup = fn;
   }
 
   startWatching(): void {
@@ -95,7 +101,13 @@ export class PermissionsStore {
     const out = new Set<Capability>();
     for (const name of entry.roles ?? []) {
       const role = this.roles.get(name);
-      if (role && this.scopeIncludes(role.scope, role.guildId, guildId, channelId)) {
+      if (!role) continue;
+      const isMirror = 'mirrorRole' in role.scope || 'mirrorRoles' in role.scope;
+      if (isMirror && role.mirrorCaps) {
+        // Full-fidelity mirror: caps = mask ∩ what the mirrored role(s) can do here.
+        const derived = this.mirrorCapsAt(role.scope, role.guildId, guildId, channelId);
+        for (const c of role.caps) if (derived.has(c)) out.add(c);
+      } else if (this.scopeIncludes(role.scope, role.guildId, guildId, channelId)) {
         for (const c of role.caps) out.add(c);
       }
     }
@@ -129,11 +141,34 @@ export class PermissionsStore {
     // mirror{Role,Roles}: inherently per-guild; deny if no guild, cross-guild, or no lookup.
     if (!guildId) return false;
     if (roleGuildId && roleGuildId !== guildId) return false;
-    const mv = this.mirrorVisibility;
+    const mv = this.mirrorLookup;
     if (!mv) return false; // fail-closed: never a stale allow
     // Union: in scope iff ANY mirrored role can view the channel.
     const roleIds = 'mirrorRoles' in scope ? scope.mirrorRoles : [scope.mirrorRole];
     return roleIds.some((rid) => mv(guildId, rid).has(channelId));
+  }
+
+  /** Per-channel caps the mirrored Discord role(s) hold at (guildId, channelId):
+   *  the union across mirrored roles. Fail-closed like {@link scopeIncludes} —
+   *  no guild, cross-guild, or no lookup ⇒ empty set. */
+  private mirrorCapsAt(
+    scope: Scope,
+    roleGuildId: string | undefined,
+    guildId: string | null,
+    channelId: string,
+  ): Set<Capability> {
+    const out = new Set<Capability>();
+    if (!('mirrorRole' in scope) && !('mirrorRoles' in scope)) return out;
+    if (!guildId) return out;
+    if (roleGuildId && roleGuildId !== guildId) return out;
+    const mv = this.mirrorLookup;
+    if (!mv) return out; // fail-closed
+    const roleIds = 'mirrorRoles' in scope ? scope.mirrorRoles : [scope.mirrorRole];
+    for (const rid of roleIds) {
+      const caps = mv(guildId, rid).get(channelId);
+      if (caps) for (const c of caps) out.add(c);
+    }
+    return out;
   }
 
   getPolicy(personaId: string): PersonaPolicy | undefined {
@@ -190,7 +225,7 @@ export class PermissionsStore {
       }
       // mirror{Role,Roles}: per-guild; grants here iff a mirrored role can see ≥1 channel.
       if (role.guildId && role.guildId !== guildId) continue;
-      const mv = this.mirrorVisibility;
+      const mv = this.mirrorLookup;
       if (!mv) continue; // fail-closed
       const rids = 'mirrorRoles' in s ? s.mirrorRoles : [s.mirrorRole];
       if (rids.some((rid) => mv(guildId, rid).size > 0)) return true;
@@ -378,6 +413,24 @@ const ALL_CAPS: Capability[] = [
   'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'EDIT_OWN', 'DELETE_OWN',
   'MANAGE_MESSAGES', 'MANAGE_CHANNELS',
 ];
+
+/** The portal caps a permission bitfield supports (per-channel, post-overwrite).
+ *  Backs full-fidelity `mirrorCaps` roles: what could a member holding exactly
+ *  this role do here? EDIT_OWN/DELETE_OWN have no Discord bit (members always
+ *  manage their own messages) — gated on SendMessages, mirroring
+ *  {@link computeCapabilities}. */
+export function capsFromPerms(perms: Readonly<PermissionsBitField>): Set<Capability> {
+  const out = new Set<Capability>();
+  for (const cap of ALL_CAPS) {
+    const required = CAP_REQUIRES[cap];
+    if (required === undefined) {
+      if (perms.has(F.SendMessages)) out.add(cap);
+      continue;
+    }
+    if (perms.has(required)) out.add(cap);
+  }
+  return out;
+}
 
 /** effective = policy-allowed ∩ what the bot can actually do in the channel. */
 export function computeCapabilities(
