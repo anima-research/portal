@@ -1,24 +1,32 @@
 /**
  * Per-guild pool of mentionable roles used as @-addressing tokens for personas.
  *
- * Roles ping nobody (no member holds them), but they autocomplete by name and
- * give a clean routing signal: a role mention resolves back to the bound
- * persona. Bindings are sticky-LRU — a persona keeps its role while active;
- * when the pool is exhausted the least-recently-used binding is reclaimed and
- * the role renamed for its new owner (rename, never delete — avoids audit-log
- * churn and role rate limits).
+ * Each persona gets its OWN dedicated role, created on demand and reused for
+ * that persona forever. Bindings are persisted (`persistPath`) so a restart
+ * re-adopts each persona's exact role instead of reshuffling the pool — the
+ * historical source of mention-corruption (a restart used to free every role,
+ * then reassign them to whoever reconnected first).
  *
- * Routing resolves against the binding that was live at message-receive time,
- * so the only failure mode is a stale autocomplete entry, which is rare because
- * autocomplete shows the current owner.
+ * Roles ping nobody (no member holds them); they exist only to autocomplete by
+ * name and to give a stable routing signal — a role mention resolves back to
+ * the bound persona.
+ *
+ * At the guild role cap (`size`) the pool frees a slot by DELETING a role —
+ * an unowned/orphan role first, else the least-recently-used persona's role.
+ * It never renames a role onto a new owner: deletion fails safe (a stale
+ * historical mention renders as a dead "@deleted-role") whereas renaming fails
+ * wrong (the mention silently retargets to a different, real persona).
  */
+import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 
 /** The Discord-side role operations the pool needs. Implemented by DiscordBot. */
 export interface RoleOps {
   /** Create a new mentionable role in the guild; resolve its id. */
   createRole(guildId: string, name: string): Promise<string>;
-  /** Rename an existing role (used on rebind). */
+  /** Rename an existing role (used only when a persona's own displayName changes). */
   renameRole(guildId: string, roleId: string, name: string): Promise<void>;
+  /** Delete a role (eviction / unbind). Must resolve even if already gone. */
+  deleteRole(guildId: string, roleId: string): Promise<void>;
   /** Roles already present in the guild that match our pool prefix, oldest
    *  first — adopted on boot so restarts reuse roles instead of leaking. */
   discoverPooledRoles(guildId: string, prefix: string): Promise<Array<{ id: string; name: string }>>;
@@ -27,8 +35,7 @@ export interface RoleOps {
 interface GuildPool {
   /** roleId → personaId (null = free/available). */
   bindings: Map<string, string | null>;
-  /** roleId → current Discord role name (kept in sync on discover/rename/create).
-   *  Lets a returning persona re-adopt the role already named for it. */
+  /** roleId → current Discord role name (kept in sync on discover/create/rename). */
   names: Map<string, string>;
   /** personaId → roleId. */
   byPersona: Map<string, string>;
@@ -39,16 +46,16 @@ interface GuildPool {
 
 export class RolePool {
   private guilds = new Map<string, GuildPool>();
-  /** Per-guild serialization tail. bind() mutates a guild's pool across awaits
-   *  (scan free → renameRole → assign); without this, simultaneous reconnects
-   *  interleave and double-pick a role or spuriously create/duplicate one. */
+  /** Per-guild serialization tail. bind()/unbind() mutate a guild's pool across
+   *  awaits; without this, simultaneous reconnects interleave and double-pick a
+   *  role or spuriously create/duplicate one. */
   private guildLocks = new Map<string, Promise<unknown>>();
 
   /** Run `fn` after any in-flight op for `guildId`, serialized. */
   private withGuildLock<T>(guildId: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.guildLocks.get(guildId) ?? Promise.resolve();
     const result = prev.then(fn);
-    // Store an error-swallowing tail so one failed bind doesn't poison the chain.
+    // Store an error-swallowing tail so one failed op doesn't poison the chain.
     this.guildLocks.set(guildId, result.then(() => {}, () => {}));
     return result;
   }
@@ -57,11 +64,43 @@ export class RolePool {
     private ops: RoleOps,
     private size: number,
     private prefix: string,
+    private persistPath?: string,
   ) {}
 
   private roleName(displayName: string): string {
     // Discord role names: <=100 chars. Prefix marks ours for discovery.
     return `${this.prefix}${displayName}`.slice(0, 100);
+  }
+
+  // ── Persistence (persona→role ownership, survives restart) ──
+
+  private loadPersisted(): Record<string, Record<string, string>> {
+    if (!this.persistPath || !existsSync(this.persistPath)) return {};
+    try {
+      return JSON.parse(readFileSync(this.persistPath, 'utf8')) as Record<string, Record<string, string>>;
+    } catch (e) {
+      console.error('[portal-relay] role-pool state unreadable, ignoring:', (e as Error).message);
+      return {};
+    }
+  }
+
+  /** Persist every guild's persona→role map atomically. Cheap: called on each
+   *  bind/unbind, and the file is small (one line per active persona). */
+  private persist(): void {
+    if (!this.persistPath) return;
+    const out: Record<string, Record<string, string>> = {};
+    for (const [guildId, pool] of this.guilds) {
+      const m: Record<string, string> = {};
+      for (const [personaId, roleId] of pool.byPersona) m[personaId] = roleId;
+      if (Object.keys(m).length) out[guildId] = m;
+    }
+    try {
+      const tmp = `${this.persistPath}.tmp`;
+      writeFileSync(tmp, JSON.stringify(out, null, 2));
+      renameSync(tmp, this.persistPath);
+    } catch (e) {
+      console.error('[portal-relay] role-pool state persist failed:', (e as Error).message);
+    }
   }
 
   private async ensureDiscovered(guildId: string): Promise<GuildPool> {
@@ -70,9 +109,21 @@ export class RolePool {
     pool ??= { bindings: new Map(), names: new Map(), byPersona: new Map(), lru: [], discovered: false };
     this.guilds.set(guildId, pool);
     const existing = await this.ops.discoverPooledRoles(guildId, this.prefix);
+    const liveNames = new Map<string, string>();
     for (const r of existing) {
       if (!pool.bindings.has(r.id)) pool.bindings.set(r.id, null);
       pool.names.set(r.id, r.name);
+      liveNames.set(r.id, r.name);
+    }
+    // Restore persisted ownership for roles that still exist on Discord. This is
+    // what stops the restart reshuffle: a persona re-adopts its exact role id.
+    const saved = this.loadPersisted()[guildId] ?? {};
+    for (const [personaId, roleId] of Object.entries(saved)) {
+      if (!liveNames.has(roleId)) continue; // role deleted out-of-band → drop
+      if (pool.bindings.get(roleId)) continue; // already owned (shouldn't happen)
+      pool.bindings.set(roleId, personaId);
+      pool.byPersona.set(personaId, roleId);
+      pool.lru.push(personaId);
     }
     pool.discovered = true;
     return pool;
@@ -87,43 +138,66 @@ export class RolePool {
   private async bindLocked(guildId: string, personaId: string, displayName: string): Promise<string> {
     const pool = await this.ensureDiscovered(guildId);
 
+    const wanted = this.roleName(displayName);
+
     const existing = pool.byPersona.get(personaId);
     if (existing) {
       this.touch(pool, personaId);
+      // Heal name drift (e.g. displayName changed while the relay was down and
+      // the binding was restored from persisted state, which matches by id, not
+      // name). Renaming a persona's OWN role is safe under the new contract —
+      // the role id keeps pointing at the same persona.
+      if (pool.names.get(existing) !== wanted) {
+        await this.ops.renameRole(guildId, existing, wanted);
+        pool.names.set(existing, wanted);
+      }
       return existing;
     }
 
-    const wanted = this.roleName(displayName);
-
-    // 1) reuse a free role — prefer one ALREADY named for this persona so a
-    //    returning persona re-adopts its own role across restarts (no rename, no
-    //    duplicate churn). Fall back to the first free role otherwise.
-    let fallback: string | null = null;
+    // 1) Adopt a free role ALREADY named for this persona (migration from the
+    //    legacy rename-pool, or a pre-persistence restart). Never adopt a free
+    //    role named for someone else — that would reattribute their mentions.
     for (const [roleId, owner] of pool.bindings) {
       if (owner !== null) continue;
       if (pool.names.get(roleId) === wanted) {
-        this.assign(pool, roleId, personaId); // already correctly named — no rename
+        this.assign(pool, roleId, personaId);
+        this.persist();
         return roleId;
       }
-      if (fallback === null) fallback = roleId;
-    }
-    if (fallback !== null) {
-      await this.ops.renameRole(guildId, fallback, wanted);
-      pool.names.set(fallback, wanted);
-      this.assign(pool, fallback, personaId);
-      return fallback;
     }
 
-    // 2) create a new role if under cap
-    if (pool.bindings.size < this.size) {
-      const roleId = await this.ops.createRole(guildId, wanted);
-      pool.bindings.set(roleId, null);
-      pool.names.set(roleId, wanted);
-      this.assign(pool, roleId, personaId);
-      return roleId;
-    }
+    // 2) Under cap → create a fresh dedicated role for this persona.
+    if (pool.bindings.size >= this.size) await this.freeOneSlot(guildId, pool);
+    const roleId = await this.ops.createRole(guildId, wanted);
+    pool.bindings.set(roleId, null);
+    pool.names.set(roleId, wanted);
+    this.assign(pool, roleId, personaId);
+    this.persist();
+    return roleId;
+  }
 
-    // 3) evict the LRU binding and repurpose its role
+  /** Make room at the role cap by DELETING a role (never renaming onto a new
+   *  owner). Prefer an unowned/orphan role; otherwise evict the LRU persona.
+   *
+   *  Known limit: with more concurrently-active personas than `size`, binds
+   *  cycle create/delete at the cap (the evicted persona's next reconcile
+   *  re-binds it, evicting the next LRU). Roles stay uncorrupted — mentions of
+   *  evicted personas just go dead — but if a guild legitimately needs that
+   *  many personas, raise PORTAL_ROLE_POOL_SIZE (Discord caps roles at 250). */
+  private async freeOneSlot(guildId: string, pool: GuildPool): Promise<void> {
+    let orphan: string | null = null;
+    for (const [roleId, owner] of pool.bindings) {
+      if (owner === null) {
+        orphan = roleId;
+        break;
+      }
+    }
+    if (orphan) {
+      pool.bindings.delete(orphan);
+      pool.names.delete(orphan);
+      await this.ops.deleteRole(guildId, orphan);
+      return;
+    }
     const victim = pool.lru[0];
     const victimRole = victim ? pool.byPersona.get(victim) : undefined;
     if (!victim || !victimRole) {
@@ -131,14 +205,38 @@ export class RolePool {
     }
     pool.byPersona.delete(victim);
     pool.lru.shift();
-    pool.bindings.set(victimRole, null);
-    await this.ops.renameRole(guildId, victimRole, wanted);
-    pool.names.set(victimRole, wanted);
-    this.assign(pool, victimRole, personaId);
-    return victimRole;
+    pool.bindings.delete(victimRole);
+    pool.names.delete(victimRole);
+    await this.ops.deleteRole(guildId, victimRole);
   }
 
-  /** Rename a persona's bound roles in every guild (live displayName change). */
+  /** Release a persona's role in a guild (lost access, or persona removed):
+   *  delete the Discord role so its stale mentions die cleanly. No-op if unbound. */
+  unbind(guildId: string, personaId: string): Promise<void> {
+    return this.withGuildLock(guildId, async () => {
+      const pool = this.guilds.get(guildId);
+      const roleId = pool?.byPersona.get(personaId);
+      if (!pool || !roleId) return;
+      // Discord first, then memory, then disk: if we die mid-flight the worst
+      // case is a persisted binding to a deleted role, which loadPersisted
+      // drops on the next boot (role no longer discoverable).
+      await this.ops.deleteRole(guildId, roleId);
+      pool.byPersona.delete(personaId);
+      pool.bindings.delete(roleId);
+      pool.names.delete(roleId);
+      const i = pool.lru.indexOf(personaId);
+      if (i >= 0) pool.lru.splice(i, 1);
+      this.persist();
+    });
+  }
+
+  /** Release a persona everywhere (identity removal). */
+  async unbindAll(personaId: string): Promise<void> {
+    for (const guildId of [...this.guilds.keys()]) await this.unbind(guildId, personaId);
+  }
+
+  /** Rename a persona's OWN bound roles in every guild (live displayName change).
+   *  Safe: the role id stays owned by the same persona, so no mention is retargeted. */
   async rename(personaId: string, displayName: string): Promise<void> {
     for (const [guildId, pool] of this.guilds) {
       const roleId = pool.byPersona.get(personaId);
@@ -147,6 +245,7 @@ export class RolePool {
         pool.names.set(roleId, this.roleName(displayName));
       }
     }
+    this.persist();
   }
 
   /** Current persona bound to a role (for inbound mention → routing). */

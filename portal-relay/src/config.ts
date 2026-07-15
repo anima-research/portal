@@ -152,6 +152,8 @@ export interface InvitesFile {
 export interface RolePoolConfig {
   size: number;
   prefix: string;
+  /** JSON file persisting persona->role ownership across restarts (optional). */
+  persistPath?: string;
 }
 
 /**
@@ -260,6 +262,7 @@ export function loadConfig(): RelayConfig {
     rolePool: {
       size: parseInt(process.env.PORTAL_ROLE_POOL_SIZE ?? '50', 10),
       prefix: process.env.PORTAL_ROLE_POOL_PREFIX ?? 'portal-',
+      persistPath: process.env.PORTAL_ROLE_POOL_STATE,
     },
     webhookPoolSize: parseInt(process.env.PORTAL_WEBHOOK_POOL ?? '1', 10),
     heartbeatIntervalMs: parseInt(process.env.PORTAL_HEARTBEAT_MS ?? '30000', 10),
