@@ -295,7 +295,11 @@ export class DiscordBot implements WebhookOps, RoleOps {
   }
 
   async deleteRole(guildId: string, roleId: string): Promise<void> {
-    const guild = await this.client.guilds.fetch(guildId);
+    // Never-throw, per RoleOps ("must resolve even if already gone"): callers
+    // fire-and-forget from cleanup paths, and a kicked guild / transient API
+    // error must not surface as an unhandled rejection.
+    const guild = await this.client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) return;
     const role = await guild.roles.fetch(roleId).catch(() => null);
     if (role) await role.delete().catch(() => {}); // already gone → fine
   }

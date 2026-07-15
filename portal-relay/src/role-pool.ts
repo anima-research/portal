@@ -138,13 +138,21 @@ export class RolePool {
   private async bindLocked(guildId: string, personaId: string, displayName: string): Promise<string> {
     const pool = await this.ensureDiscovered(guildId);
 
+    const wanted = this.roleName(displayName);
+
     const existing = pool.byPersona.get(personaId);
     if (existing) {
       this.touch(pool, personaId);
+      // Heal name drift (e.g. displayName changed while the relay was down and
+      // the binding was restored from persisted state, which matches by id, not
+      // name). Renaming a persona's OWN role is safe under the new contract —
+      // the role id keeps pointing at the same persona.
+      if (pool.names.get(existing) !== wanted) {
+        await this.ops.renameRole(guildId, existing, wanted);
+        pool.names.set(existing, wanted);
+      }
       return existing;
     }
-
-    const wanted = this.roleName(displayName);
 
     // 1) Adopt a free role ALREADY named for this persona (migration from the
     //    legacy rename-pool, or a pre-persistence restart). Never adopt a free
@@ -169,7 +177,13 @@ export class RolePool {
   }
 
   /** Make room at the role cap by DELETING a role (never renaming onto a new
-   *  owner). Prefer an unowned/orphan role; otherwise evict the LRU persona. */
+   *  owner). Prefer an unowned/orphan role; otherwise evict the LRU persona.
+   *
+   *  Known limit: with more concurrently-active personas than `size`, binds
+   *  cycle create/delete at the cap (the evicted persona's next reconcile
+   *  re-binds it, evicting the next LRU). Roles stay uncorrupted — mentions of
+   *  evicted personas just go dead — but if a guild legitimately needs that
+   *  many personas, raise PORTAL_ROLE_POOL_SIZE (Discord caps roles at 250). */
   private async freeOneSlot(guildId: string, pool: GuildPool): Promise<void> {
     let orphan: string | null = null;
     for (const [roleId, owner] of pool.bindings) {
@@ -203,12 +217,15 @@ export class RolePool {
       const pool = this.guilds.get(guildId);
       const roleId = pool?.byPersona.get(personaId);
       if (!pool || !roleId) return;
+      // Discord first, then memory, then disk: if we die mid-flight the worst
+      // case is a persisted binding to a deleted role, which loadPersisted
+      // drops on the next boot (role no longer discoverable).
+      await this.ops.deleteRole(guildId, roleId);
       pool.byPersona.delete(personaId);
       pool.bindings.delete(roleId);
       pool.names.delete(roleId);
       const i = pool.lru.indexOf(personaId);
       if (i >= 0) pool.lru.splice(i, 1);
-      await this.ops.deleteRole(guildId, roleId);
       this.persist();
     });
   }

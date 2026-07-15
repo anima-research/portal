@@ -192,7 +192,7 @@ export class Relay implements GatewayHooks {
     if (c.kind === 'remove') {
       this.gateway.closePersona(c.id);
       this.readState.forget(c.id);
-      void this.roles.unbindAll(c.id);
+      void this.roles.unbindAll(c.id).catch((e) => console.error('[portal-relay] unbind on remove:', (e as Error).message));
       return;
     }
     const renamed = c.prev && c.prev.displayName !== c.next.displayName;
@@ -221,7 +221,8 @@ export class Relay implements GatewayHooks {
       });
     }
 
-    for (const g of this.bot.listGuilds()) void this.reconcilePersonaGuild(c.personaId, g.id);
+    for (const g of this.bot.listGuilds())
+      void this.reconcilePersonaGuild(c.personaId, g.id).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
   }
 
   /** Guild allow-list changed at runtime (admin edit, hot-reload, or the bot
@@ -234,7 +235,7 @@ export class Relay implements GatewayHooks {
       // pre-authorized but not joined yet — dormant until guildCreate fires.
       const g = this.bot.listGuilds().find((x) => x.id === gid);
       if (!g) continue;
-      void this.reconcileGuild(gid);
+      void this.reconcileGuild(gid).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
       const metas = this.bot.listChannelMetas(gid);
       for (const personaId of this.gateway.activePersonas()) {
         this.gateway.dispatch(personaId, {
@@ -247,6 +248,9 @@ export class Relay implements GatewayHooks {
     for (const gid of c.removed) {
       this.mirror.invalidateGuild(gid);
       this.repushGuildCaps(gid); // capsFor's allow-gate zeroes them out
+      // Explicit (not only via repushGuildCaps): still runs when the bot was
+      // kicked and the channel cache is empty, so bindings/persisted state die.
+      void this.reconcileGuild(gid).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
       for (const personaId of this.gateway.activePersonas()) {
         this.gateway.dispatch(personaId, { type: 'guild_delete', guildId: gid });
       }
@@ -268,7 +272,7 @@ export class Relay implements GatewayHooks {
       }
     }
 
-    void this.reconcileGuild(guildId);
+    void this.reconcileGuild(guildId).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
   }
 
   /** Ensure every connected persona has an addressing role wherever it can act,
@@ -293,7 +297,7 @@ export class Relay implements GatewayHooks {
       if (canAccess) await this.roles.bind(guildId, personaId, cfg.displayName);
       else await this.roles.unbind(guildId, personaId);
     } catch (e) {
-      console.error('[portal-relay] addressing-role reconcile (' + personaId + '/' + guildId + '):', (e as Error).message);
+      console.error(`[portal-relay] addressing-role reconcile (${personaId}/${guildId}):`, (e as Error).message);
       return;
     }
     this.gateway.dispatch(personaId, {

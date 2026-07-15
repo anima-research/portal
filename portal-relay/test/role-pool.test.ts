@@ -186,3 +186,77 @@ test('concurrent restart reclaim: matching names, zero renames/creates', async (
   assert.equal(ops.calls.create, 0);
   assert.equal(ops.roles.get(roles[0]), 'portal-x');
 });
+
+// ── Persistence (PORTAL_ROLE_POOL_STATE) ──
+
+import { mkdtempSync, writeFileSync as fsWrite, readFileSync as fsRead } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+function tmpState(): string {
+  return join(mkdtempSync(join(tmpdir(), 'role-pool-test-')), 'state.json');
+}
+
+test('persistence: restart re-adopts the exact role id even when the display name changed while down', async () => {
+  const ops = new FakeRoleOps();
+  const state = tmpState();
+
+  const pool1 = new RolePool(ops, 50, PREFIX, state);
+  const role1 = await pool1.bind(GUILD, 'p-grok', 'grok43');
+
+  // Relay restarts; persona reconnects under a NEW displayName. Name-based
+  // re-adoption cannot solve this — only persisted ownership can.
+  const pool2 = new RolePool(ops, 50, PREFIX, state);
+  const role2 = await pool2.bind(GUILD, 'p-grok', 'grok44');
+
+  assert.equal(role2, role1, 'same physical role re-adopted by persisted id, not by name');
+  assert.equal(ops.calls.create, 1, 'no second role created');
+  assert.equal(ops.roles.get(role1), 'portal-grok44', 'name drift healed on its OWN role');
+  assert.equal(ops.calls.rename, 1, 'exactly the drift-healing rename');
+});
+
+test('persistence: a persisted role deleted out-of-band is dropped and a fresh one created', async () => {
+  const ops = new FakeRoleOps();
+  const state = tmpState();
+
+  const pool1 = new RolePool(ops, 50, PREFIX, state);
+  const role1 = await pool1.bind(GUILD, 'p-grok', 'grok43');
+
+  ops.roles.delete(role1); // someone deleted the role in the Discord UI
+
+  const pool2 = new RolePool(ops, 50, PREFIX, state);
+  const role2 = await pool2.bind(GUILD, 'p-grok', 'grok43');
+
+  assert.notEqual(role2, role1, 'stale persisted binding was not resurrected');
+  assert.equal(ops.roles.get(role2), 'portal-grok43');
+  assert.equal(pool2.resolveRole(GUILD, role2), 'p-grok');
+});
+
+test('persistence: a corrupt state file is ignored, not fatal', async () => {
+  const ops = new FakeRoleOps();
+  const state = tmpState();
+  fsWrite(state, '{ this is not json');
+
+  const pool = new RolePool(ops, 50, PREFIX, state);
+  const role = await pool.bind(GUILD, 'p-grok', 'grok43');
+
+  assert.equal(ops.roles.get(role), 'portal-grok43', 'pool still functions');
+  // And the file heals: the new binding round-trips.
+  const saved = JSON.parse(fsRead(state, 'utf8')) as Record<string, Record<string, string>>;
+  assert.equal(saved[GUILD]['p-grok'], role);
+});
+
+test('unbind deletes Discord-side first, then memory and disk', async () => {
+  const ops = new FakeRoleOps();
+  const state = tmpState();
+  const pool = new RolePool(ops, 50, PREFIX, state);
+  const role = await pool.bind(GUILD, 'p-grok', 'grok43');
+
+  await pool.unbind(GUILD, 'p-grok');
+
+  assert.equal(ops.calls.delete, 1);
+  assert.equal(ops.roles.has(role), false, 'Discord role gone');
+  assert.equal(pool.getRoleFor(GUILD, 'p-grok'), undefined, 'memory unbound');
+  const saved = JSON.parse(fsRead(state, 'utf8')) as Record<string, Record<string, string>>;
+  assert.equal(saved[GUILD]?.['p-grok'], undefined, 'disk unbound');
+});
