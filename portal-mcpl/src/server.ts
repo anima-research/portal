@@ -33,6 +33,7 @@ import {
   type PushEventParams,
 } from '@animalabs/mcpl-core';
 import type { PortalClient } from '@animalabs/portal-client';
+import { chunkText } from './chunk.js';
 import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
 import type { PortalAgent } from './agent.js';
 import type { PendingPing } from './agent-state.js';
@@ -194,8 +195,14 @@ export class PortalMcplServer {
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
       .map((b) => b.text)
       .join('\n');
-    const { messageId } = await this.client.sendMessage({ channelId, content: text });
-    return { delivered: true, messageId };
+    // Discord caps content at 2000 chars — split long prose into sequential
+    // messages instead of letting the whole publish 400 and vanish.
+    let firstId: string | undefined;
+    for (const chunk of chunkText(text)) {
+      const { messageId } = await this.client.sendMessage({ channelId, content: chunk });
+      firstId ??= messageId;
+    }
+    return { delivered: true, messageId: firstId };
   }
 
   private async handleChannelOpen(open: ChannelsOpenParams): Promise<ChannelsOpenResult> {
@@ -289,6 +296,13 @@ export class PortalMcplServer {
       }
     });
     this.client.on('message', (e) => {
+      // Self-echo filter: the relay dispatches the persona's OWN webhook posts
+      // back to it like any other channel message. Re-ingesting them is pure
+      // noise — the send tool already returned the messageId, and with
+      // hear-while-acting (agent-framework ≥0.6.5) each echo would be
+      // re-injected INTO the live turn as an incoming message, so a narrating
+      // agent hears itself quoted back every round.
+      if (authorOf(e.message).id === this.client.personaId) return;
       if (e.addressedToMe) this.wokenPings.add(e.message.id); // live wake covers it
       this.pushMessage(e.message, e.addressedToMe, e.reasons);
     });

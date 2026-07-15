@@ -78,6 +78,11 @@ interface Pending {
 
 export class PortalClient extends TypedEmitter<PortalClientEvents> {
   readonly cache = new ClientCache();
+
+  /** The persona this client is connected as (for self-message filtering). */
+  get personaId(): string {
+    return this.opts.personaId;
+  }
   private ws?: WebSocket;
   private opts: Required<Omit<PortalClientOptions, 'subscriptions' | 'wsFactory'>> &
     Pick<PortalClientOptions, 'subscriptions' | 'wsFactory'>;

@@ -14,6 +14,7 @@
 import type { PortalClient } from '@animalabs/portal-client';
 import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
 import { AgentState, type PendingPing } from './agent-state.js';
+import { chunkText } from './chunk.js';
 import { toolDefinitions } from './tools.js';
 
 export interface PortalAgentOptions {
@@ -116,14 +117,28 @@ export class PortalAgent {
   /** Dispatch a tool call. Returns a plain JSON-able result. */
   async handleToolCall(name: string, args: Record<string, unknown>): Promise<unknown> {
     switch (name) {
-      case 'send_message':
-        return this.client.sendMessage({
-          channelId: str(args.channelId),
-          content: optStr(args.content),
-          files: args.files as never,
-          replyToId: optStr(args.replyToId),
-          mentionPersonaIds: args.mentionPersonaIds as string[] | undefined,
-        });
+      case 'send_message': {
+        // Discord caps content at 2000 chars — split long messages into
+        // sequential sends (files/reply/mentions ride on the first chunk).
+        const content = optStr(args.content);
+        const chunks = content !== undefined ? chunkText(content) : [content];
+        let first: unknown;
+        for (let i = 0; i < chunks.length; i++) {
+          const result = await this.client.sendMessage({
+            channelId: str(args.channelId),
+            content: chunks[i],
+            ...(i === 0
+              ? {
+                  files: args.files as never,
+                  replyToId: optStr(args.replyToId),
+                  mentionPersonaIds: args.mentionPersonaIds as string[] | undefined,
+                }
+              : {}),
+          });
+          first ??= result;
+        }
+        return first;
+      }
       case 'edit_message':
         return this.client.editMessage(str(args.messageId), str(args.content));
       case 'delete_message':
