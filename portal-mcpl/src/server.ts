@@ -507,6 +507,16 @@ export class PortalMcplServer {
       .map((channel) => toDescriptor(channel, this.agent.state.isSubscribed(channel.id)));
   }
 
+  /** Drop the legacy file-backed subscription for each channel that has now
+   *  been advertised to the host (as an initiallyOpen bootstrap). Selective on
+   *  purpose: only an advertised channel's bootstrap job is done. */
+  private retireAdvertisedSubscriptions(descriptors: ChannelDescriptor[]): void {
+    for (const descriptor of descriptors) {
+      const relayId = parsePortalChannelId(descriptor.id);
+      if (relayId) this.agent.state.unsubscribe(relayId);
+    }
+  }
+
   private registerChannels(): Promise<void> {
     if (this.registrationInFlight) return this.registrationInFlight;
 
@@ -523,7 +533,15 @@ export class PortalMcplServer {
         await conn.sendRequest(method.CHANNELS_REGISTER, params);
         for (const descriptor of descriptors) this.registered.add(descriptor.id);
         this.initialRegistrationComplete = true;
-        this.agent.state.clearSubscriptions();
+        // Retire ONLY the subscriptions that were actually advertised in the
+        // acked register (their initiallyOpen has been durably reconciled by
+        // the host). A blanket clearSubscriptions() here permanently
+        // destroyed any subscription whose channel missed the enumeration
+        // (partial relay cache, stale build, transport hiccup) — the exact
+        // "every bot loses its subscriptions on migration" failure mode.
+        // Anything not yet advertised survives for a later register/changed
+        // cycle, mirroring discord-mcpl's keep-the-bootstrap-hint approach.
+        this.retireAdvertisedSubscriptions(descriptors);
         return;
       }
 
@@ -531,6 +549,10 @@ export class PortalMcplServer {
       if (added.length === 0) return;
       for (const descriptor of added) this.registered.add(descriptor.id);
       conn.sendNotification(method.CHANNELS_CHANGED, { added });
+      // Late-arriving channels carried initiallyOpen too — retire their
+      // subscriptions once announced (the host bootstraps their desired
+      // state from the changed notification).
+      this.retireAdvertisedSubscriptions(added);
     };
 
     this.registrationInFlight = run().finally(() => {
