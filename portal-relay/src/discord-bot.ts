@@ -294,6 +294,12 @@ export class DiscordBot implements WebhookOps, RoleOps {
     if (role) await role.edit({ name, mentionable: true });
   }
 
+  async deleteRole(guildId: string, roleId: string): Promise<void> {
+    const guild = await this.client.guilds.fetch(guildId);
+    const role = await guild.roles.fetch(roleId).catch(() => null);
+    if (role) await role.delete().catch(() => {}); // already gone → fine
+  }
+
   async discoverPooledRoles(
     guildId: string,
     prefix: string,

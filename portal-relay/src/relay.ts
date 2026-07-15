@@ -78,7 +78,7 @@ export class Relay implements GatewayHooks {
     this.mirror = new MirrorCache(this.bot);
     this.permissions.setMirrorLookup((g, r) => this.mirror.lookup(g, r));
     if (config.invitesPath) this.invites = new InviteStore(config.invitesPath);
-    this.roles = new RolePool(this.bot, config.rolePool.size, config.rolePool.prefix);
+    this.roles = new RolePool(this.bot, config.rolePool.size, config.rolePool.prefix, config.rolePool.persistPath);
     this.webhooks = new WebhookPool(this.bot, config.webhookPoolSize);
     this.gateway = new Gateway(this, config.heartbeatIntervalMs);
     // RFC-005: admin HTTP API. The deps object closes over the bot/gateway so the
@@ -192,6 +192,7 @@ export class Relay implements GatewayHooks {
     if (c.kind === 'remove') {
       this.gateway.closePersona(c.id);
       this.readState.forget(c.id);
+      void this.roles.unbindAll(c.id);
       return;
     }
     const renamed = c.prev && c.prev.displayName !== c.next.displayName;
@@ -219,6 +220,8 @@ export class Relay implements GatewayHooks {
         capabilities: this.capsFor(c.personaId, meta.id, meta.guildId),
       });
     }
+
+    for (const g of this.bot.listGuilds()) void this.reconcilePersonaGuild(c.personaId, g.id);
   }
 
   /** Guild allow-list changed at runtime (admin edit, hot-reload, or the bot
@@ -231,6 +234,7 @@ export class Relay implements GatewayHooks {
       // pre-authorized but not joined yet — dormant until guildCreate fires.
       const g = this.bot.listGuilds().find((x) => x.id === gid);
       if (!g) continue;
+      void this.reconcileGuild(gid);
       const metas = this.bot.listChannelMetas(gid);
       for (const personaId of this.gateway.activePersonas()) {
         this.gateway.dispatch(personaId, {
@@ -263,6 +267,39 @@ export class Relay implements GatewayHooks {
         });
       }
     }
+
+    void this.reconcileGuild(guildId);
+  }
+
+  /** Ensure every connected persona has an addressing role wherever it can act,
+   *  and none where it cannot. Called on any role/channel/permission/allow-list
+   *  change so the pool tracks live access instead of only binding at connect. */
+  private async reconcileGuild(guildId: string): Promise<void> {
+    for (const personaId of this.gateway.activePersonas()) {
+      await this.reconcilePersonaGuild(personaId, guildId);
+    }
+  }
+
+  /** Bind (or delete) one persona's addressing role in a guild to match whether
+   *  it currently has any capability there. Idempotent; only calls Discord when
+   *  the bound state actually differs from access. */
+  private async reconcilePersonaGuild(personaId: string, guildId: string): Promise<void> {
+    const cfg = this.identity.get(personaId);
+    if (!cfg) return;
+    const canAccess = this.bot.isGuildAllowed(guildId) && this.personaCanAccessGuild(personaId, guildId);
+    const bound = !!this.roles.getRoleFor(guildId, personaId);
+    if (canAccess === bound) return;
+    try {
+      if (canAccess) await this.roles.bind(guildId, personaId, cfg.displayName);
+      else await this.roles.unbind(guildId, personaId);
+    } catch (e) {
+      console.error('[portal-relay] addressing-role reconcile (' + personaId + '/' + guildId + '):', (e as Error).message);
+      return;
+    }
+    this.gateway.dispatch(personaId, {
+      type: 'persona_update',
+      persona: this.identity.toPersona(cfg, this.roles.roleByGuildFor(personaId)),
+    });
   }
 
   // ── GatewayHooks ──

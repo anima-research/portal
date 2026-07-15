@@ -10,7 +10,7 @@ const PREFIX = 'portal-';
 class FakeRoleOps implements RoleOps {
   private seq = 0;
   roles = new Map<string, string>(); // roleId → name
-  calls = { create: 0, rename: 0 };
+  calls = { create: 0, rename: 0, delete: 0 };
   constructor(private latencyMs = 0) {}
 
   private async delay(): Promise<void> {
@@ -38,22 +38,42 @@ class FakeRoleOps implements RoleOps {
     this.calls.rename++;
   }
 
+  async deleteRole(_guildId: string, roleId: string): Promise<void> {
+    await this.delay();
+    this.roles.delete(roleId);
+    this.calls.delete++;
+  }
+
   async discoverPooledRoles(_guildId: string, prefix: string): Promise<Array<{ id: string; name: string }>> {
     await this.delay();
     return [...this.roles].filter(([, n]) => n.startsWith(prefix)).map(([id, name]) => ({ id, name }));
   }
 }
 
-test('fresh bind reuses a free role and renames it', async () => {
+test('fresh bind never hijacks an unrelated free role — creates its own', async () => {
   const ops = new FakeRoleOps();
-  ops.seed('portal-old');
+  const orphan = ops.seed('portal-old'); // a free role named for a DIFFERENT persona
   const pool = new RolePool(ops, 50, PREFIX);
 
   const roleId = await pool.bind(GUILD, 'p-grok', 'grok43');
 
   assert.equal(ops.roles.get(roleId), 'portal-grok43');
-  assert.equal(ops.calls.rename, 1);
+  assert.notEqual(roleId, orphan, 'did not reuse the unrelated free role');
+  assert.equal(ops.calls.rename, 0, 'no rename — an unrelated role is never reattributed');
+  assert.equal(ops.calls.create, 1, 'created its own dedicated role');
+  assert.equal(ops.roles.get(orphan), 'portal-old', 'the unrelated role is left intact');
+});
+
+test('a free role ALREADY named for this persona is re-adopted (no create, no rename)', async () => {
+  const ops = new FakeRoleOps();
+  const own = ops.seed('portal-grok43'); // e.g. legacy role or a prior boot's role
+  const pool = new RolePool(ops, 50, PREFIX);
+
+  const roleId = await pool.bind(GUILD, 'p-grok', 'grok43');
+
+  assert.equal(roleId, own, 're-adopted its own existing role');
   assert.equal(ops.calls.create, 0);
+  assert.equal(ops.calls.rename, 0);
 });
 
 test('bind creates a role when none are free', async () => {
@@ -97,9 +117,37 @@ test('across a restart, a persona re-adopts its own role — no rename, no dupli
   assert.equal([...ops.roles.values()].filter((n) => n === 'portal-grok43').length, 1);
 });
 
-test('concurrent reconnects get distinct roles — no double-pick, no spurious create', async () => {
+test('at cap, eviction DELETES the LRU role — never renames it onto the new owner', async () => {
+  const ops = new FakeRoleOps();
+  const pool = new RolePool(ops, 2, PREFIX); // cap of 2 forces eviction on the 3rd
+
+  const rA = await pool.bind(GUILD, 'pA', 'A');
+  await pool.bind(GUILD, 'pB', 'B');
+  const rC = await pool.bind(GUILD, 'pC', 'C'); // at cap → evict LRU (pA)
+
+  assert.equal(ops.calls.rename, 0, 'no rename — a stale mention is never reattributed to a new persona');
+  assert.equal(ops.calls.delete, 1, 'the evicted role was physically deleted');
+  assert.equal(ops.roles.has(rA), false, "pA's role is gone → its old mentions render as a dead role");
+  assert.equal(pool.getRoleFor(GUILD, 'pA'), undefined, 'pA is no longer bound');
+  assert.notEqual(rC, rA, 'pC got a fresh role, not pA’s renamed');
+  assert.equal(ops.roles.get(rC), 'portal-C');
+});
+
+test('an orphan free role is deleted (not renamed) to make room before evicting a live persona', async () => {
+  const ops = new FakeRoleOps();
+  ops.seed('portal-orphan'); // 1 unowned role occupies the single slot
+  const pool = new RolePool(ops, 1, PREFIX); // cap of 1
+
+  const r = await pool.bind(GUILD, 'p1', 'one');
+
+  assert.equal(ops.calls.rename, 0, 'orphan reclaimed by delete, never renamed');
+  assert.equal(ops.calls.delete, 1, 'the orphan role was deleted to free the slot');
+  assert.equal(ops.roles.get(r), 'portal-one');
+});
+
+test('concurrent reconnects get distinct dedicated roles — no double-pick', async () => {
   const ops = new FakeRoleOps(5); // latency so binds interleave across awaits
-  ops.seed('portal-a');
+  ops.seed('portal-a'); // unrelated free roles — must NOT be hijacked
   ops.seed('portal-b');
   ops.seed('portal-c');
   const pool = new RolePool(ops, 50, PREFIX);
@@ -111,7 +159,8 @@ test('concurrent reconnects get distinct roles — no double-pick, no spurious c
   ]);
 
   assert.equal(new Set([r1, r2, r3]).size, 3, 'each persona got a distinct role');
-  assert.equal(ops.calls.create, 0, 'reused the 3 free roles, created none');
+  assert.equal(ops.calls.create, 3, 'each got its own dedicated role — unrelated frees left alone');
+  assert.equal(ops.calls.rename, 0, 'no renames — no mention reattribution');
   // Each persona resolves to its own role and vice-versa.
   assert.equal(pool.getRoleFor(GUILD, 'p1'), r1);
   assert.equal(pool.resolveRole(GUILD, r1), 'p1');
