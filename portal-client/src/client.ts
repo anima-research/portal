@@ -165,14 +165,26 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   fetchHistory(params: RpcParams<'fetch_history'>) {
     return this.call('fetch_history', params);
   }
-  subscribe(channelId: string) {
+  async subscribe(channelId: string) {
     const subs = (this.opts.subscriptions ??= []);
-    if (!subs.includes(channelId)) subs.push(channelId);
-    return this.call('subscribe_channel', { channelId });
+    const added = !subs.includes(channelId);
+    if (added) subs.push(channelId);
+    try {
+      return await this.call('subscribe_channel', { channelId });
+    } catch (error) {
+      if (added) this.opts.subscriptions = subs.filter((c) => c !== channelId);
+      throw error;
+    }
   }
-  unsubscribe(channelId: string) {
-    this.opts.subscriptions = (this.opts.subscriptions ?? []).filter((c) => c !== channelId);
-    return this.call('unsubscribe_channel', { channelId });
+  async unsubscribe(channelId: string) {
+    const previous = [...(this.opts.subscriptions ?? [])];
+    this.opts.subscriptions = previous.filter((c) => c !== channelId);
+    try {
+      return await this.call('unsubscribe_channel', { channelId });
+    } catch (error) {
+      this.opts.subscriptions = previous;
+      throw error;
+    }
   }
   /** Claim an invite to expand this persona's rights (RFC-005 §5.6). */
   claimInvite(code: string) {

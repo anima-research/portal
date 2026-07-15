@@ -47,8 +47,8 @@ export const featureSets: FeatureSetDeclaration[] = [
   {
     name: 'portal.subscriptions',
     description:
-      'Manage ambient channel subscriptions + server-authoritative read-state ' +
-      '(pending pings, unread, channel_missed) with offline catch-up',
+      'Server-authoritative read-state (pending pings, unread, channel_missed) ' +
+      'with offline catch-up; the MCPL host owns channel open/close lifecycle',
     uses: ['tools'],
     rollback: false,
     hostState: false,

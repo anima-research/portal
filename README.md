@@ -119,11 +119,17 @@ ephemeral `--mcp-config`); dev channels go in
 
 ## connectome-host integration
 
-`portal-mcpl` is also a full MCPL server for connectome-host (recipe-driven
-agent host). It does the initialize handshake, `tools/list`, `tools/call` →
-`PortalAgent`, channel registration, `push/event` for inbound messages, and
-`channels/publish` → send (the host's locus-routing path). Stdio entry:
-`portal-mcpl/src/server-cli.ts`.
+`portal-mcpl` is also a full MCPL server for connectome-host. The host owns
+channel lifecycle in Chronicle: `channel_open` subscribes the Portal relay,
+`channel_close` unsubscribes it, and the state is restored without depending on
+Portal's local files. A ping in a closed channel is still delivered as a gated
+event so the agent can choose whether to open it (with optional backscroll) or
+acknowledge it with a visible reaction. Existing file-backed subscriptions are
+migrated once as `initiallyOpen` during `channels/register`.
+
+The legacy Portal subscription and reaction-visibility tools are hidden in this
+mode; they remain available in the standalone Claude Code channel mode. Stdio
+entry: `portal-mcpl/src/server-cli.ts`.
 
 ```
 connectome-host (one per agent recipe)

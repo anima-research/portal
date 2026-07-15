@@ -67,10 +67,10 @@ async function main(): Promise<void> {
   const url = process.env.PORTAL_URL ?? 'ws://127.0.0.1:8790';
   const { personaId, token } = await resolveCreds(url);
 
-  // Durable agent state (watermarks + pending pings + subscriptions). Keyed to
-  // the persona so it survives restarts. The relay is now authoritative for
-  // read-state, but local subscriptions still drive what ambient traffic the
-  // relay delivers — so we persist + reapply them on every (re)connect.
+  // Durable agent state (watermarks + pending pings plus legacy subscriptions).
+  // The MCPL host owns channel lifecycle in Chronicle. Existing file-backed
+  // subscriptions are advertised once as `initiallyOpen`, then removed after
+  // the host acknowledges channels/register; the remaining state stays local.
   const credsDir =
     process.env.PORTAL_CREDENTIALS ? dirname(process.env.PORTAL_CREDENTIALS) : join(homedir(), '.portal');
   const statePath = process.env.PORTAL_STATE ?? join(credsDir, `${personaId}.state.json`);
@@ -84,7 +84,8 @@ async function main(): Promise<void> {
     state = new AgentState();
   }
 
-  // PORTAL_SUBSCRIPTIONS is a one-time seed; the state file is the source of truth after.
+  // PORTAL_SUBSCRIPTIONS is a bootstrap seed. Once the host acknowledges the
+  // registration, Chronicle becomes the source of truth for channel lifecycle.
   for (const ch of (process.env.PORTAL_SUBSCRIPTIONS ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
     state.subscribe(ch);
   }
@@ -106,7 +107,7 @@ async function main(): Promise<void> {
   for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { flush(); process.exit(0); });
 
   const client = new PortalClient({ url, token, personaId, subscriptions: state.subscriptionList() });
-  const agent = new PortalAgent(client, { state });
+  const agent = new PortalAgent(client, { state, hostOwnsChannelLifecycle: true });
   const server = new PortalMcplServer(client, agent);
 
   // Connect to the relay in the background; the MCPL handshake can proceed and

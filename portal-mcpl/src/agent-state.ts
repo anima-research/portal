@@ -100,6 +100,16 @@ export class AgentState {
     return [...this.subscriptions];
   }
 
+  /** Clear subscriptions after a Chronicle-backed MCPL host has acknowledged
+   *  their one-time migration. Watermarks, pings, and reaction preferences are
+   *  deliberately unaffected. */
+  clearSubscriptions(): boolean {
+    if (this.subscriptions.size === 0) return false;
+    this.subscriptions.clear();
+    this.emitChange();
+    return true;
+  }
+
   isSubscribed(channelId: string): boolean {
     return this.subscriptions.has(channelId);
   }

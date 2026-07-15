@@ -8,6 +8,14 @@
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import type { PortalChannel } from '@animalabs/portal-protocol';
 
+export type PortalChannelDescriptor = ChannelDescriptor & {
+  initiallyOpen?: boolean;
+  capabilities?: {
+    history?: { maxMessages?: number; supportsBeforeMessage?: boolean };
+    acknowledgment?: { kind?: string; supportsValue?: boolean };
+  };
+};
+
 export function portalChannelId(channelId: string): string {
   return `portal:${channelId}`;
 }
@@ -17,7 +25,11 @@ export function parsePortalChannelId(id: string): string | null {
   return parts.length === 2 && parts[0] === 'portal' ? parts[1] : null;
 }
 
-export function toDescriptor(channel: PortalChannel): ChannelDescriptor {
+export function toDescriptor(
+  channel: PortalChannel,
+  initiallyOpen = false,
+  maxHistory = 500,
+): PortalChannelDescriptor {
   const guildLabel = channel.guildId ? '' : ' (dm)';
   return {
     id: portalChannelId(channel.id),
@@ -30,6 +42,11 @@ export function toDescriptor(channel: PortalChannel): ChannelDescriptor {
       parentId: channel.parentId,
       guildId: channel.guildId,
       capabilities: channel.capabilities,
+    },
+    initiallyOpen,
+    capabilities: {
+      history: { maxMessages: maxHistory, supportsBeforeMessage: true },
+      acknowledgment: { kind: 'reaction', supportsValue: true },
     },
   };
 }

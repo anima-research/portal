@@ -85,6 +85,24 @@ test('subscriptions survive serialize/restore', () => {
   assert.deepEqual(restored.subscriptionList().sort(), ['c1', 'c2']);
 });
 
+test('clearSubscriptions removes only the legacy lifecycle state', () => {
+  const s = new AgentState();
+  let changes = 0;
+  s.onChange(() => changes++);
+  s.subscribe('c1');
+  s.setReactionVisibility('c1', true);
+  s.ingest(msg('m1', 'c1', '2026-01-01T00:00:00Z'), true, ['role_mention']);
+  changes = 0;
+
+  assert.equal(s.clearSubscriptions(), true);
+  assert.deepEqual(s.subscriptionList(), []);
+  assert.equal(s.isReactionVisible('c1'), true);
+  assert.equal(s.pendingPings().length, 1);
+  assert.equal(changes, 1);
+  assert.equal(s.clearSubscriptions(), false);
+  assert.equal(changes, 1);
+});
+
 test('reaction visibility: opt-in toggles, dedupes, fires onChange, and persists', () => {
   const s = new AgentState();
   let changes = 0;

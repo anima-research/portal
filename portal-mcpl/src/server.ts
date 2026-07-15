@@ -12,6 +12,8 @@ import {
   textContent,
   method,
   type ChannelDescriptor,
+  type ChannelsAcknowledgeParams,
+  type ChannelsAcknowledgeResult,
   type ChannelsCloseParams,
   type ChannelsCloseResult,
   type ChannelsIncomingParams,
@@ -20,6 +22,7 @@ import {
   type ChannelsOpenResult,
   type ChannelsPublishParams,
   type ChannelsPublishResult,
+  type ChannelsRegisterParams,
   type ContentBlock,
   type InitializeCapabilities,
   type JsonRpcNotification,
@@ -40,6 +43,8 @@ export class PortalMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
   private registered = new Set<string>();
+  private initialRegistrationComplete = false;
+  private registrationInFlight: Promise<void> | null = null;
   /** Portal channel ids the host has opened — routed via channels/incoming so
    *  ambient traffic folds into the open conversation; closed channels use
    *  push/event (which the host's wake gate evaluates). Mirrors discord-mcpl. */
@@ -56,9 +61,17 @@ export class PortalMcplServer {
 
   async serve(conn: McplConnection): Promise<void> {
     this.conn = conn;
+    this.registered.clear();
+    this.openChannels.clear();
+    this.initialRegistrationComplete = false;
+    this.registrationInFlight = null;
     this.wireClient();
     await this.handleInitialize();
-    if (this.mcplEnabled) this.registerChannels();
+    if (this.mcplEnabled) {
+      void this.registerChannels().catch((err) =>
+        console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
+      );
+    }
 
     try {
       while (!conn.isClosed) {
@@ -134,28 +147,19 @@ export class PortalMcplServer {
           break;
         }
         case method.CHANNELS_OPEN: {
-          const open = params as unknown as ChannelsOpenParams;
-          const addr = open.address as { channelId?: string } | undefined;
-          const channelId = addr?.channelId;
-          const channel = channelId ? this.client.cache.getChannel(channelId) : undefined;
-          if (!channelId || !channel) {
-            conn.sendError(req.id, -32000, 'unknown channel');
-            break;
-          }
-          void this.client.subscribe(channelId).catch(() => {});
-          this.openChannels.add(channelId);
-          const result: ChannelsOpenResult = { channel: toDescriptor(channel) };
+          const result = await this.handleChannelOpen(params as unknown as ChannelsOpenParams);
           conn.sendResponse(req.id, result);
           break;
         }
         case method.CHANNELS_CLOSE: {
-          const close = params as unknown as ChannelsCloseParams;
-          const channelId = parsePortalChannelId(close.channelId);
-          if (channelId) {
-            void this.client.unsubscribe(channelId).catch(() => {});
-            this.openChannels.delete(channelId);
-          }
-          const result: ChannelsCloseResult = { closed: true };
+          const result = await this.handleChannelClose(params as unknown as ChannelsCloseParams);
+          conn.sendResponse(req.id, result);
+          break;
+        }
+        case method.CHANNELS_ACKNOWLEDGE: {
+          const result = await this.handleChannelAcknowledge(
+            params as unknown as ChannelsAcknowledgeParams,
+          );
           conn.sendResponse(req.id, result);
           break;
         }
@@ -194,14 +198,95 @@ export class PortalMcplServer {
     return { delivered: true, messageId };
   }
 
+  private async handleChannelOpen(open: ChannelsOpenParams): Promise<ChannelsOpenResult> {
+    const exact = open.channelId ? parsePortalChannelId(open.channelId) : null;
+    const addr = open.address as { channelId?: string } | undefined;
+    const channelId = exact ?? addr?.channelId;
+    const channel = channelId ? this.client.cache.getChannel(channelId) : undefined;
+    if (!channelId || !channel) throw new Error('unknown channel');
+
+    const result: ChannelsOpenResult = {
+      channel: toDescriptor(channel, false),
+    };
+    const requested = open.history?.limit ?? 0;
+    if (requested > 0) {
+      const limit = Math.min(500, Math.max(0, Math.floor(requested)));
+      const fetched = await this.client.fetchHistory({
+        channelId,
+        limit,
+        ...(open.history?.beforeMessageId ? { before: open.history.beforeMessageId } : {}),
+      });
+      const messages = [...fetched.messages].sort((a, b) =>
+        a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0);
+      result.history = await Promise.all(messages.map(async (message) => ({
+        channelId: portalChannelId(message.channelId),
+        messageId: message.id,
+        ...(message.threadId ? { threadId: message.threadId } : {}),
+        author: authorOf(message),
+        timestamp: message.createdAt,
+        content: await buildContent(message),
+        metadata: { ...wakeMetadata(message, false, []), backscroll: true },
+        tags: deriveTags(message, false, []),
+      })));
+      result.historyTruncated = requested > limit;
+    }
+
+    // Commit actual lifecycle only after requested history succeeds.
+    await this.client.subscribe(channelId);
+    this.openChannels.add(channelId);
+    return result;
+  }
+
+  private async handleChannelClose(close: ChannelsCloseParams): Promise<ChannelsCloseResult> {
+    const channelId = parsePortalChannelId(close.channelId);
+    if (!channelId) throw new Error(`invalid Portal channel id: ${close.channelId}`);
+    await this.client.unsubscribe(channelId);
+    this.openChannels.delete(channelId);
+    return { closed: true };
+  }
+
+  private async handleChannelAcknowledge(
+    request: ChannelsAcknowledgeParams,
+  ): Promise<ChannelsAcknowledgeResult> {
+    if (!parsePortalChannelId(request.channelId)) {
+      return { acknowledged: false, reason: `invalid Portal channel id: ${request.channelId}` };
+    }
+    const representation = request.value?.trim() || '👀';
+    try {
+      // A visible persona reaction is attributable to this agent. A native
+      // reaction would be owned by the relay's shared Discord bot instead.
+      await this.client.react(request.messageId, representation, true, false);
+      return { acknowledged: true, representation };
+    } catch (error) {
+      return { acknowledged: false, reason: (error as Error).message };
+    }
+  }
+
   // ── Client → host event forwarding ──
 
   private wireClient(): void {
     this.client.on('ready', () => {
-      if (this.mcplEnabled) this.registerChannels();
+      if (this.mcplEnabled) {
+        void this.registerChannels().catch((err) =>
+          console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
+        );
+      }
       void this.catchUp().catch((err) =>
         console.error('[portal-mcpl] catch-up failed:', (err as Error).message),
       );
+    });
+    this.client.on('resumed', () => {
+      // A Portal transport resume restores event delivery but the relay session
+      // starts with no ambient subscriptions. Reassert actual host-open state;
+      // a fresh identify already receives the client's mutable replay set.
+      for (const channelId of this.openChannels) {
+        void this.client.subscribe(channelId).catch((err) =>
+          console.error(
+            `[portal-mcpl] failed to restore open channel ${channelId}:`,
+            (err as Error).message,
+          ),
+        );
+      }
     });
     this.client.on('message', (e) => {
       if (e.addressedToMe) this.wokenPings.add(e.message.id); // live wake covers it
@@ -210,8 +295,8 @@ export class PortalMcplServer {
     // Live reactions → context, NEVER a wake. Only *native* (human/bot)
     // reactions are surfaced: the relay dispatches a persona's own *pseudo*
     // reaction back only to that persona, so skipping pseudo avoids echoing the
-    // agent's own reactions. Per-channel opt-in (default off) via
-    // set_reaction_visibility. discord-mcpl parity.
+    // agent's own reactions. An open channel receives reaction context; a
+    // closed channel does not. This is the same lifecycle boundary as messages.
     this.client.on('reactionAdd', (e) => {
       if (e.reaction.kind === 'pseudo') return;
       this.pushReaction('add', e.channelId, e.messageId, e.reaction.emoji, e.reaction.by[0]?.name ?? 'someone');
@@ -231,7 +316,11 @@ export class PortalMcplServer {
           featureSet: 'portal.messaging',
           eventId: `portal_del_${e.messageId}`,
           timestamp: new Date().toISOString(),
-          origin: { source: 'portal', channelId: portalChannelId(e.channelId) },
+          origin: {
+            source: 'portal',
+            channelId: portalChannelId(e.channelId),
+            mcplChannelId: portalChannelId(e.channelId),
+          },
           tags: ['chat:deleted'],
           payload: { content: [textContent(`[message deleted] ${e.messageId}`)] },
         } satisfies PushEventParams)
@@ -239,9 +328,9 @@ export class PortalMcplServer {
     });
     this.client.on('channelChange', (channel) => {
       if (!this.conn || !this.mcplEnabled) return;
-      const desc = toDescriptor(channel);
-      this.registered.add(desc.id);
-      this.conn.sendNotification(method.CHANNELS_CHANGED, { added: [desc] });
+      void this.registerChannels().catch((err) =>
+        console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
+      );
     });
   }
 
@@ -288,6 +377,7 @@ export class PortalMcplServer {
               source: 'portal',
               messageId: message.id,
               channelId: channelMcplId,
+              mcplChannelId: channelMcplId,
               channelName: this.channelLabel(message.channelId),
               guildId: message.guildId,
               threadId: message.threadId,
@@ -305,7 +395,7 @@ export class PortalMcplServer {
 
   /**
    * Surface a live reaction into the agent's context WITHOUT waking it. Gated by
-   * the per-channel opt-in (set_reaction_visibility, default off). The push
+   * whether the host has the channel open. The push
    * carries the `chat:reaction` tag and an origin with NO wake flags
    * (isMention/isExplicitMention/addressed absent) — the host's wake gate matches
    * nothing, so the event is addMessage()'d into context but triggers no
@@ -319,7 +409,7 @@ export class PortalMcplServer {
     reactorName: string,
   ): void {
     if (!this.conn || !this.mcplEnabled) return;
-    if (!this.agent.state.isReactionVisible(channelId)) return;
+    if (!this.openChannels.has(channelId)) return;
     const verb = action === 'add' ? 'reacted' : 'removed a reaction';
     const shown = renderReactionEmoji(emoji);
     const line = `[reaction] @${reactorName} ${verb} ${shown} on message ${messageId} in ${this.channelLabel(channelId)}`;
@@ -332,6 +422,7 @@ export class PortalMcplServer {
         origin: {
           source: 'portal',
           channelId: portalChannelId(channelId),
+          mcplChannelId: portalChannelId(channelId),
           messageId,
           reactor: reactorName,
           emoji: shown,
@@ -374,6 +465,7 @@ export class PortalMcplServer {
         origin: {
           source: 'portal',
           channelId: portalChannelId(latest.channelId),
+          mcplChannelId: portalChannelId(latest.channelId),
           messageId: latest.id,
           isMention: true,
           isExplicitMention: true,
@@ -396,15 +488,49 @@ export class PortalMcplServer {
   // ── Channels ──
 
   private allDescriptors(): ChannelDescriptor[] {
-    return this.client.cache.allChannels().map(toDescriptor);
+    return this.client.cache
+      .allChannels()
+      .map((channel) => toDescriptor(channel, this.agent.state.isSubscribed(channel.id)));
   }
 
-  private registerChannels(): void {
-    if (!this.conn) return;
-    const added = this.allDescriptors().filter((d) => !this.registered.has(d.id));
-    if (added.length === 0) return;
-    for (const d of added) this.registered.add(d.id);
-    this.conn.sendNotification(method.CHANNELS_CHANGED, { added });
+  private registerChannels(): Promise<void> {
+    if (this.registrationInFlight) return this.registrationInFlight;
+
+    const run = async (): Promise<void> => {
+      const conn = this.conn;
+      if (!conn || !this.mcplEnabled) return;
+      const descriptors = this.allDescriptors();
+
+      // The first complete enumeration is a request so the host can durably
+      // reconcile it before we retire the legacy file-backed subscriptions.
+      if (!this.initialRegistrationComplete) {
+        if (descriptors.length === 0) return;
+        const params: ChannelsRegisterParams = { channels: descriptors };
+        await conn.sendRequest(method.CHANNELS_REGISTER, params);
+        for (const descriptor of descriptors) this.registered.add(descriptor.id);
+        this.initialRegistrationComplete = true;
+        this.agent.state.clearSubscriptions();
+        return;
+      }
+
+      const added = descriptors.filter((descriptor) => !this.registered.has(descriptor.id));
+      if (added.length === 0) return;
+      for (const descriptor of added) this.registered.add(descriptor.id);
+      conn.sendNotification(method.CHANNELS_CHANGED, { added });
+    };
+
+    this.registrationInFlight = run().finally(() => {
+      this.registrationInFlight = null;
+      if (
+        this.initialRegistrationComplete &&
+        this.allDescriptors().some((descriptor) => !this.registered.has(descriptor.id))
+      ) {
+        void this.registerChannels().catch((err) =>
+          console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
+        );
+      }
+    });
+    return this.registrationInFlight;
   }
 }
 

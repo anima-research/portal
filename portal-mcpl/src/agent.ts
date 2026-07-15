@@ -21,11 +21,16 @@ export interface PortalAgentOptions {
   state?: AgentState;
   /** Called when a new message is addressed to this persona — wire to a push. */
   onPing?: (ping: PendingPing) => void;
+  /** The surrounding MCPL host owns open/close state in Chronicle. This
+   *  disables the legacy subscription tools and mention auto-subscribe while
+   *  leaving the standalone Claude Code channel behavior unchanged. */
+  hostOwnsChannelLifecycle?: boolean;
 }
 
 export class PortalAgent {
   readonly state: AgentState;
   private onPing?: (ping: PendingPing) => void;
+  private hostOwnsChannelLifecycle: boolean;
 
   constructor(
     private client: PortalClient,
@@ -33,6 +38,7 @@ export class PortalAgent {
   ) {
     this.state = opts.state ?? new AgentState();
     this.onPing = opts.onPing;
+    this.hostOwnsChannelLifecycle = opts.hostOwnsChannelLifecycle === true;
     this.client.on('message', (e) => this.ingest(e.message, e.addressedToMe, e.reasons));
     this.client.on('messageUpdate', (e) => {
       // An edit to a message we track refreshes its preview but isn't a new ping.
@@ -41,7 +47,9 @@ export class PortalAgent {
     // A transport `resume` restores the event stream but NOT the relay session's
     // subscriptions (the new session starts empty). Reapply from durable state.
     // The fresh-`identify` path already carries them via the client's replay set.
-    this.client.on('resumed', () => this.reapplySubscriptions());
+    if (!this.hostOwnsChannelLifecycle) {
+      this.client.on('resumed', () => this.reapplySubscriptions());
+    }
   }
 
   /** Re-assert this agent's durable subscriptions on the live session. */
@@ -57,7 +65,7 @@ export class PortalAgent {
     // (non-mention) messages for unsubscribed personas — so without this, the
     // agent never sees the chatter between mentions. Subscribing now means
     // subsequent ambient messages are delivered and accumulate for the next wake.
-    if (addressedToMe && this.state.subscribe(message.channelId)) {
+    if (!this.hostOwnsChannelLifecycle && addressedToMe && this.state.subscribe(message.channelId)) {
       if (process.env.PORTAL_DEBUG) {
         console.error(`[portal-cc] auto-subscribed to ${message.channelId} (addressed here)`);
       }
@@ -70,7 +78,12 @@ export class PortalAgent {
   }
 
   get tools(): typeof toolDefinitions {
-    return toolDefinitions;
+    if (!this.hostOwnsChannelLifecycle) return toolDefinitions;
+    return toolDefinitions.filter((tool) =>
+      tool.name !== 'subscribe_channel' &&
+      tool.name !== 'unsubscribe_channel' &&
+      tool.name !== 'list_subscriptions' &&
+      tool.name !== 'set_reaction_visibility');
   }
 
   /** Server-authoritative pending pings, including any accrued while this
@@ -149,16 +162,25 @@ export class PortalAgent {
           name: str(args.name),
         });
       case 'subscribe_channel': {
+        if (this.hostOwnsChannelLifecycle) {
+          throw new Error('subscribe_channel is retired; use the host channel_open tool');
+        }
         const channelId = str(args.channelId);
         this.state.subscribe(channelId); // durable; persisted via onChange
         return this.client.subscribe(channelId);
       }
       case 'unsubscribe_channel': {
+        if (this.hostOwnsChannelLifecycle) {
+          throw new Error('unsubscribe_channel is retired; use the host channel_close tool');
+        }
         const channelId = str(args.channelId);
         this.state.unsubscribe(channelId);
         return this.client.unsubscribe(channelId);
       }
       case 'list_subscriptions':
+        if (this.hostOwnsChannelLifecycle) {
+          throw new Error('list_subscriptions is retired; use the host channel_list tool');
+        }
         // Durable agent state is the source of truth (survives reconnect/restart).
         return { channelIds: this.state.subscriptionList() };
       case 'list_members':
@@ -177,6 +199,11 @@ export class PortalAgent {
       case 'list_emojis':
         return this.client.call('list_emojis', { guildId: optStr(args.guildId) });
       case 'set_reaction_visibility': {
+        if (this.hostOwnsChannelLifecycle) {
+          throw new Error(
+            'set_reaction_visibility is retired; reactions follow host channel_open/channel_close state',
+          );
+        }
         const channelId = str(args.channelId);
         const visible = Boolean(args.visible);
         // Durable per-channel opt-in; persisted via onChange. Reactions are shown

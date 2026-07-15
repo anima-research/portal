@@ -6,14 +6,12 @@
       "env": {
         "PORTAL_URL": "ws://127.0.0.1:8790",
         "PORTAL_TOKEN": "replace-with-the-persona-token-from-relay-identity",
-        "PORTAL_PERSONA": "mythos",
-        "PORTAL_SUBSCRIPTIONS": ""
+        "PORTAL_PERSONA": "mythos"
       },
       "toolPrefix": "discord",
       "enabledFeatureSets": ["portal.*"],
       "reconnect": true,
-      "reconnectIntervalMs": 5000,
-      "channelSubscription": "auto"
+      "reconnectIntervalMs": 5000
     }
   }
 }
