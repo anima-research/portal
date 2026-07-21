@@ -1,0 +1,75 @@
+name: Build & Publish
+
+# Monorepo variant of the org publish workflow: one file publishes any of the
+# four packages. Trigger with a `<package-dir>-v<version>` tag (e.g.
+# `portal-client-v0.4.0`) or manually via workflow_dispatch.
+#
+# OIDC trusted publishing: GitHub mints a short-lived id-token, npm CLI
+# exchanges it for a publish credential. No long-lived NPM_TOKEN secret.
+# npm-side config (per package): npmjs.com -> package -> Settings ->
+# Trusted Publishers -> GitHub Actions, matching anima-research/portal +
+# this workflow path.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package directory to publish'
+        required: true
+        type: choice
+        options:
+          - portal-protocol
+          - portal-client
+          - portal-relay
+          - portal-mcpl
+  push:
+    tags:
+      - 'portal-protocol-v*'
+      - 'portal-client-v*'
+      - 'portal-relay-v*'
+      - 'portal-mcpl-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build, Test & Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve target package (from tag or dispatch input)
+        id: pkg
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            echo "dir=${tag%-v*}" >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=${{ inputs.package }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # node 24 ships npm >= 11.5.1, required for OIDC publishing.
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Build stack in dependency order (up to the target)
+        run: |
+          target="${{ steps.pkg.outputs.dir }}"
+          for p in portal-protocol portal-client portal-relay portal-mcpl; do
+            (cd "$p" && npm install && npm run build)
+            if [ "$p" = "$target" ]; then break; fi
+          done
+
+      - name: Test
+        run: cd "${{ steps.pkg.outputs.dir }}" && npm test
+
+      - name: Publish
+        run: cd "${{ steps.pkg.outputs.dir }}" && npm publish --access public --provenance
