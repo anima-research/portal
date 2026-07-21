@@ -8,6 +8,11 @@
     "portal-relay": "./dist/src/index.js"
   },
   "description": "One Discord bot fronting many webhook personas: webhook + role pools, permission engine, WS gateway.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anima-research/portal.git",
+    "directory": "portal-relay"
+  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",

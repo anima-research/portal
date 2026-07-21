@@ -16,6 +16,11 @@
     }
   },
   "description": "General-purpose portal client: WS transport, client-side cache, typed RPC, reconnect/resume.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anima-research/portal.git",
+    "directory": "portal-client"
+  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",

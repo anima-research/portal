@@ -5,6 +5,11 @@
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
   "description": "Wire contract (WS events + RPC) shared by the portal relay and portal client. Pure types + lightweight guards; no runtime deps.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anima-research/portal.git",
+    "directory": "portal-protocol"
+  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
