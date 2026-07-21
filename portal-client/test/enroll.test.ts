@@ -4,7 +4,9 @@ import { WebSocketServer } from 'ws';
 import { mkdtempSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { enroll, loadOrEnrollCreds } from '../src/enroll.js';
+// Import via the Node entry: it registers the default `ws` factory that
+// enroll() relies on when no wsFactory is passed.
+import { enroll, loadOrEnrollCreds } from '../src/index.js';
 
 const PORT = 8795;
 

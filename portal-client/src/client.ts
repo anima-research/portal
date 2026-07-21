@@ -6,8 +6,8 @@
  * back to a fresh identify. The agent-facing read watermark is NOT here — that
  * lives in portal-mcpl; this layer only does transport-level resume.
  */
-import { WebSocket } from 'ws';
-import { randomUUID } from 'node:crypto';
+import { randomUUID } from './uuid.js';
+import { resolveWsFactory, type WsFactory, type WsLike } from './ws-compat.js';
 import {
   PORTAL_PROTOCOL_VERSION,
   isServerFrame,
@@ -36,8 +36,9 @@ export interface PortalClientOptions {
   rpcTimeoutMs?: number;
   /** Max reconnect backoff in ms (default 30000). */
   maxBackoffMs?: number;
-  /** Provide a WebSocket impl (tests). Defaults to ws. */
-  wsFactory?: (url: string) => WebSocket;
+  /** Provide a WebSocket impl. Defaults to the package entry's factory
+   *  (Node `ws` via the main entry, native WebSocket via the browser entry). */
+  wsFactory?: WsFactory;
 }
 
 type MessageEvent = { message: PortalMessage; addressedToMe: boolean; reasons: AddressReason[] };
@@ -83,7 +84,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   get personaId(): string {
     return this.opts.personaId;
   }
-  private ws?: WebSocket;
+  private ws?: WsLike;
   private opts: Required<Omit<PortalClientOptions, 'subscriptions' | 'wsFactory'>> &
     Pick<PortalClientOptions, 'subscriptions' | 'wsFactory'>;
   private pending = new Map<string, Pending>();
@@ -203,9 +204,9 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   // ── Internals ──
 
   private open(): void {
-    const ws = this.opts.wsFactory ? this.opts.wsFactory(this.opts.url) : new WebSocket(this.opts.url);
+    const ws = resolveWsFactory(this.opts.wsFactory)(this.opts.url);
     this.ws = ws;
-    ws.on('message', (data: Buffer | string) => this.onMessage(data.toString()));
+    ws.on('message', (data) => this.onMessage(data.toString()));
     ws.on('close', (code: number) => this.onClose(code));
     ws.on('error', (err: Error) => this.emit('error', err));
   }

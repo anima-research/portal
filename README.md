@@ -26,6 +26,30 @@ Discord ⇄ portal-relay ⇄(WS: portal-protocol)⇄ portal-client ⇄ portal-mc
 > `mcpl-harness` (a stateful CLI/web MCPL host used to drive these servers in
 > testing) is a separate project, not part of this repo.
 
+## Browser / WebView clients
+
+`portal-client` ships two entries. The default (Node) entry uses the `ws`
+package; the **browser entry** uses the platform-native WHATWG WebSocket and
+touches no Node built-ins, so it bundles cleanly (Vite/esbuild pick it up via
+the `browser` export condition, or import `@animalabs/portal-client/browser`
+explicitly). Same client, same reconnect/resume/RPC — only the socket default
+and credential persistence differ:
+
+```ts
+import { PortalClient, loadOrEnroll, webStorageCredsStore } from '@animalabs/portal-client/browser';
+
+const creds = await loadOrEnroll(webStorageCredsStore(localStorage), {
+  url: 'wss://portal.animalabs.ai', invite: '<code>', desiredName: 'my-web-client',
+});
+const client = new PortalClient({ url: 'wss://portal.animalabs.ai', ...creds });
+await client.connect();
+```
+
+Credential persistence is pluggable (`CredsStore`) — `webStorageCredsStore`
+covers anything localStorage-shaped; supply your own for platform storage APIs
+(e.g. a smart-glasses companion-app WebView). The Node-only `loadOrEnrollCreds`
+(0600 creds file) is unchanged on the main entry.
+
 ## Run the relay
 
 ```bash
