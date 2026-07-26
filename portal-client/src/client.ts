@@ -201,6 +201,20 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     return this.call('rotate_token', {});
   }
 
+  /**
+   * Swap to freshly-minted credentials (e.g. after the old persona was revoked
+   * server-side and every identify is rejected with close 4001). Resets
+   * transport resume state — the next (re)connect identifies as the new
+   * persona from scratch instead of trying to resume the dead session. The
+   * running reconnect loop picks the new identity up on its next attempt.
+   */
+  updateCredentials(creds: { personaId: string; token: string }): void {
+    this.opts.personaId = creds.personaId;
+    this.opts.token = creds.token;
+    this.sessionId = undefined;
+    this.lastSeq = 0;
+  }
+
   // ── Internals ──
 
   private open(): void {
@@ -335,7 +349,18 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       // lockstep — avoids a thundering-herd reconnect + role-rebind burst.
       const delay = capped / 2 + Math.random() * (capped / 2);
       this.backoff = Math.min(this.backoff * 2, this.opts.maxBackoffMs);
-      setTimeout(() => this.open(), delay);
+      setTimeout(() => {
+        try {
+          this.open();
+        } catch (err) {
+          // A synchronous open() failure must not end the reconnect loop:
+          // before this guard, one throw inside the timer left the client
+          // wedged forever — no socket, no retries, every RPC timing out
+          // (field-observed as the "wedged portal MCP client" gotcha).
+          this.emit('error', err instanceof Error ? err : new Error(String(err)));
+          this.onClose(0);
+        }
+      }, delay);
     }
 
     this.emit('close', { code, willReconnect });
