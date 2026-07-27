@@ -215,6 +215,21 @@ export interface RotateTokenResult {
   token: string;
 }
 
+/** Ask the relay to join a voice channel and start transcribing. Requires
+ *  VOICE_LISTEN. Transcripts flow to sessions subscribed to the channel
+ *  (subscribe_channel). Idempotent: joining an already-joined channel is ok. */
+export interface VoiceJoinParams {
+  channelId: ChannelId;
+}
+export interface VoiceJoinResult {
+  /** Whether the relay is now (or already was) listening in the channel. */
+  listening: boolean;
+}
+
+export interface VoiceLeaveParams {
+  channelId: ChannelId;
+}
+
 type Empty = Record<string, never>;
 
 /**
@@ -245,6 +260,9 @@ export interface RpcMethods {
   list_pins: { params: ListPinsParams; result: ListPinsResult };
   claim_invite: { params: ClaimInviteParams; result: ClaimInviteResult };
   rotate_token: { params: RotateTokenParams; result: RotateTokenResult };
+  // ── Voice (relay joins, transcribes, fans out) ──
+  voice_join: { params: VoiceJoinParams; result: VoiceJoinResult };
+  voice_leave: { params: VoiceLeaveParams; result: Empty };
   // ── Server-authoritative read-state (catch-up / unread) ──
   get_pending_pings: { params: Empty; result: GetPendingPingsResult };
   list_unread: { params: Empty; result: ListUnreadResult };
