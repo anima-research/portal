@@ -23,6 +23,7 @@ const SERVER_OPS = new Set([
   'heartbeat_ack',
   'invalid_session',
   'dispatch',
+  'dispatch_ephemeral',
   'rpc_result',
 ]);
 
@@ -37,6 +38,7 @@ export function isServerFrame(x: unknown): x is ServerFrame {
   if (!isObj(x) || typeof x.op !== 'string' || !SERVER_OPS.has(x.op)) return false;
   if (x.op === 'heartbeat_ack') return true;
   if (x.op === 'dispatch') return typeof x.seq === 'number' && isObj(x.d) && typeof x.d.type === 'string';
+  if (x.op === 'dispatch_ephemeral') return isObj(x.d) && typeof x.d.type === 'string';
   return 'd' in x && isObj(x.d);
 }
 
@@ -67,6 +69,10 @@ export function parseServerFrame(raw: string): ServerFrame | null {
 
 export function dispatch(seq: number, event: PortalEvent): ServerFrame {
   return { op: 'dispatch', seq, d: event };
+}
+
+export function dispatchEphemeral(event: PortalEvent): ServerFrame {
+  return { op: 'dispatch_ephemeral', d: event };
 }
 
 export function rpcOk(id: RpcId, result: unknown): ServerFrame {

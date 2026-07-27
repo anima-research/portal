@@ -281,6 +281,18 @@ export class Gateway {
     for (const s of this.byPersona.get(personaId) ?? []) s.send(frame);
   }
 
+  /**
+   * Fan out an event to a persona's live sessions WITHOUT sequencing it —
+   * no stream append, no replay on resume. For high-frequency display-only
+   * events (voice transcript partials) that would churn the replay buffer:
+   * a resumed session has no use for stale interim captions, and BUFFER_CAP
+   * worth of partials would evict the durable events resume actually needs.
+   */
+  dispatchEphemeral(personaId: string, event: PortalEvent): void {
+    const frame: ServerFrame = { op: 'dispatch_ephemeral', d: event };
+    for (const s of this.byPersona.get(personaId) ?? []) s.send(frame);
+  }
+
   /** Personas with at least one live session. */
   activePersonas(): string[] {
     return [...this.byPersona.entries()].filter(([, set]) => set.size > 0).map(([id]) => id);

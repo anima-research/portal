@@ -487,12 +487,13 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
   MENTION_EVERYONE: F.MentionEveryone,
   MANAGE_MESSAGES: F.ManageMessages,
   MANAGE_CHANNELS: F.ManageChannels,
+  VOICE_LISTEN: F.Connect,
 };
 
 export const ALL_CAPS: Capability[] = [
   'VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES', 'SEND_IN_THREADS', 'CREATE_THREADS',
   'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'EDIT_OWN', 'DELETE_OWN',
-  'MANAGE_MESSAGES', 'MANAGE_CHANNELS',
+  'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'VOICE_LISTEN',
 ];
 
 /** The portal caps a permission bitfield supports (per-channel, post-overwrite).

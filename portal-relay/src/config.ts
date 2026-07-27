@@ -257,6 +257,9 @@ export interface RelayConfig {
   /** Prepend a quoted jump-link when a persona replies (webhooks can't carry a
    *  native Discord reply). Default true; set false to suppress the header. */
   replyLink: boolean;
+  /** ElevenLabs API key for voice transcription (Scribe v2 realtime).
+   *  Undefined ⇒ voice_join RPC returns UNAVAILABLE; no other effect. */
+  elevenLabsKey?: string;
   /** Admin panel / HTTP API (RFC-005). Undefined ⇒ disabled. */
   admin?: AdminConfig;
 }
@@ -264,6 +267,7 @@ export interface RelayConfig {
 export function loadConfig(): RelayConfig {
   return {
     discordToken: requireEnv('DISCORD_TOKEN'),
+    elevenLabsKey: process.env.ELEVENLABS_KEY || undefined,
     wsPort: parseInt(process.env.PORTAL_WS_PORT ?? '8790', 10),
     avatarBaseUrl: (process.env.PORTAL_AVATAR_BASE_URL ?? '').replace(/\/$/, ''),
     guildIds: splitCsv(process.env.DISCORD_GUILD_ID),
