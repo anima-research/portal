@@ -172,6 +172,9 @@ export class DiscordBot implements WebhookOps, RoleOps {
       // Non-privileged. Populates guild.emojis for list_emojis and keeps the
       // custom-emoji cache fresh (emojiCreate/Update/Delete).
       GatewayIntentBits.GuildEmojisAndStickers,
+      // Non-privileged. Required for voice: joinVoiceChannel needs the voice
+      // state cache to complete its handshake. Harmless when voice is unused.
+      GatewayIntentBits.GuildVoiceStates,
     ];
     if (this.guildMembersIntent) intents.push(GatewayIntentBits.GuildMembers);
     this.client = new Client({
@@ -199,6 +202,12 @@ export class DiscordBot implements WebhookOps, RoleOps {
 
   get botUserId(): string | null {
     return this.client.user?.id ?? null;
+  }
+
+  /** The underlying discord.js client, for subsystems that need gateway-adjacent
+   *  state discord.js doesn't expose through this facade (voice adapters). */
+  get rawClient(): Client {
+    return this.client;
   }
 
   private guildAllowed(guildId: string | null | undefined): boolean {

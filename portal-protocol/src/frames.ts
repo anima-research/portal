@@ -91,6 +91,13 @@ export type ServerFrame =
   | { op: 'heartbeat_ack' }
   | { op: 'invalid_session'; d: InvalidSessionData }
   | { op: 'dispatch'; seq: number; d: PortalEvent }
+  /**
+   * Fire-and-forget dispatch: no seq, excluded from the replay stream by
+   * construction. Carries high-frequency display-only events (voice transcript
+   * partials) that would otherwise churn the resume buffer. Pre-v4 clients
+   * fail `isServerFrame` on the unknown op and drop it — safe by design.
+   */
+  | { op: 'dispatch_ephemeral'; d: PortalEvent }
   | { op: 'rpc_result'; d: RpcResponse };
 
 export type ClientOp = ClientFrame['op'];

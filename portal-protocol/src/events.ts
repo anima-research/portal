@@ -54,6 +54,30 @@ export type PortalEvent =
   /** A persona's identity changed (e.g. role rebinding after rotation). */
   | { type: 'persona_update'; persona: Persona }
   /** Effective capabilities in a channel changed for the receiving persona. */
-  | { type: 'capabilities_update'; channelId: ChannelId; capabilities: Capability[] };
+  | { type: 'capabilities_update'; channelId: ChannelId; capabilities: Capability[] }
+  /**
+   * Live speech transcribed from a voice channel the relay has joined,
+   * delivered to sessions subscribed to that channel (subscribe_channel works
+   * on voice channels). Partials are display-only interim text and ride the
+   * ephemeral dispatch path — they are never sequenced and never replayed on
+   * resume; a partial with the same utteranceId replaces its predecessor.
+   * The final (`partial: false`) is sequenced like any other event.
+   */
+  | {
+      type: 'voice_transcript';
+      channelId: ChannelId;
+      guildId: GuildId | null;
+      /** Relay-assigned utterance identity; partials replace-in-place by this key. */
+      utteranceId: string;
+      speaker: MessageAuthor;
+      text: string;
+      partial: boolean;
+      /** ms epoch: when the utterance's audio began. */
+      startedAt: number;
+      /** ms epoch: when this transcript text was produced. */
+      at: number;
+    }
+  /** The relay joined or left a voice channel (voice_join/voice_leave RPC). */
+  | { type: 'voice_status'; channelId: ChannelId; guildId: GuildId | null; joined: boolean };
 
 export type PortalEventType = PortalEvent['type'];

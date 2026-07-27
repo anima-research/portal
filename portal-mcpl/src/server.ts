@@ -346,6 +346,46 @@ export class PortalMcplServer {
         console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
       );
     });
+    // Voice transcripts → context, NEVER a wake (same policy boundary as
+    // reactions). Finals only: partials are a display-plane stream for caption
+    // clients; at conversational cadence an agent wants the settled utterance,
+    // not 5 Hz interim churn. Wake-on-name-in-speech is a deliberate follow-up,
+    // not a v1 behavior — speech has no structural addressing to gate on.
+    this.client.on('voiceTranscript', (e) => {
+      if (e.partial || !this.conn || !this.mcplEnabled) return;
+      if (!this.openChannels.has(e.channelId)) return;
+      this.conn
+        .sendRequest(method.PUSH_EVENT, {
+          featureSet: 'portal.voice',
+          eventId: `portal_voice_${e.utteranceId}`,
+          timestamp: new Date(e.at).toISOString(),
+          origin: {
+            source: 'portal',
+            channelId: portalChannelId(e.channelId),
+            mcplChannelId: portalChannelId(e.channelId),
+          },
+          tags: ['voice:transcript'],
+          payload: { content: [textContent(`[voice] ${e.speaker.kind === 'user' ? e.speaker.displayName : 'someone'}: ${e.text}`)] },
+        } satisfies PushEventParams)
+        .catch(() => {});
+    });
+    this.client.on('voiceStatus', (e) => {
+      if (!this.conn || !this.mcplEnabled || !this.openChannels.has(e.channelId)) return;
+      this.conn
+        .sendRequest(method.PUSH_EVENT, {
+          featureSet: 'portal.voice',
+          eventId: `portal_voice_status_${e.channelId}_${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          origin: {
+            source: 'portal',
+            channelId: portalChannelId(e.channelId),
+            mcplChannelId: portalChannelId(e.channelId),
+          },
+          tags: ['voice:status'],
+          payload: { content: [textContent(e.joined ? '[voice] transcription started in this channel' : '[voice] transcription stopped')] },
+        } satisfies PushEventParams)
+        .catch(() => {});
+    });
   }
 
   /**
