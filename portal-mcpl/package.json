@@ -23,7 +23,7 @@
   "dependencies": {
     "@animalabs/portal-protocol": "file:../portal-protocol",
     "@animalabs/portal-client": "file:../portal-client",
-    "@animalabs/mcpl-core": "^0.2.0"
+    "@animalabs/mcpl-core": "^0.2.2"
   },
   "devDependencies": {
     "tsx": "^4.7.0",
