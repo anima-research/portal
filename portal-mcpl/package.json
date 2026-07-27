@@ -21,8 +21,8 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@animalabs/portal-protocol": "file:../portal-protocol",
-    "@animalabs/portal-client": "file:../portal-client",
+    "@animalabs/portal-protocol": "^0.3.0",
+    "@animalabs/portal-client": "^0.4.1",
     "@animalabs/mcpl-core": "^0.2.2"
   },
   "devDependencies": {
