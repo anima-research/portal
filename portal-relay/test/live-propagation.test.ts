@@ -87,9 +87,14 @@ function makeRelay() {
   };
 
   const dispatched: Array<{ personaId: string; event: any }> = [];
+  // Streams outlive live sessions: structural events go to stream-retained
+  // personas (buffered for resume), so the fakes model both sets.
   const active = new Set<string>([ALICE, BOB]);
+  const streams = new Set<string>([ALICE, BOB]);
   relay.gateway = {
     activePersonas: () => [...active],
+    streamPersonas: () => [...streams],
+    hasStream: (pid: string) => streams.has(pid),
     sessionsOf: (pid: string) => (active.has(pid) ? [{}] : []),
     personaSubscribed: () => false,
     dispatch: (personaId: string, event: any) => dispatched.push({ personaId, event }),
@@ -106,6 +111,7 @@ function makeRelay() {
     dispatched,
     metas,
     active,
+    streams,
     ofType: (type: string) => dispatched.filter((d) => d.event.type === type),
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
@@ -168,12 +174,29 @@ test('permission change → capabilities_update once; identical repush is dedupe
   }
 });
 
-test('permission change for a persona without live sessions dispatches nothing', () => {
+test('permission change for a persona with NO retained stream dispatches nothing', () => {
   const t = makeRelay();
   try {
     t.active.delete(ALICE);
+    t.streams.delete(ALICE);
+    t.relay.permissions.setChannel(ALICE, GUILD, CHAN_A, ['VIEW_CHANNEL']);
     t.relay.onPermissionChange({ personaId: ALICE, scope: 'channel', guildId: GUILD, channelId: CHAN_A });
     assert.equal(t.dispatched.length, 0);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('a briefly-dropped persona (stream retained, no live session) still gets structural events buffered', () => {
+  const t = makeRelay();
+  try {
+    t.active.delete(ALICE); // dropped, will resume
+    t.metas.push(meta(CHAN_B));
+    t.relay.onBotChannelChange(meta(CHAN_B), 'create');
+
+    const creates = t.ofType('channel_create');
+    assert.deepEqual(new Set(creates.map((d) => d.personaId)), new Set([ALICE, BOB]),
+      'dispatch targets stream-retained personas, not just live ones');
   } finally {
     t.cleanup();
   }

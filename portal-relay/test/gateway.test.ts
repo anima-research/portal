@@ -156,3 +156,47 @@ test('register: enroll mints creds, then ready; disabled when no enroll hook', a
     await gw2.close();
   }
 });
+
+test('resume past the buffer window is rejected → client falls back to fresh identify', async () => {
+  const gw = new Gateway(hooks(), 30_000);
+  const port = PORT + 1;
+  gw.listen(port);
+  try {
+    const wsA = new WebSocket(`ws://127.0.0.1:${port}`);
+    const fA = new Frames(wsA);
+    await new Promise<void>((resolve) => wsA.on('open', () => resolve()));
+    await fA.next((f) => f.op === 'hello');
+    wsA.send(JSON.stringify({ op: 'identify', d: { protocolVersion: 1, token: 'secret', personaId: 'pg' } }));
+    const ready = (await fA.next((f) => f.op === 'ready')) as Extract<ServerFrame, { op: 'ready' }>;
+    const sessionId = ready.d.sessionId;
+    wsA.close();
+    await new Promise<void>((resolve) => wsA.on('close', () => resolve()));
+
+    // Overflow the bounded buffer while the session is away: events 1..1005,
+    // of which only 6..1005 remain buffered.
+    for (let i = 0; i < 1005; i++) {
+      gw.dispatch('pg', { type: 'pins_update', channelId: `c${i}` } as never);
+    }
+
+    // Resume from seq 0 — events 1..5 are unrecoverable; a silent partial
+    // replay would leave the client convinced it is current. Must reject.
+    const wsB = new WebSocket(`ws://127.0.0.1:${port}`);
+    const fB = new Frames(wsB);
+    await new Promise<void>((resolve) => wsB.on('open', () => resolve()));
+    await fB.next((f) => f.op === 'hello');
+    wsB.send(JSON.stringify({ op: 'resume', d: { sessionId, seq: 0 } }));
+    const rejected = (await fB.next((f) => f.op === 'invalid_session')) as Extract<
+      ServerFrame,
+      { op: 'invalid_session' }
+    >;
+    assert.equal(rejected.d.resumable, false);
+
+    // From inside the window the same session resumes fine (seq 1000 → 5 replays).
+    wsB.send(JSON.stringify({ op: 'resume', d: { sessionId, seq: 1000 } }));
+    const resumed = (await fB.next((f) => f.op === 'resumed')) as Extract<ServerFrame, { op: 'resumed' }>;
+    assert.equal(resumed.d.replayedEvents, 5);
+    wsB.close();
+  } finally {
+    await gw.close();
+  }
+});

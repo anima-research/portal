@@ -737,7 +737,12 @@ export class DiscordBot implements WebhookOps, RoleOps {
       }
     });
     this.client.on('channelDelete', (c) => {
-      if ('guildId' in c) this.handlers.channelDelete?.(c.id, (c as GuildBasedChannel).guildId ?? null);
+      // Allow-list gate matches create/update above — without it every delete
+      // in a bot-joined-but-non-allowed guild would burn a slot in every
+      // persona's bounded resume buffer.
+      if ('guildId' in c && this.guildAllowed(c.guildId)) {
+        this.handlers.channelDelete?.(c.id, (c as GuildBasedChannel).guildId ?? null);
+      }
     });
 
     this.client.on('threadCreate', (t) => {
@@ -747,7 +752,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       if (this.guildAllowed(t.guildId)) this.handlers.channelChange?.(this.metaOf(t as unknown as GuildBasedChannel), 'update');
     });
     this.client.on('threadDelete', (t) => {
-      this.handlers.channelDelete?.(t.id, t.guildId ?? null);
+      if (this.guildAllowed(t.guildId)) this.handlers.channelDelete?.(t.id, t.guildId ?? null);
     });
 
     // Role events ride the base Guilds intent (already requested) — no new intent.

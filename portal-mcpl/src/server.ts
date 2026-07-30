@@ -51,6 +51,10 @@ export class PortalMcplServer {
    * and the host needs a channels/changed `updated` entry (issue #5).
    */
   private advertised = new Map<string, string>();
+  /** Raw relay channel ids whose removal was observed but not yet retracted
+   *  (a removal can land while channels/register is in flight, before
+   *  `advertised` is stamped — retracting inline would silently miss it). */
+  private pendingRemovals = new Set<string>();
   private initialRegistrationComplete = false;
   private registrationInFlight: Promise<void> | null = null;
   /** Portal channel ids the host has opened — routed via channels/incoming so
@@ -70,6 +74,7 @@ export class PortalMcplServer {
   async serve(conn: McplConnection): Promise<void> {
     this.conn = conn;
     this.advertised.clear();
+    this.pendingRemovals.clear();
     this.openChannels.clear();
     this.initialRegistrationComplete = false;
     this.registrationInFlight = null;
@@ -355,17 +360,14 @@ export class PortalMcplServer {
     });
     this.client.on('channelRemove', ({ channelId }) => {
       if (!this.conn || !this.mcplEnabled) return;
-      const id = portalChannelId(channelId);
-      // Only retract what was actually advertised. Deliberately event-driven,
-      // never derived by diffing an enumeration against `advertised` — a
-      // partial enumeration must not be able to mass-retract channels (the
-      // "every bot loses its subscriptions on migration" failure mode).
-      if (!this.advertised.delete(id)) return;
-      this.openChannels.delete(channelId); // openChannels holds RAW relay ids
-      this.agent.state.unsubscribe(channelId);
-      this.conn.sendNotification(method.CHANNELS_CHANGED, {
-        removed: [id],
-      } satisfies ChannelsChangedParams);
+      // Queue rather than retract inline: a removal landing while
+      // channels/register is in flight finds `advertised` still unstamped, and
+      // the ack would then stamp the dead channel in from its stale descriptor
+      // snapshot — durably registering a channel that no longer exists.
+      this.pendingRemovals.add(channelId);
+      void this.flushRemovals().catch((err) =>
+        console.error('[portal-mcpl] channel retraction failed:', (err as Error).message),
+      );
     });
   }
 
@@ -606,6 +608,33 @@ export class PortalMcplServer {
     return this.allDescriptors().some(
       (descriptor) => this.advertised.get(descriptor.id) !== descriptorKey(descriptor),
     );
+  }
+
+  /**
+   * Retract queued removals once no registration is in flight. Only ids that
+   * were BOTH observed via a channelRemove event AND actually advertised are
+   * retracted — never anything derived by diffing an enumeration against
+   * `advertised` (a partial enumeration must not be able to mass-retract
+   * channels: the "every bot loses its subscriptions on migration" failure
+   * mode). A queued id that was never advertised (created and deleted within
+   * one registration window) drops silently — correct, the host never saw it.
+   */
+  private async flushRemovals(): Promise<void> {
+    while (this.registrationInFlight) await this.registrationInFlight;
+    const conn = this.conn;
+    if (!conn || !this.mcplEnabled || this.pendingRemovals.size === 0) return;
+    const removed: string[] = [];
+    for (const channelId of this.pendingRemovals) {
+      const id = portalChannelId(channelId);
+      if (!this.advertised.delete(id)) continue;
+      removed.push(id);
+      this.openChannels.delete(channelId); // openChannels holds RAW relay ids
+      this.agent.state.unsubscribe(channelId);
+    }
+    this.pendingRemovals.clear();
+    if (removed.length) {
+      conn.sendNotification(method.CHANNELS_CHANGED, { removed } satisfies ChannelsChangedParams);
+    }
   }
 }
 

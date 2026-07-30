@@ -190,6 +190,7 @@ export class Relay implements GatewayHooks {
   private async onIdentityChange(c: IdentityChange): Promise<void> {
     if (c.kind === 'remove') {
       this.gateway.closePersona(c.id);
+      this.gateway.dropStream(c.id);
       this.readState.forget(c.id);
       this.deliveredCaps.delete(c.id);
       void this.roles.unbindAll(c.id).catch((e) => console.error('[portal-relay] unbind on remove:', (e as Error).message));
@@ -203,7 +204,10 @@ export class Relay implements GatewayHooks {
   }
 
   private onPermissionChange(c: PermissionChange): void {
-    if (this.gateway.sessionsOf(c.personaId).length === 0) return;
+    // Stream-retained, not live-session — a change during a brief drop must
+    // land in the resume buffer (see streamPersonas). No stream ⇒ the persona
+    // never identified since boot; its next identify rehydrates everything.
+    if (!this.gateway.hasStream(c.personaId)) return;
     let channels: ChannelMeta[];
     if (c.scope === 'channel' && c.channelId) {
       const meta = this.bot.channelMetaFromCache(c.channelId);
@@ -231,7 +235,7 @@ export class Relay implements GatewayHooks {
       if (!g) continue;
       void this.reconcileGuild(gid).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
       const metas = this.bot.listChannelMetas(gid);
-      for (const personaId of this.gateway.activePersonas()) {
+      for (const personaId of this.gateway.streamPersonas()) {
         const channels = metas.map((m) => this.toPortalChannel(m, personaId));
         for (const c of channels) this.rememberCaps(personaId, c.id, c.capabilities);
         this.gateway.dispatch(personaId, {
@@ -247,7 +251,7 @@ export class Relay implements GatewayHooks {
       // Explicit (not only via repushGuildCaps): still runs when the bot was
       // kicked and the channel cache is empty, so bindings/persisted state die.
       void this.reconcileGuild(gid).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
-      for (const personaId of this.gateway.activePersonas()) {
+      for (const personaId of this.gateway.streamPersonas()) {
         this.gateway.dispatch(personaId, { type: 'guild_delete', guildId: gid });
       }
       // Hygiene: drop the guild's channels from the dedup baseline so a future
@@ -266,8 +270,12 @@ export class Relay implements GatewayHooks {
     // A bare capabilities_update can't do this — clients can't invent a
     // channel from a caps array — so new channels were invisible until the
     // next full identify (i.e. an agent restart).
+    // Stream-retained personas, not just live ones: a briefly-dropped agent
+    // must find this event in its resume replay, or the channel stays
+    // invisible until a full re-identify (and the dedup baseline would
+    // suppress the correcting caps push forever).
     const create = kind === 'create';
-    for (const personaId of this.gateway.activePersonas()) {
+    for (const personaId of this.gateway.streamPersonas()) {
       const channel = this.toPortalChannel(meta, personaId);
       this.rememberCaps(personaId, meta.id, channel.capabilities);
       this.gateway.dispatch(personaId, meta.isThread
@@ -285,7 +293,7 @@ export class Relay implements GatewayHooks {
     if (!guildId) return;
     this.mirror.invalidateGuild(guildId);
     this.forgetChannelCaps(channelId);
-    for (const personaId of this.gateway.activePersonas()) {
+    for (const personaId of this.gateway.streamPersonas()) {
       this.gateway.dispatch(personaId, { type: 'channel_delete', channelId, guildId });
     }
     this.repushGuildCaps(guildId);
@@ -297,7 +305,7 @@ export class Relay implements GatewayHooks {
   private repushGuildCaps(guildId: string): void {
     const metas = this.bot.listChannelMetas(guildId);
     if (!metas.length) return;
-    for (const personaId of this.gateway.activePersonas()) {
+    for (const personaId of this.gateway.streamPersonas()) {
       for (const meta of metas) this.pushCaps(personaId, meta.id, guildId);
     }
 
@@ -526,6 +534,28 @@ export class Relay implements GatewayHooks {
 
   async buildReady(session: Session): Promise<ReadyData> {
     const cfg = this.identity.get(session.personaId)!;
+    // Pre-bind a role in each guild the persona can actually act in, so it's
+    // addressable immediately. Skip guilds where it has no rights — no point
+    // minting (and leaking) a Discord addressing role there.
+    //
+    // ORDER MATTERS: these binds await real Discord calls, and the session is
+    // already registered — a rights change landing mid-await dispatches into
+    // this session/stream AND updates the deliveredCaps baseline. The
+    // channel/caps snapshot below is therefore taken AFTER all awaits, in one
+    // synchronous block with seqOf, so ready can never carry state older than
+    // an already-dispatched event (which hydrate would clobber back in while
+    // the baseline suppresses every future repush of the true value).
+    const roleByGuild: Record<string, string> = {};
+    for (const g of this.bot.listGuilds()) {
+      if (!this.personaCanAccessGuild(cfg.id, g.id)) continue;
+      try {
+        roleByGuild[g.id] = await this.roles.bind(g.id, cfg.id, cfg.displayName);
+      } catch (err) {
+        console.error(`[portal-relay] role bind failed (${g.id}/${cfg.id}):`, (err as Error).message);
+      }
+    }
+    // ── Synchronous from here to return: snapshot, baseline, seq. ──
+    const current = this.identity.get(session.personaId) ?? cfg; // may have changed mid-await
     const guilds = this.bot.listGuilds();
     const channels: PortalChannel[] = [];
     for (const g of guilds) {
@@ -536,21 +566,9 @@ export class Relay implements GatewayHooks {
         channels.push(channel);
       }
     }
-    // Pre-bind a role in each guild the persona can actually act in, so it's
-    // addressable immediately. Skip guilds where it has no rights — no point
-    // minting (and leaking) a Discord addressing role there.
-    const roleByGuild: Record<string, string> = {};
-    for (const g of guilds) {
-      if (!this.personaCanAccessGuild(cfg.id, g.id)) continue;
-      try {
-        roleByGuild[g.id] = await this.roles.bind(g.id, cfg.id, cfg.displayName);
-      } catch (err) {
-        console.error(`[portal-relay] role bind failed (${g.id}/${cfg.id}):`, (err as Error).message);
-      }
-    }
     return {
       sessionId: session.id,
-      persona: this.identity.toPersona(cfg, roleByGuild),
+      persona: this.identity.toPersona(current, roleByGuild),
       guilds: guilds.map((g) => ({ id: g.id, native: g.id, name: g.name, memberCount: g.memberCount })),
       channels,
       seq: this.gateway.seqOf(session.personaId),

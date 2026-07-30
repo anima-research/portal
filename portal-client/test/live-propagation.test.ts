@@ -92,3 +92,10 @@ test('guild_create emits channelChange for every carried channel', () => {
   assert.equal(t.changes[0].id, 'c-n');
   assert.equal(t.client.cache.getChannel('c-n')?.id, 'c-n');
 });
+
+test('channel_delete for an unknown channel emits nothing (no phantom removals)', () => {
+  const t = makeClient();
+  t.dispatch({ type: 'channel_delete', channelId: 'never-known', guildId: 'g1' });
+  assert.equal(t.removes.length, 0);
+  assert.equal(t.changes.length, 0);
+});

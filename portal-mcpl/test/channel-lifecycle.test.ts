@@ -376,3 +376,50 @@ test('a channel arriving via live channel_create is announced as added', async (
   assert.equal(params.added?.[0].id, `portal:${fresh.id}`);
   assert.equal(params.updated, undefined);
 });
+
+test('a removal landing during the in-flight initial register is retracted after the ack', async () => {
+  const client = clientWithChannel();
+  const state = new AgentState();
+  const agent = new PortalAgent(client, { state, hostOwnsChannelLifecycle: true });
+  const server = new PortalMcplServer(client, agent);
+  const notifications: Array<{ method: string; params: unknown }> = [];
+  let releaseRegister!: () => void;
+  const registerGate = new Promise<void>((resolve) => (releaseRegister = resolve));
+  const internal = server as unknown as {
+    conn: {
+      sendRequest(method: string, params: unknown): Promise<unknown>;
+      sendNotification(method: string, params: unknown): void;
+    };
+    mcplEnabled: boolean;
+    registerChannels(): Promise<void>;
+    wireClient(): void;
+  };
+  internal.conn = {
+    async sendRequest() {
+      await registerGate; // hold channels/register in flight
+      return { registered: [`portal:${channel.id}`] };
+    },
+    sendNotification(method, params) {
+      notifications.push({ method, params });
+    },
+  };
+  internal.mcplEnabled = true;
+  internal.wireClient();
+
+  const registration = internal.registerChannels();
+  // The channel dies while the register request is still awaiting the host.
+  (client as unknown as { onEvent(e: unknown): void }).onEvent({
+    type: 'channel_delete',
+    channelId: channel.id,
+    guildId: channel.guildId,
+  });
+  assert.equal(notifications.length, 0, 'retraction must wait for the ack');
+
+  releaseRegister();
+  await registration;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].method, 'channels/changed');
+  assert.deepEqual(notifications[0].params, { removed: [`portal:${channel.id}`] });
+});

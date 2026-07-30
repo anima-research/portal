@@ -127,6 +127,8 @@ function makeRelay() {
   const dispatched: Array<{ personaId: string; event: any }> = [];
   relay.gateway = {
     activePersonas: () => [PERSONA],
+    streamPersonas: () => [PERSONA],
+    hasStream: (pid: string) => pid === PERSONA,
     dispatch: (personaId: string, event: any) => dispatched.push({ personaId, event }),
   };
   return { relay, store, dispatched, cleanup: () => rmSync(dir, { recursive: true, force: true }) };

@@ -275,7 +275,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       event.type === 'guild_delete'
         ? this.cache.allChannels().filter((c) => c.guildId === event.guildId)
         : [];
-    this.cache.apply(event);
+    const applied = this.cache.apply(event);
     this.emit('event', event);
     switch (event.type) {
       case 'message_create':
@@ -321,7 +321,11 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       }
       case 'channel_delete':
       case 'thread_delete':
-        this.emit('channelRemove', { channelId: event.channelId, guildId: event.guildId });
+        // Only when the cache actually dropped something — a delete for a
+        // channel we never knew must not fan a phantom removal downstream.
+        if (applied) {
+          this.emit('channelRemove', { channelId: event.channelId, guildId: event.guildId });
+        }
         break;
       case 'guild_create':
         for (const channel of event.channels) this.emit('channelChange', channel);
