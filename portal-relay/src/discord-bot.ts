@@ -129,7 +129,10 @@ type Handlers = {
   reactionRemove?: (r: IncomingReaction) => void;
   pinsUpdate?: (channelId: string, guildId: string | null) => void;
   guildCreate?: (guildId: string, name: string, channels: ChannelMeta[]) => void;
-  channelChange?: (channel: ChannelMeta) => void;
+  /** A channel or thread appeared or changed. `kind` preserves Discord's
+   *  create/update distinction so the relay can dispatch the matching wire
+   *  event (clients upsert either way; the semantics are for the protocol). */
+  channelChange?: (channel: ChannelMeta, kind: 'create' | 'update') => void;
   channelDelete?: (channelId: string, guildId: string | null) => void;
   /** A role's guild-level perms changed, or a role was created/deleted (RFC-004
    *  mirror invalidation). `roleId === @everyone` ⇒ guild-wide baseline shift. */
@@ -725,12 +728,12 @@ export class DiscordBot implements WebhookOps, RoleOps {
 
     this.client.on('channelCreate', (c) => {
       if ('guildId' in c && this.guildAllowed(c.guildId)) {
-        this.handlers.channelChange?.(this.metaOf(c as GuildBasedChannel));
+        this.handlers.channelChange?.(this.metaOf(c as GuildBasedChannel), 'create');
       }
     });
     this.client.on('channelUpdate', (_o, c) => {
       if ('guildId' in c && this.guildAllowed((c as GuildBasedChannel).guildId)) {
-        this.handlers.channelChange?.(this.metaOf(c as GuildBasedChannel));
+        this.handlers.channelChange?.(this.metaOf(c as GuildBasedChannel), 'update');
       }
     });
     this.client.on('channelDelete', (c) => {
@@ -738,10 +741,10 @@ export class DiscordBot implements WebhookOps, RoleOps {
     });
 
     this.client.on('threadCreate', (t) => {
-      if (this.guildAllowed(t.guildId)) this.handlers.channelChange?.(this.metaOf(t as unknown as GuildBasedChannel));
+      if (this.guildAllowed(t.guildId)) this.handlers.channelChange?.(this.metaOf(t as unknown as GuildBasedChannel), 'create');
     });
     this.client.on('threadUpdate', (_o, t) => {
-      if (this.guildAllowed(t.guildId)) this.handlers.channelChange?.(this.metaOf(t as unknown as GuildBasedChannel));
+      if (this.guildAllowed(t.guildId)) this.handlers.channelChange?.(this.metaOf(t as unknown as GuildBasedChannel), 'update');
     });
     this.client.on('threadDelete', (t) => {
       this.handlers.channelDelete?.(t.id, t.guildId ?? null);

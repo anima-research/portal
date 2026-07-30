@@ -48,6 +48,15 @@ export class Relay implements GatewayHooks {
   private history: HistoryCache;
   private gateway: Gateway;
   private mirror: MirrorCache;
+  /**
+   * Last capabilities delivered to each persona, keyed persona → channel →
+   * caps-key (issue #5). Pure dedup for live rights propagation: rights-change
+   * repushes walk whole guilds, and without this every walk would spam
+   * no-op `capabilities_update` events into persona streams (churning the
+   * bounded resume buffer). Seeded at ready; updated by every channel-bearing
+   * dispatch. Not authoritative — capsFor() remains the source of truth.
+   */
+  private deliveredCaps = new Map<string, Map<string, string>>();
   private admin?: AdminServer;
   /** Shared audit log (RFC-005). Present only when the admin panel is enabled;
    *  self-service ops (claim_invite / rotate_token) audit here too. */
@@ -130,18 +139,8 @@ export class Relay implements GatewayHooks {
       this.mirror.invalidateRole(guildId, roleId);
       this.repushGuildCaps(guildId);
     });
-    this.bot.on('channelChange', (meta) => {
-      if (meta.guildId) {
-        this.mirror.invalidateGuild(meta.guildId);
-        this.repushGuildCaps(meta.guildId);
-      }
-    });
-    this.bot.on('channelDelete', (_channelId, guildId) => {
-      if (guildId) {
-        this.mirror.invalidateGuild(guildId);
-        this.repushGuildCaps(guildId);
-      }
-    });
+    this.bot.on('channelChange', (meta, kind) => this.onBotChannelChange(meta, kind));
+    this.bot.on('channelDelete', (channelId, guildId) => this.onBotChannelDelete(channelId, guildId));
     this.bot.on('ready', () => this.mirror.clear());
     // A pre-authorized guild (allow-listed before the bot joined) lights up the
     // moment the bot joins it; discord-bot only fires this for allowed guilds.
@@ -192,6 +191,7 @@ export class Relay implements GatewayHooks {
     if (c.kind === 'remove') {
       this.gateway.closePersona(c.id);
       this.readState.forget(c.id);
+      this.deliveredCaps.delete(c.id);
       void this.roles.unbindAll(c.id).catch((e) => console.error('[portal-relay] unbind on remove:', (e as Error).message));
       return;
     }
@@ -213,13 +213,7 @@ export class Relay implements GatewayHooks {
     } else {
       channels = this.bot.listGuilds().flatMap((g) => this.bot.listChannelMetas(g.id));
     }
-    for (const meta of channels) {
-      this.gateway.dispatch(c.personaId, {
-        type: 'capabilities_update',
-        channelId: meta.id,
-        capabilities: this.capsFor(c.personaId, meta.id, meta.guildId),
-      });
-    }
+    for (const meta of channels) this.pushCaps(c.personaId, meta.id, meta.guildId);
 
     for (const g of this.bot.listGuilds())
       void this.reconcilePersonaGuild(c.personaId, g.id).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
@@ -238,10 +232,12 @@ export class Relay implements GatewayHooks {
       void this.reconcileGuild(gid).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
       const metas = this.bot.listChannelMetas(gid);
       for (const personaId of this.gateway.activePersonas()) {
+        const channels = metas.map((m) => this.toPortalChannel(m, personaId));
+        for (const c of channels) this.rememberCaps(personaId, c.id, c.capabilities);
         this.gateway.dispatch(personaId, {
           type: 'guild_create',
           guild: { id: g.id, native: g.id, name: g.name, memberCount: g.memberCount },
-          channels: metas.map((m) => this.toPortalChannel(m, personaId)),
+          channels,
         });
       }
     }
@@ -254,25 +250,80 @@ export class Relay implements GatewayHooks {
       for (const personaId of this.gateway.activePersonas()) {
         this.gateway.dispatch(personaId, { type: 'guild_delete', guildId: gid });
       }
+      // Hygiene: drop the guild's channels from the dedup baseline so a future
+      // re-allow reseeds instead of matching stale keys. (If the bot was kicked
+      // the cache is empty and this is a no-op — rememberCaps overwrites on
+      // reseed anyway, so staleness is harmless, just untidy.)
+      for (const meta of this.bot.listChannelMetas(gid)) this.forgetChannelCaps(meta.id);
     }
   }
 
+  /** A guild channel/thread appeared or changed on Discord's side. */
+  private onBotChannelChange(meta: ChannelMeta, kind: 'create' | 'update'): void {
+    if (!meta.guildId) return;
+    this.mirror.invalidateGuild(meta.guildId);
+    // Materialize the changed channel for every connected persona (issue #5).
+    // A bare capabilities_update can't do this — clients can't invent a
+    // channel from a caps array — so new channels were invisible until the
+    // next full identify (i.e. an agent restart).
+    const create = kind === 'create';
+    for (const personaId of this.gateway.activePersonas()) {
+      const channel = this.toPortalChannel(meta, personaId);
+      this.rememberCaps(personaId, meta.id, channel.capabilities);
+      this.gateway.dispatch(personaId, meta.isThread
+        ? { type: create ? 'thread_create' : 'thread_update', channel }
+        : { type: create ? 'channel_create' : 'channel_update', channel });
+    }
+    // A permission-overwrite change on one channel can shift mirror-derived
+    // caps on siblings; re-derive the rest of the guild (dedup'd, so
+    // untouched channels cost nothing on the wire).
+    this.repushGuildCaps(meta.guildId);
+  }
+
+  /** A guild channel/thread was deleted on Discord's side. */
+  private onBotChannelDelete(channelId: string, guildId: string | null): void {
+    if (!guildId) return;
+    this.mirror.invalidateGuild(guildId);
+    this.forgetChannelCaps(channelId);
+    for (const personaId of this.gateway.activePersonas()) {
+      this.gateway.dispatch(personaId, { type: 'channel_delete', channelId, guildId });
+    }
+    this.repushGuildCaps(guildId);
+  }
+
   /** Re-push capabilities for every connected persona across a guild's channels.
-   *  Used when a role/channel change may have shifted mirrorRole visibility. */
+   *  Used when a role/channel change may have shifted mirrorRole visibility.
+   *  Dedup'd against deliveredCaps — only actual changes hit the wire. */
   private repushGuildCaps(guildId: string): void {
     const metas = this.bot.listChannelMetas(guildId);
     if (!metas.length) return;
     for (const personaId of this.gateway.activePersonas()) {
-      for (const meta of metas) {
-        this.gateway.dispatch(personaId, {
-          type: 'capabilities_update',
-          channelId: meta.id,
-          capabilities: this.capsFor(personaId, meta.id, guildId),
-        });
-      }
+      for (const meta of metas) this.pushCaps(personaId, meta.id, guildId);
     }
 
     void this.reconcileGuild(guildId).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
+  }
+
+  /** Dispatch a capabilities_update iff the caps differ from what this persona
+   *  last received for the channel (any channel-bearing dispatch counts). */
+  private pushCaps(personaId: string, channelId: string, guildId: string | null): void {
+    const caps = this.capsFor(personaId, channelId, guildId);
+    if (!this.rememberCaps(personaId, channelId, caps)) return;
+    this.gateway.dispatch(personaId, { type: 'capabilities_update', channelId, capabilities: caps });
+  }
+
+  /** Record caps as delivered; returns true when they changed since last delivery. */
+  private rememberCaps(personaId: string, channelId: string, caps: readonly string[]): boolean {
+    let byChannel = this.deliveredCaps.get(personaId);
+    if (!byChannel) this.deliveredCaps.set(personaId, (byChannel = new Map()));
+    const key = caps.join(',');
+    if (byChannel.get(channelId) === key) return false;
+    byChannel.set(channelId, key);
+    return true;
+  }
+
+  private forgetChannelCaps(channelId: string): void {
+    for (const byChannel of this.deliveredCaps.values()) byChannel.delete(channelId);
   }
 
   /** Ensure every connected persona has an addressing role wherever it can act,
@@ -479,7 +530,10 @@ export class Relay implements GatewayHooks {
     const channels: PortalChannel[] = [];
     for (const g of guilds) {
       for (const meta of this.bot.listChannelMetas(g.id)) {
-        channels.push(this.toPortalChannel(meta, session.personaId));
+        const channel = this.toPortalChannel(meta, session.personaId);
+        // Baseline for the caps-dedup filter: ready IS a delivery.
+        this.rememberCaps(session.personaId, channel.id, channel.capabilities);
+        channels.push(channel);
       }
     }
     // Pre-bind a role in each guild the persona can actually act in, so it's

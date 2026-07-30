@@ -41,8 +41,15 @@ export class ClientCache {
         this.guilds.set(event.guild.id, event.guild);
         for (const c of event.channels) this.channels.set(c.id, c);
         return true;
-      case 'guild_delete':
+      case 'guild_delete': {
+        // Drop the guild's channels too — a lost guild must not leave phantom
+        // channels resolvable by id/name (they'd also resurrect as stale
+        // descriptors on the next MCPL registration diff).
+        for (const [id, c] of this.channels) {
+          if (c.guildId === event.guildId) this.channels.delete(id);
+        }
         return this.guilds.delete(event.guildId);
+      }
       case 'persona_update':
         this.persona = event.persona;
         return true;

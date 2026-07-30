@@ -22,6 +22,7 @@ import {
   type ChannelsOpenResult,
   type ChannelsPublishParams,
   type ChannelsPublishResult,
+  type ChannelsChangedParams,
   type ChannelsRegisterParams,
   type ContentBlock,
   type InitializeCapabilities,
@@ -43,7 +44,13 @@ import { featureSets } from './feature-sets.js';
 export class PortalMcplServer {
   private conn: McplConnection | null = null;
   private mcplEnabled = false;
-  private registered = new Set<string>();
+  /**
+   * What the host currently knows about each channel: id → content key
+   * (descriptor minus open-state). Presence ⇒ the channel was advertised;
+   * a differing key ⇒ the descriptor changed (rename, live capability edit)
+   * and the host needs a channels/changed `updated` entry (issue #5).
+   */
+  private advertised = new Map<string, string>();
   private initialRegistrationComplete = false;
   private registrationInFlight: Promise<void> | null = null;
   /** Portal channel ids the host has opened — routed via channels/incoming so
@@ -62,7 +69,7 @@ export class PortalMcplServer {
 
   async serve(conn: McplConnection): Promise<void> {
     this.conn = conn;
-    this.registered.clear();
+    this.advertised.clear();
     this.openChannels.clear();
     this.initialRegistrationComplete = false;
     this.registrationInFlight = null;
@@ -346,6 +353,20 @@ export class PortalMcplServer {
         console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
       );
     });
+    this.client.on('channelRemove', ({ channelId }) => {
+      if (!this.conn || !this.mcplEnabled) return;
+      const id = portalChannelId(channelId);
+      // Only retract what was actually advertised. Deliberately event-driven,
+      // never derived by diffing an enumeration against `advertised` — a
+      // partial enumeration must not be able to mass-retract channels (the
+      // "every bot loses its subscriptions on migration" failure mode).
+      if (!this.advertised.delete(id)) return;
+      this.openChannels.delete(channelId); // openChannels holds RAW relay ids
+      this.agent.state.unsubscribe(channelId);
+      this.conn.sendNotification(method.CHANNELS_CHANGED, {
+        removed: [id],
+      } satisfies ChannelsChangedParams);
+    });
   }
 
   /**
@@ -531,7 +552,9 @@ export class PortalMcplServer {
         if (descriptors.length === 0) return;
         const params: ChannelsRegisterParams = { channels: descriptors };
         await conn.sendRequest(method.CHANNELS_REGISTER, params);
-        for (const descriptor of descriptors) this.registered.add(descriptor.id);
+        for (const descriptor of descriptors) {
+          this.advertised.set(descriptor.id, descriptorKey(descriptor));
+        }
         this.initialRegistrationComplete = true;
         // Retire ONLY the subscriptions that were actually advertised in the
         // acked register (their initiallyOpen has been durably reconciled by
@@ -545,10 +568,21 @@ export class PortalMcplServer {
         return;
       }
 
-      const added = descriptors.filter((descriptor) => !this.registered.has(descriptor.id));
-      if (added.length === 0) return;
-      for (const descriptor of added) this.registered.add(descriptor.id);
-      conn.sendNotification(method.CHANNELS_CHANGED, { added });
+      const added = descriptors.filter((descriptor) => !this.advertised.has(descriptor.id));
+      // A known channel whose descriptor content drifted (rename, live rights
+      // change → new caps in metadata) refreshes the host registry in place.
+      const updated = descriptors.filter((descriptor) => {
+        const known = this.advertised.get(descriptor.id);
+        return known !== undefined && known !== descriptorKey(descriptor);
+      });
+      if (added.length === 0 && updated.length === 0) return;
+      for (const descriptor of [...added, ...updated]) {
+        this.advertised.set(descriptor.id, descriptorKey(descriptor));
+      }
+      const changed: ChannelsChangedParams = {};
+      if (added.length) changed.added = added;
+      if (updated.length) changed.updated = updated;
+      conn.sendNotification(method.CHANNELS_CHANGED, changed);
       // Late-arriving channels carried initiallyOpen too — retire their
       // subscriptions once announced (the host bootstraps their desired
       // state from the changed notification).
@@ -557,10 +591,7 @@ export class PortalMcplServer {
 
     this.registrationInFlight = run().finally(() => {
       this.registrationInFlight = null;
-      if (
-        this.initialRegistrationComplete &&
-        this.allDescriptors().some((descriptor) => !this.registered.has(descriptor.id))
-      ) {
+      if (this.initialRegistrationComplete && this.hasUnadvertisedWork()) {
         void this.registerChannels().catch((err) =>
           console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
         );
@@ -568,6 +599,23 @@ export class PortalMcplServer {
     });
     return this.registrationInFlight;
   }
+
+  /** Any cached channel the host hasn't seen (or has seen with a stale
+   *  descriptor)? Used to re-arm registration after an in-flight cycle. */
+  private hasUnadvertisedWork(): boolean {
+    return this.allDescriptors().some(
+      (descriptor) => this.advertised.get(descriptor.id) !== descriptorKey(descriptor),
+    );
+  }
+}
+
+/** Content identity of a descriptor for change detection. Open-state hints
+ *  (initiallyOpen) are excluded: they're a one-shot bootstrap consumed by the
+ *  host, not channel content — retiring a legacy subscription must not read
+ *  as "channel changed". */
+function descriptorKey(descriptor: ReturnType<typeof toDescriptor>): string {
+  const { initiallyOpen: _open, ...content } = descriptor;
+  return JSON.stringify(content);
 }
 
 /** discord-mcpl-parity wake flags, derived from the relay's AddressInfo. The
