@@ -222,6 +222,16 @@ export class Gateway {
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'unknown session' } });
       return;
     }
+    // Gap detection: if events the session missed have already been shifted
+    // out of the bounded buffer, a silent partial replay would leave the
+    // client believing it is current while holding stale channel/rights
+    // state — force a fresh identify (full ready rehydrate) instead.
+    const oldest = stream.buffer[0]?.seq;
+    const gap = oldest !== undefined ? fromSeq < oldest - 1 : fromSeq < stream.seq;
+    if (gap) {
+      session.send({ op: 'invalid_session', d: { resumable: false, reason: 'resume window exceeded' } });
+      return;
+    }
     session.personaId = personaId;
     session.identified = true;
     this.register(session);
@@ -274,6 +284,27 @@ export class Gateway {
   /** Personas with at least one live session. */
   activePersonas(): string[] {
     return [...this.byPersona.entries()].filter(([, set]) => set.size > 0).map(([id]) => id);
+  }
+
+  /**
+   * Personas with a retained event stream — identified at least once since
+   * boot, live or not. Structural/rights events dispatch to these (buffered
+   * for resume) so a briefly-dropped single-session agent doesn't miss a
+   * channel_create/channel_delete/capabilities_update; messages deliberately
+   * do NOT (offline message catch-up rides durable read-state instead).
+   */
+  streamPersonas(): string[] {
+    return [...this.streams.keys()];
+  }
+
+  hasStream(personaId: string): boolean {
+    return this.streams.has(personaId);
+  }
+
+  /** Drop a persona's stream + buffer (identity removed — not token rotation,
+   *  which keeps the stream so re-authed sessions can resume). */
+  dropStream(personaId: string): void {
+    this.streams.delete(personaId);
   }
 
   sessionsOf(personaId: string): Session[] {

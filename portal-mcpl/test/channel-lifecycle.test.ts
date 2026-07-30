@@ -253,3 +253,173 @@ test('relay resume reasserts channels that the host still has open', async () =>
 
   assert.deepEqual(restored, [channel.id]);
 });
+
+// ── Live rights propagation (issue #5) ──
+
+/** Harness with a captured conn + wired client events (post-initial-registration). */
+async function registeredServer() {
+  const client = clientWithChannel();
+  const state = new AgentState();
+  const agent = new PortalAgent(client, { state, hostOwnsChannelLifecycle: true });
+  const server = new PortalMcplServer(client, agent);
+  const requests: Array<{ method: string; params: unknown }> = [];
+  const notifications: Array<{ method: string; params: unknown }> = [];
+  const internal = server as unknown as {
+    conn: {
+      sendRequest(method: string, params: unknown): Promise<unknown>;
+      sendNotification(method: string, params: unknown): void;
+    };
+    mcplEnabled: boolean;
+    openChannels: Set<string>;
+    registerChannels(): Promise<void>;
+    wireClient(): void;
+  };
+  internal.conn = {
+    async sendRequest(method, params) {
+      requests.push({ method, params });
+      return { registered: [`portal:${channel.id}`] };
+    },
+    sendNotification(method, params) {
+      notifications.push({ method, params });
+    },
+  };
+  internal.mcplEnabled = true;
+  internal.wireClient();
+  await internal.registerChannels();
+  requests.length = 0;
+  return { client, state, server, internal, requests, notifications };
+}
+
+test('a live capability change re-advertises the channel as updated', async () => {
+  const t = await registeredServer();
+
+  // Relay pushed new caps; the client cache merged them and (in production)
+  // channelChange re-triggers registration — call it directly here.
+  t.client.cache.apply({
+    type: 'capabilities_update',
+    channelId: channel.id,
+    capabilities: ['VIEW_CHANNEL', 'READ_HISTORY'],
+  });
+  await t.internal.registerChannels();
+
+  assert.equal(t.notifications.length, 1);
+  assert.equal(t.notifications[0].method, 'channels/changed');
+  const params = t.notifications[0].params as {
+    added?: unknown[];
+    updated?: Array<{ id: string; metadata: { capabilities: string[] } }>;
+  };
+  assert.equal(params.added, undefined, 'known channel must not re-add');
+  assert.equal(params.updated?.length, 1);
+  assert.equal(params.updated?.[0].id, `portal:${channel.id}`);
+  assert.deepEqual(params.updated?.[0].metadata.capabilities, ['VIEW_CHANNEL', 'READ_HISTORY']);
+
+  // Same state again → no further notification (content key caught up).
+  await t.internal.registerChannels();
+  assert.equal(t.notifications.length, 1);
+});
+
+test('an unchanged cache produces no channels/changed traffic', async () => {
+  const t = await registeredServer();
+  // Regression guard: initial registration retires the legacy subscription,
+  // flipping initiallyOpen for the next enumeration. Open-state is excluded
+  // from the descriptor content key, so this must NOT read as a change.
+  await t.internal.registerChannels();
+  await t.internal.registerChannels();
+  assert.equal(t.notifications.length, 0);
+  assert.equal(t.requests.length, 0);
+});
+
+test('channelRemove retracts an advertised channel and cleans local state', async () => {
+  const t = await registeredServer();
+  t.internal.openChannels.add(channel.id);
+
+  (t.client as unknown as { onEvent(e: unknown): void }).onEvent({
+    type: 'channel_delete',
+    channelId: channel.id,
+    guildId: channel.guildId,
+  });
+
+  assert.equal(t.notifications.length, 1);
+  assert.equal(t.notifications[0].method, 'channels/changed');
+  assert.deepEqual(t.notifications[0].params, { removed: [`portal:${channel.id}`] });
+  assert.equal(t.internal.openChannels.has(channel.id), false);
+
+  // Never-advertised channels retract nothing (event-driven only — a second
+  // delete for the same id is a no-op, not a repeated notification).
+  (t.client as unknown as { onEvent(e: unknown): void }).onEvent({
+    type: 'channel_delete',
+    channelId: channel.id,
+    guildId: channel.guildId,
+  });
+  assert.equal(t.notifications.length, 1);
+});
+
+test('a channel arriving via live channel_create is announced as added', async () => {
+  const t = await registeredServer();
+  const fresh: PortalChannel = {
+    id: '1526659685036331099',
+    guildId: 'g1',
+    name: 'freshly-granted',
+    type: 'text',
+    capabilities: ['VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES'],
+  };
+
+  (t.client as unknown as { onEvent(e: unknown): void }).onEvent({
+    type: 'channel_create',
+    channel: fresh,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(t.notifications.length, 1);
+  const params = t.notifications[0].params as { added?: Array<{ id: string }>; updated?: unknown[] };
+  assert.equal(params.added?.length, 1);
+  assert.equal(params.added?.[0].id, `portal:${fresh.id}`);
+  assert.equal(params.updated, undefined);
+});
+
+test('a removal landing during the in-flight initial register is retracted after the ack', async () => {
+  const client = clientWithChannel();
+  const state = new AgentState();
+  const agent = new PortalAgent(client, { state, hostOwnsChannelLifecycle: true });
+  const server = new PortalMcplServer(client, agent);
+  const notifications: Array<{ method: string; params: unknown }> = [];
+  let releaseRegister!: () => void;
+  const registerGate = new Promise<void>((resolve) => (releaseRegister = resolve));
+  const internal = server as unknown as {
+    conn: {
+      sendRequest(method: string, params: unknown): Promise<unknown>;
+      sendNotification(method: string, params: unknown): void;
+    };
+    mcplEnabled: boolean;
+    registerChannels(): Promise<void>;
+    wireClient(): void;
+  };
+  internal.conn = {
+    async sendRequest() {
+      await registerGate; // hold channels/register in flight
+      return { registered: [`portal:${channel.id}`] };
+    },
+    sendNotification(method, params) {
+      notifications.push({ method, params });
+    },
+  };
+  internal.mcplEnabled = true;
+  internal.wireClient();
+
+  const registration = internal.registerChannels();
+  // The channel dies while the register request is still awaiting the host.
+  (client as unknown as { onEvent(e: unknown): void }).onEvent({
+    type: 'channel_delete',
+    channelId: channel.id,
+    guildId: channel.guildId,
+  });
+  assert.equal(notifications.length, 0, 'retraction must wait for the ack');
+
+  releaseRegister();
+  await registration;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].method, 'channels/changed');
+  assert.deepEqual(notifications[0].params, { removed: [`portal:${channel.id}`] });
+});

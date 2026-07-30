@@ -66,7 +66,11 @@ export interface PortalClientEvents extends Record<string, (...args: never[]) =>
   }) => void;
   /** Any dispatch event, after the cache has been updated. */
   event: (e: PortalEvent) => void;
+  /** A channel appeared or changed — including live capability changes (a
+   *  rights edit relay-side arrives here with the channel's merged new caps). */
   channelChange: (channel: PortalChannel) => void;
+  /** A channel or thread is gone (deleted, or its guild left the allow-list). */
+  channelRemove: (e: { channelId: string; guildId: string | null }) => void;
   close: (info: { code: number; willReconnect: boolean }) => void;
   error: (err: Error) => void;
 }
@@ -265,7 +269,13 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   }
 
   private onEvent(event: PortalEvent): void {
-    this.cache.apply(event);
+    // Snapshot before apply — guild_delete removes the guild's channels from
+    // the cache, but listeners still need to know WHICH channels vanished.
+    const guildChannels =
+      event.type === 'guild_delete'
+        ? this.cache.allChannels().filter((c) => c.guildId === event.guildId)
+        : [];
+    const applied = this.cache.apply(event);
     this.emit('event', event);
     switch (event.type) {
       case 'message_create':
@@ -299,6 +309,31 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       case 'thread_create':
       case 'thread_update':
         this.emit('channelChange', event.channel);
+        break;
+      case 'capabilities_update': {
+        // The cache has already merged the new caps; surface the channel so
+        // downstream layers (portal-mcpl → host registry) see rights changes
+        // live instead of only at the next identify (issue #5). Unknown id ⇒
+        // nothing to update — the channel_create carrying it is on its way.
+        const channel = this.cache.getChannel(event.channelId);
+        if (channel) this.emit('channelChange', channel);
+        break;
+      }
+      case 'channel_delete':
+      case 'thread_delete':
+        // Only when the cache actually dropped something — a delete for a
+        // channel we never knew must not fan a phantom removal downstream.
+        if (applied) {
+          this.emit('channelRemove', { channelId: event.channelId, guildId: event.guildId });
+        }
+        break;
+      case 'guild_create':
+        for (const channel of event.channels) this.emit('channelChange', channel);
+        break;
+      case 'guild_delete':
+        for (const channel of guildChannels) {
+          this.emit('channelRemove', { channelId: channel.id, guildId: event.guildId });
+        }
         break;
     }
   }
