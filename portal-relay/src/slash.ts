@@ -45,6 +45,9 @@ export interface AutocompleteRequest {
   command: string;
   guildId: string;
   channelId: string;
+  /** Autocomplete is gated like execution — an unauthorized user typing in a
+   *  visible option field must not be able to enumerate personas/roles. */
+  invoker: SlashInvoker;
   option: string;
   /** What the user has typed so far in the focused option. */
   partial: string;
@@ -183,6 +186,9 @@ export interface SlashDeps {
   invites?: InviteStore;
   audit?: AuditLog;
   superadmins: string[];
+  /** Per-guild operator delegates (PORTAL_GUILD_ADMINS) — honored like the
+   *  admin panel does, in addition to live Discord Manage-Server. */
+  guildAdmins: Record<string, string[]>;
   capsFor(personaId: string, channelId: string, guildId: string): Capability[];
   canAccessGuild(personaId: string, guildId: string): boolean;
   /** Re-push the full channel set to a persona; returns channels pushed. */
@@ -194,7 +200,7 @@ export class SlashHandler {
   constructor(private deps: SlashDeps) {}
 
   handle(inv: SlashInvocation): string {
-    if (!this.authorized(inv.invoker)) {
+    if (!this.authorized(inv.invoker, inv.guildId)) {
       this.audit(inv, 'authz.denied', undefined, false, { command: inv.command });
       return 'Not authorized: requires Manage Server here, or portal superadmin.';
     }
@@ -219,8 +225,27 @@ export class SlashHandler {
     }
   }
 
-  private authorized(invoker: SlashInvoker): boolean {
-    return invoker.hasManageGuild || this.deps.superadmins.includes(invoker.id);
+  private authorized(invoker: SlashInvoker, guildId: string): boolean {
+    return (
+      invoker.hasManageGuild ||
+      this.isSuper(invoker) ||
+      (this.deps.guildAdmins[guildId] ?? []).includes(invoker.id)
+    );
+  }
+
+  private isSuper(invoker: SlashInvoker): boolean {
+    return this.deps.superadmins.includes(invoker.id);
+  }
+
+  /**
+   * Guild containment for role grants (/add-role, /invite): a guild's admin
+   * may only hand out roles SCOPED TO THAT GUILD. Guild-unbound (global) roles
+   * and other guilds' roles are superadmin-only — otherwise a single-guild
+   * Manage-Server holder could mint fleet-wide access. Autocomplete filters
+   * the same way, but the filter is a hint; THIS is the gate.
+   */
+  private roleGrantableHere(role: AccessRole, inv: SlashInvocation): boolean {
+    return this.isSuper(inv.invoker) || role.guildId === inv.guildId;
   }
 
   private audit(
@@ -296,6 +321,10 @@ export class SlashHandler {
     const name = inv.options.role ?? '';
     const role = this.deps.permissions.getRole(name);
     if (!role) return `No such access role: \`${name}\``;
+    if (!this.roleGrantableHere(role, inv)) {
+      this.audit(inv, 'slash.add-role', persona.id, false, { role: name, reason: 'guild-containment' });
+      return `\`${name}\` is ${role.guildId ? 'scoped to another guild' : 'guild-unbound (grants access fleet-wide)'} — only a portal superadmin can assign it.`;
+    }
     const roles = this.deps.permissions.addPersonaRoles(persona.id, [name]);
     this.audit(inv, 'slash.add-role', persona.id, true, { role: name });
     return `**${persona.displayName}** now holds \`${name}\` (all roles: ${roles.map((r) => `\`${r}\``).join(', ')}).`;
@@ -307,6 +336,13 @@ export class SlashHandler {
     const name = inv.options.role ?? '';
     if (!this.deps.permissions.getRoleNames(persona.id).includes(name)) {
       return `**${persona.displayName}** doesn’t hold \`${name}\`.`;
+    }
+    // Same containment as granting: removing another guild's (or a global)
+    // role changes the persona's access OUTSIDE this admin's authority.
+    const role = this.deps.permissions.getRole(name);
+    if (role && !this.roleGrantableHere(role, inv)) {
+      this.audit(inv, 'slash.remove-role', persona.id, false, { role: name, reason: 'guild-containment' });
+      return `\`${name}\` is ${role.guildId ? 'scoped to another guild' : 'guild-unbound (affects other guilds)'} — only a portal superadmin can remove it.`;
     }
     const roles = this.deps.permissions.removePersonaRole(persona.id, name);
     this.audit(inv, 'slash.remove-role', persona.id, true, { role: name });
@@ -320,6 +356,13 @@ export class SlashHandler {
     );
     const unknown = names.filter((n) => !this.deps.permissions.getRole(n));
     if (unknown.length) return `No such access role${unknown.length === 1 ? '' : 's'}: ${unknown.map((n) => `\`${n}\``).join(', ')}`;
+    // Guild containment: the invite's roles carry their own scope, so an
+    // uncontained mint here would hand out cross-guild/fleet-wide access.
+    const uncontained = names.filter((n) => !this.roleGrantableHere(this.deps.permissions.getRole(n)!, inv));
+    if (uncontained.length) {
+      this.audit(inv, 'slash.invite', undefined, false, { roles: names, reason: 'guild-containment' });
+      return `Role${uncontained.length === 1 ? '' : 's'} ${uncontained.map((n) => `\`${n}\``).join(', ')} not scoped to this guild — only a portal superadmin can mint invites carrying them.`;
+    }
     const code = this.deps.newInviteCode();
     this.deps.invites.mint({
       code,
@@ -343,20 +386,31 @@ export class SlashHandler {
       .filter((name) => this.deps.permissions.getRole(name)?.guildId === inv.guildId);
     for (const name of guildRoles) this.deps.permissions.removePersonaRole(persona.id, name);
     this.deps.permissions.clearGuild(persona.id, inv.guildId);
-    const residual = this.deps.permissions
-      .getRoleNames(persona.id)
-      .filter((name) => {
-        const role = this.deps.permissions.getRole(name);
-        return role && !role.guildId; // catalog roles without a guild binding could still apply
-      });
-    this.audit(inv, 'slash.ban', persona.id, true, { rolesRemoved: guildRoles });
-    return (
-      `Banned **${persona.displayName}** (\`${persona.id}\`) from this guild: ` +
-      `removed role${guildRoles.length === 1 ? '' : 's'} ${guildRoles.map((r) => `\`${r}\``).join(', ') || '(none held)'} and denied all direct grants.` +
-      (residual.length
-        ? `\n⚠️ Still holds guild-unbound role${residual.length === 1 ? '' : 's'}: ${residual.map((r) => `\`${r}\``).join(', ')} — check their scope.`
-        : '')
-    );
+    // Honesty check: guild-UNBOUND roles are out of a guild admin's reach (a
+    // /ban here must not strip someone's access in OTHER guilds), so access
+    // can survive. Verify instead of asserting: does anything still resolve?
+    const stillHasAccess = this.deps.canAccessGuild(persona.id, inv.guildId);
+    const residual = this.deps.permissions.getRoleNames(persona.id).filter((name) => {
+      const role = this.deps.permissions.getRole(name);
+      return role && !role.guildId;
+    });
+    this.audit(inv, 'slash.ban', persona.id, !stillHasAccess, {
+      rolesRemoved: guildRoles,
+      residualRoles: residual,
+      accessFullyRevoked: !stillHasAccess,
+    });
+    const did =
+      `Removed guild role${guildRoles.length === 1 ? '' : 's'} ` +
+      `${guildRoles.map((r) => `\`${r}\``).join(', ') || '(none held)'} from ` +
+      `**${persona.displayName}** (\`${persona.id}\`) and denied all direct grants here.`;
+    if (stillHasAccess) {
+      return (
+        `${did}\n⚠️ **Access NOT fully revoked**: they still resolve access in this guild via ` +
+        `guild-unbound role${residual.length === 1 ? '' : 's'} ${residual.map((r) => `\`${r}\``).join(', ') || '(unknown source)'} — ` +
+        `removing those affects other guilds too, so it takes a portal superadmin (\`/remove-role\`) or a catalog edit.`
+      );
+    }
+    return `${did}\nNo remaining access in this guild.`;
   }
 
   private caps(inv: SlashInvocation): string {
@@ -389,6 +443,10 @@ export class SlashHandler {
   // ── Autocomplete ──
 
   autocomplete(req: AutocompleteRequest): SlashChoice[] {
+    // Same gate as execution: a user who can see the command (e.g. after a
+    // guild admin widened visibility in Integrations settings) but can't run
+    // it must not be able to enumerate personas or the role catalog by typing.
+    if (!this.authorized(req.invoker, req.guildId)) return [];
     if (req.option === 'identity') return this.identityChoices(req);
     if (req.option === 'role' || req.option === 'role2' || req.option === 'role3') {
       return this.roleChoices(req);
@@ -420,12 +478,16 @@ export class SlashHandler {
       .map((p) => ({ name: `${p.displayName} (${p.id})`, value: p.id }));
   }
 
-  /** Role dropdowns: catalog roles usable in this guild; for remove-role,
-   *  narrowed to what the (already chosen) persona actually holds. */
+  /** Role dropdowns mirror the grant gate: this guild's roles for everyone
+   *  authorized, guild-unbound (global) roles only for superadmins; for
+   *  remove-role, narrowed to what the (already chosen) persona holds. */
   private roleChoices(req: AutocompleteRequest): SlashChoice[] {
     const q = req.partial.toLowerCase();
+    const superInvoker = this.isSuper(req.invoker);
     let names = Object.entries(this.deps.permissions.allRoles())
-      .filter(([, role]: [string, AccessRole]) => !role.guildId || role.guildId === req.guildId)
+      .filter(([, role]: [string, AccessRole]) =>
+        role.guildId ? role.guildId === req.guildId : superInvoker,
+      )
       .map(([name]) => name);
     if (req.command === 'remove-role' && req.options.identity) {
       const held = new Set(this.deps.permissions.getRoleNames(req.options.identity));

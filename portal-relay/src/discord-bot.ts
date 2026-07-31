@@ -874,6 +874,11 @@ export class DiscordBot implements WebhookOps, RoleOps {
         command: interaction.commandName,
         guildId: interaction.guildId,
         channelId: interaction.channelId,
+        invoker: {
+          id: interaction.user.id,
+          name: interaction.user.username,
+          hasManageGuild: interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ?? false,
+        },
         option: focused.name,
         partial: String(focused.value ?? ''),
         options,
@@ -891,6 +896,11 @@ export class DiscordBot implements WebhookOps, RoleOps {
       const channel = interaction.channel;
       const channelName =
         channel && 'name' in channel && channel.name ? channel.name : interaction.channelId;
+      // Defer BEFORE running the handler: /list-style commands can walk
+      // personas × mirror caches, and the raw-reply window is only 3s —
+      // deferring first (the await yields, letting the ACK go out) buys 15
+      // minutes for the synchronous work below.
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const content = handler({
         command: interaction.commandName,
         guildId: interaction.guildId,
@@ -904,10 +914,15 @@ export class DiscordBot implements WebhookOps, RoleOps {
         options,
       });
       // Ephemeral, chunked on line boundaries under Discord's 2000-char limit.
+      // Mentions never parse — option values echo into replies.
       const chunks = splitContent(content, 1990);
-      await interaction.reply({ content: chunks[0], flags: MessageFlags.Ephemeral });
+      await interaction.editReply({ content: chunks[0], allowedMentions: { parse: [] } });
       for (const extra of chunks.slice(1)) {
-        await interaction.followUp({ content: extra, flags: MessageFlags.Ephemeral });
+        await interaction.followUp({
+          content: extra,
+          flags: MessageFlags.Ephemeral,
+          allowedMentions: { parse: [] },
+        });
       }
     }
   }

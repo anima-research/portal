@@ -135,6 +135,7 @@ export class Relay implements GatewayHooks {
       invites: this.invites,
       audit: this.audit,
       superadmins: config.admin?.superadmins ?? [],
+      guildAdmins: config.admin?.guildAdmins ?? {},
       capsFor: (personaId, channelId, guildId) => this.capsFor(personaId, channelId, guildId),
       canAccessGuild: (personaId, guildId) => this.personaCanAccessGuild(personaId, guildId),
       resync: (personaId) => this.resyncPersona(personaId),
