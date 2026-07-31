@@ -11,9 +11,13 @@ import {
   GatewayIntentBits,
   Partials,
   PermissionsBitField,
+  PermissionFlagsBits,
   ChannelType,
   MessageType,
+  MessageFlags,
+  ApplicationCommandOptionType,
   AttachmentBuilder,
+  type Interaction,
   type Guild,
   type GuildMember,
   type Message,
@@ -33,6 +37,7 @@ import type { Capability } from '@animalabs/portal-protocol';
 import { capsFromPerms } from './permissions.js';
 import type { RoleOps } from './role-pool.js';
 import type { WebhookOps, WebhookSendOpts } from './webhook-pool.js';
+import { SLASH_COMMANDS, type AutocompleteRequest, type SlashChoice, type SlashInvocation } from './slash.js';
 
 export interface ChannelMeta {
   id: string;
@@ -266,6 +271,10 @@ type Handlers = {
   /** A role's guild-level perms changed, or a role was created/deleted (RFC-004
    *  mirror invalidation). `roleId === @everyone` ⇒ guild-wide baseline shift. */
   roleChange?: (guildId: string, roleId: string) => void;
+  /** A slash command was invoked (already normalized; reply is sent ephemeral). */
+  slashCommand?: (inv: SlashInvocation) => string;
+  /** An autocomplete keystroke on a slash-command option. */
+  slashAutocomplete?: (req: AutocompleteRequest) => SlashChoice[];
 };
 
 const MAX_ATTACH = 10;
@@ -809,6 +818,100 @@ export class DiscordBot implements WebhookOps, RoleOps {
     });
   }
 
+  // ── Slash commands ──
+
+  /**
+   * (Re)register the admin slash commands for allowed+joined guilds (or one
+   * guild). Registered with Manage-Server default visibility — that hides them
+   * from non-admins; the authoritative gate is server-side in SlashHandler.
+   * No-op unless a slashCommand handler is wired (relay opts in).
+   */
+  async syncSlashCommands(guildId?: string): Promise<void> {
+    if (!this.handlers.slashCommand) return;
+    const app = this.client.application;
+    if (!app) return;
+    const data = SLASH_COMMANDS.map((c) => ({
+      name: c.name,
+      description: c.description,
+      // Guild-scoped commands can't run in DMs, so no dmPermission field (it's
+      // a global-command concept and some API paths reject it on guild sets).
+      defaultMemberPermissions: PermissionFlagsBits.ManageGuild,
+      options: c.options.map((o) => ({
+        type: ApplicationCommandOptionType.String as const,
+        name: o.name,
+        description: o.description,
+        required: o.required ?? false,
+        autocomplete: o.autocomplete ?? false,
+        ...(o.choices ? { choices: o.choices.map((v) => ({ name: v, value: v })) } : {}),
+      })),
+    }));
+    const gids = guildId
+      ? [guildId]
+      : [...this.client.guilds.cache.keys()].filter((id) => this.guildAllowed(id));
+    for (const gid of gids) {
+      if (!this.guildAllowed(gid) || !this.client.guilds.cache.has(gid)) continue;
+      try {
+        await app.commands.set(data, gid);
+      } catch (err) {
+        console.error(`[discord-bot] slash registration failed (${gid}):`, (err as Error).message);
+      }
+    }
+  }
+
+  private async onInteraction(interaction: Interaction): Promise<void> {
+    if (interaction.isAutocomplete()) {
+      const handler = this.handlers.slashAutocomplete;
+      if (!handler || !interaction.guildId) {
+        await interaction.respond([]);
+        return;
+      }
+      const focused = interaction.options.getFocused(true);
+      const options: Record<string, string | undefined> = {};
+      for (const o of interaction.options.data) {
+        if (typeof o.value === 'string') options[o.name] = o.value;
+      }
+      const choices = handler({
+        command: interaction.commandName,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+        option: focused.name,
+        partial: String(focused.value ?? ''),
+        options,
+      });
+      await interaction.respond(choices.slice(0, 25));
+      return;
+    }
+    if (interaction.isChatInputCommand()) {
+      const handler = this.handlers.slashCommand;
+      if (!handler || !interaction.guildId || !interaction.channelId) return;
+      const options: Record<string, string | undefined> = {};
+      for (const o of interaction.options.data) {
+        if (o.value !== undefined) options[o.name] = String(o.value);
+      }
+      const channel = interaction.channel;
+      const channelName =
+        channel && 'name' in channel && channel.name ? channel.name : interaction.channelId;
+      const content = handler({
+        command: interaction.commandName,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+        channelName,
+        invoker: {
+          id: interaction.user.id,
+          name: interaction.user.username,
+          hasManageGuild: interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ?? false,
+        },
+        options,
+      });
+      // Ephemeral, chunked on line boundaries under Discord's 2000-char limit.
+      const chunks = splitContent(content, 1990);
+      await interaction.reply({ content: chunks[0], flags: MessageFlags.Ephemeral });
+      for (const extra of chunks.slice(1)) {
+        await interaction.followUp({ content: extra, flags: MessageFlags.Ephemeral });
+      }
+    }
+  }
+
   // ── Wiring ──
 
   private wire(): void {
@@ -817,6 +920,15 @@ export class DiscordBot implements WebhookOps, RoleOps {
       if (this.guildMembersIntent) {
         for (const g of this.client.guilds.cache.values()) void this.warmMembers(g);
       }
+      void this.syncSlashCommands().catch((err) =>
+        console.error('[discord-bot] slash registration:', (err as Error).message),
+      );
+    });
+
+    this.client.on('interactionCreate', (interaction) => {
+      void this.onInteraction(interaction).catch((err) =>
+        console.error('[discord-bot] interaction:', (err as Error).message),
+      );
     });
 
     this.client.on('messageCreate', (m) => {
@@ -852,6 +964,9 @@ export class DiscordBot implements WebhookOps, RoleOps {
     this.client.on('guildCreate', (g) => {
       void this.warmMembers(g);
       if (!this.guildAllowed(g.id)) return;
+      void this.syncSlashCommands(g.id).catch((err) =>
+        console.error('[discord-bot] slash registration:', (err as Error).message),
+      );
       this.handlers.guildCreate?.(g.id, g.name, this.listChannelMetas(g.id));
     });
 
@@ -1062,4 +1177,28 @@ function mapChannelType(type: number): ChannelMeta['type'] {
     default:
       return 'unknown';
   }
+}
+
+/** Split reply content into ≤max-char chunks, preferring line boundaries. */
+export function splitContent(content: string, max: number): string[] {
+  if (!content) return ['(empty)'];
+  const chunks: string[] = [];
+  let current = '';
+  for (const line of content.split('\n')) {
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length <= max) {
+      current = candidate;
+      continue;
+    }
+    if (current) chunks.push(current);
+    // A single oversized line hard-wraps.
+    let rest = line;
+    while (rest.length > max) {
+      chunks.push(rest.slice(0, max));
+      rest = rest.slice(max);
+    }
+    current = rest;
+  }
+  if (current) chunks.push(current);
+  return chunks.length ? chunks : ['(empty)'];
 }
