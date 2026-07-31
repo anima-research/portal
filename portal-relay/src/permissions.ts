@@ -56,6 +56,10 @@ export type PermissionChange = {
 export class PermissionsStore {
   private personas = new Map<string, PersonaEntry>();
   private roles = new Map<string, AccessRole>();
+  /** Catalog entries refused at load (no guildId / malformed): excluded from
+   *  resolution but written back verbatim on persist — quarantine, not
+   *  deletion. A live entry created under the same name wins on merge. */
+  private quarantinedRoles: Record<string, unknown> = {};
   private fileDefault: Capability[] = [];
   private listeners: Array<(c: PermissionChange) => void> = [];
   private file?: WatchedFile;
@@ -146,11 +150,20 @@ export class PermissionsStore {
     guildId: string | null,
     channelId: string,
   ): boolean {
-    if ('all' in scope) return scope.all === true;
-    if ('channels' in scope) return scope.channels.includes(channelId);
+    // Roles are guild-scoped, PERIOD (2026-07-31): every scope kind is gated on
+    // the role's guild binding. scope:{all} means "all channels of MY guild",
+    // never fleet-wide — before this, `all` returned true without consulting
+    // roleGuildId, making the binding decorative on non-mirror roles (and a
+    // guild admin's /add-role silently fleet-wide). Unbound roles are dropped
+    // at load; `!roleGuildId` here is belt-and-braces fail-closed.
+    if ('all' in scope) return scope.all === true && !!roleGuildId && roleGuildId === guildId;
+    if ('channels' in scope) {
+      if (!roleGuildId || roleGuildId !== guildId) return false;
+      return scope.channels.includes(channelId);
+    }
     // mirror{Role,Roles}: inherently per-guild; deny if no guild, cross-guild, or no lookup.
     if (!guildId) return false;
-    if (roleGuildId && roleGuildId !== guildId) return false;
+    if (!roleGuildId || roleGuildId !== guildId) return false;
     const mv = this.mirrorLookup;
     if (!mv) return false; // fail-closed: never a stale allow
     // Union: in scope iff ANY mirrored role can view the channel.
@@ -170,7 +183,7 @@ export class PermissionsStore {
     const out = new Set<Capability>();
     if (!('mirrorRole' in scope) && !('mirrorRoles' in scope)) return out;
     if (!guildId) return out;
-    if (roleGuildId && roleGuildId !== guildId) return out;
+    if (!roleGuildId || roleGuildId !== guildId) return out;
     const mv = this.mirrorLookup;
     if (!mv) return out; // fail-closed
     const roleIds = 'mirrorRoles' in scope ? scope.mirrorRoles : [scope.mirrorRole];
@@ -224,6 +237,8 @@ export class PermissionsStore {
     for (const name of entry.roles ?? []) {
       const role = this.roles.get(name);
       if (!role || role.caps.length === 0) continue;
+      // Guild-scoped, PERIOD — same gate as scopeIncludes (2026-07-31).
+      if (!role.guildId || role.guildId !== guildId) continue;
       const s = role.scope;
       if ('all' in s) {
         if (s.all) return true;
@@ -233,8 +248,7 @@ export class PermissionsStore {
         if (s.channels.some(channelInGuild)) return true;
         continue;
       }
-      // mirror{Role,Roles}: per-guild; grants here iff a mirrored role can see ≥1 channel.
-      if (role.guildId && role.guildId !== guildId) continue;
+      // mirror{Role,Roles}: grants here iff a mirrored role can see ≥1 channel.
       const mv = this.mirrorLookup;
       if (!mv) continue; // fail-closed
       const rids = 'mirrorRoles' in s ? s.mirrorRoles : [s.mirrorRole];
@@ -242,11 +256,21 @@ export class PermissionsStore {
     }
     const pol = entry.policy;
     if (pol) {
-      if (pol.default.length > 0) return true; // legacy global default applies everywhere
       const g = pol.guilds?.[guildId];
       if (g) {
         if (g.default && g.default.length > 0) return true;
         if (g.channels && Object.values(g.channels).some((caps) => caps.length > 0)) return true;
+        // Mirror resolvePolicy exactly (channel ?? guild ?? default): an
+        // UNDEFINED g.default is transparent — channels not in g.channels
+        // still fall through to the legacy persona default — while an
+        // explicit deny ({default: []}, e.g. /ban) shadows it. Getting this
+        // wrong under-reports for the canonical legacy persona shape
+        // (nonempty default + channel-only guild entries) and unbinds
+        // addressing roles / silences ambient dispatch while resolve()
+        // still grants.
+        if (g.default === undefined && pol.default.length > 0) return true;
+      } else if (pol.default.length > 0) {
+        return true; // legacy global default applies where no guild entry says otherwise
       }
     }
     return false;
@@ -321,10 +345,21 @@ export class PermissionsStore {
    *  subtree would fall back to the persona default instead). Used by /ban;
    *  guild-scoped access ROLES are removed separately by the caller. */
   clearGuild(personaId: string, guildId: string): void {
-    const entry = this.personas.get(personaId);
-    if (!entry) return;
-    const policy = (entry.policy ??= { default: [] });
-    (policy.guilds ??= {})[guildId] = { default: [] };
+    // ensureGuild (not personas.get) so a persona with NO permissions entry
+    // gets one pinned to deny — otherwise a /ban of a file-default persona
+    // would silently no-op and the file default would keep applying.
+    //
+    // Guild containment of the side effect: creating the entry stops the
+    // FILE default from applying to this persona ANYWHERE (resolve() only
+    // consults it for entry-less personas). Seed the persona default from a
+    // snapshot of it so a guild-scoped ban denies exactly this guild and
+    // leaves the persona's standing in every other guild unchanged.
+    if (!this.personas.has(personaId) && this.fileDefault.length > 0) {
+      this.ensurePolicy(personaId).default = [...this.fileDefault];
+    }
+    const g = this.ensureGuild(personaId, guildId);
+    g.default = [];
+    delete g.channels;
     this.persist();
     this.emit({ personaId, scope: 'guild', guildId });
   }
@@ -333,6 +368,7 @@ export class PermissionsStore {
    *  RFC-005 §5.3). A reload-scope emit re-pushes caps to any persona that
    *  references the role. */
   setRole(name: string, role: AccessRole): void {
+    if (!role.guildId) throw new Error('roles are guild-scoped: guildId is required');
     this.roles.set(name, role);
     this.persist();
     for (const [pid, e] of this.personas) {
@@ -380,7 +416,25 @@ export class PermissionsStore {
     const oldJson = new Map([...this.personas].map(([id, p]) => [id, JSON.stringify(p)]));
     const oldRolesJson = JSON.stringify([...this.roles].sort());
     this.fileDefault = next.default ?? [];
-    this.roles = new Map(Object.entries(next.roles ?? {}));
+    // Roles are guild-scoped, PERIOD: a role without a guild binding (or a
+    // malformed entry) is INERT (fail-closed) rather than resolving
+    // fleet-wide. Loud, because a catalog entry silently granting nothing is
+    // a debugging trap. Quarantined — not dropped — so the next persist()
+    // doesn't destroy config the operator intends to repair.
+    this.quarantinedRoles = {};
+    this.roles = new Map(
+      Object.entries(next.roles ?? {}).filter(([name, role]) => {
+        if (!role || !role.guildId) {
+          console.error(
+            `[portal-relay] permissions: role "${name}" has no guildId — roles are guild-scoped; ` +
+              `treating it as INERT until it gets one (entry preserved on save)`,
+          );
+          this.quarantinedRoles[name] = role;
+          return false;
+        }
+        return true;
+      }),
+    );
     this.personas = new Map(
       Object.entries(next.personas ?? {}).map(([id, raw]) => [id, toEntry(raw)]),
     );
@@ -401,9 +455,13 @@ export class PermissionsStore {
   }
 
   private persist(): void {
+    const quarantined = Object.keys(this.quarantinedRoles).length;
     const data: PermissionsFile = {
       default: this.fileDefault.length ? this.fileDefault : undefined,
-      roles: this.roles.size ? Object.fromEntries(this.roles) : undefined,
+      roles:
+        this.roles.size || quarantined
+          ? ({ ...this.quarantinedRoles, ...Object.fromEntries(this.roles) } as PermissionsFile['roles'])
+          : undefined,
       personas: Object.fromEntries(
         [...this.personas].map(([id, e]) => [id, fromEntry(e)]),
       ),

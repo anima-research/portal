@@ -238,11 +238,12 @@ export class SlashHandler {
   }
 
   /**
-   * Guild containment for role grants (/add-role, /invite): a guild's admin
-   * may only hand out roles SCOPED TO THAT GUILD. Guild-unbound (global) roles
-   * and other guilds' roles are superadmin-only — otherwise a single-guild
-   * Manage-Server holder could mint fleet-wide access. Autocomplete filters
-   * the same way, but the filter is a hint; THIS is the gate.
+   * Guild containment for role grants (/add-role, /remove-role, /invite): a
+   * guild's admin may only hand out (or take away) roles SCOPED TO THAT
+   * GUILD; other guilds' roles are superadmin-only. Since 2026-07-31 roles
+   * are guild-scoped in RESOLUTION too (scope:{all} = that guild only), so
+   * this gate and the resolver agree. Autocomplete filters the same way, but
+   * the filter is a hint; THIS is the gate.
    */
   private roleGrantableHere(role: AccessRole, inv: SlashInvocation): boolean {
     return this.isSuper(inv.invoker) || role.guildId === inv.guildId;
@@ -323,7 +324,7 @@ export class SlashHandler {
     if (!role) return `No such access role: \`${name}\``;
     if (!this.roleGrantableHere(role, inv)) {
       this.audit(inv, 'slash.add-role', persona.id, false, { role: name, reason: 'guild-containment' });
-      return `\`${name}\` is ${role.guildId ? 'scoped to another guild' : 'guild-unbound (grants access fleet-wide)'} — only a portal superadmin can assign it.`;
+      return `\`${name}\` is scoped to another guild — only a portal superadmin can assign it.`;
     }
     const roles = this.deps.permissions.addPersonaRoles(persona.id, [name]);
     this.audit(inv, 'slash.add-role', persona.id, true, { role: name });
@@ -342,7 +343,7 @@ export class SlashHandler {
     const role = this.deps.permissions.getRole(name);
     if (role && !this.roleGrantableHere(role, inv)) {
       this.audit(inv, 'slash.remove-role', persona.id, false, { role: name, reason: 'guild-containment' });
-      return `\`${name}\` is ${role.guildId ? 'scoped to another guild' : 'guild-unbound (affects other guilds)'} — only a portal superadmin can remove it.`;
+      return `\`${name}\` is scoped to another guild — only a portal superadmin can remove it.`;
     }
     const roles = this.deps.permissions.removePersonaRole(persona.id, name);
     this.audit(inv, 'slash.remove-role', persona.id, true, { role: name });
@@ -386,17 +387,12 @@ export class SlashHandler {
       .filter((name) => this.deps.permissions.getRole(name)?.guildId === inv.guildId);
     for (const name of guildRoles) this.deps.permissions.removePersonaRole(persona.id, name);
     this.deps.permissions.clearGuild(persona.id, inv.guildId);
-    // Honesty check: guild-UNBOUND roles are out of a guild admin's reach (a
-    // /ban here must not strip someone's access in OTHER guilds), so access
-    // can survive. Verify instead of asserting: does anything still resolve?
+    // Roles are guild-scoped in resolution (2026-07-31), so removing this
+    // guild's roles + pinning the inline policy to deny IS full revocation
+    // here. Verify anyway — an invariant break must surface, not hide.
     const stillHasAccess = this.deps.canAccessGuild(persona.id, inv.guildId);
-    const residual = this.deps.permissions.getRoleNames(persona.id).filter((name) => {
-      const role = this.deps.permissions.getRole(name);
-      return role && !role.guildId;
-    });
     this.audit(inv, 'slash.ban', persona.id, !stillHasAccess, {
       rolesRemoved: guildRoles,
-      residualRoles: residual,
       accessFullyRevoked: !stillHasAccess,
     });
     const did =
@@ -405,9 +401,8 @@ export class SlashHandler {
       `**${persona.displayName}** (\`${persona.id}\`) and denied all direct grants here.`;
     if (stillHasAccess) {
       return (
-        `${did}\n⚠️ **Access NOT fully revoked**: they still resolve access in this guild via ` +
-        `guild-unbound role${residual.length === 1 ? '' : 's'} ${residual.map((r) => `\`${r}\``).join(', ') || '(unknown source)'} — ` +
-        `removing those affects other guilds too, so it takes a portal superadmin (\`/remove-role\`) or a catalog edit.`
+        `${did}\n⚠️ **Access unexpectedly still resolves in this guild** — this should be ` +
+        `impossible now that roles are guild-scoped; check permissions.json (invariant break, please report).`
       );
     }
     return `${did}\nNo remaining access in this guild.`;
@@ -478,16 +473,13 @@ export class SlashHandler {
       .map((p) => ({ name: `${p.displayName} (${p.id})`, value: p.id }));
   }
 
-  /** Role dropdowns mirror the grant gate: this guild's roles for everyone
-   *  authorized, guild-unbound (global) roles only for superadmins; for
-   *  remove-role, narrowed to what the (already chosen) persona holds. */
+  /** Role dropdowns mirror the grant gate: this guild's roles only (a
+   *  superadmin may still TYPE another guild's role — the gate exempts them);
+   *  for remove-role, narrowed to what the (already chosen) persona holds. */
   private roleChoices(req: AutocompleteRequest): SlashChoice[] {
     const q = req.partial.toLowerCase();
-    const superInvoker = this.isSuper(req.invoker);
     let names = Object.entries(this.deps.permissions.allRoles())
-      .filter(([, role]: [string, AccessRole]) =>
-        role.guildId ? role.guildId === req.guildId : superInvoker,
-      )
+      .filter(([, role]: [string, AccessRole]) => role.guildId === req.guildId)
       .map(([name]) => name);
     if (req.command === 'remove-role' && req.options.identity) {
       const held = new Set(this.deps.permissions.getRoleNames(req.options.identity));

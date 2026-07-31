@@ -59,8 +59,13 @@ export type Scope =
 export interface AccessRole {
   caps: Capability[];
   scope: Scope;
-  /** Bind to a guild — required for `mirrorRole`; omit for global. */
-  guildId?: string;
+  /**
+   * The guild this role is scoped to — REQUIRED (2026-07-31): roles are
+   * guild-scoped, period. `scope:{all}` means all channels of THIS guild,
+   * never fleet-wide. Legacy unbound entries are dropped at load
+   * (fail-closed) with a console warning; setRole rejects them.
+   */
+  guildId: string;
   /**
    * Full-fidelity mirroring (mirror scopes only). When true, `caps` acts as a
    * *mask*: the effective grant in a channel is `caps ∩ what the mirrored

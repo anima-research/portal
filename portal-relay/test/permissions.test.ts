@@ -52,8 +52,8 @@ test('scoped grant (channels) is default-deny outside scope', () => {
 test('access roles: channels scope + union (most-permissive) across roles', () => {
   const path = tmpFile({
     roles: {
-      reader: { caps: ['VIEW_CHANNEL', 'READ_HISTORY'], scope: { channels: ['c1', 'c2'] } },
-      poster: { caps: ['SEND_MESSAGES'], scope: { channels: ['c2'] } },
+      reader: { caps: ['VIEW_CHANNEL', 'READ_HISTORY'], scope: { channels: ['c1', 'c2'] }, guildId: 'g1' },
+      poster: { caps: ['SEND_MESSAGES'], scope: { channels: ['c2'] }, guildId: 'g1' },
     },
     personas: { bot: { roles: ['reader', 'poster'] } },
   });
@@ -67,14 +67,21 @@ test('access roles: channels scope + union (most-permissive) across roles', () =
   rmSync(path, { force: true });
 });
 
-test('scope:{all} grants everywhere; unknown role name is ignored', () => {
+test('scope:{all} grants all channels of ITS guild only; unknown/unbound roles are ignored', () => {
   const path = tmpFile({
-    roles: { admin: { caps: [...RW], scope: { all: true } } },
-    personas: { a: { roles: ['admin', 'ghost'] } },
+    roles: {
+      admin: { caps: [...RW], scope: { all: true }, guildId: 'g1' },
+      // Legacy unbound role: dropped at load (roles are guild-scoped, PERIOD).
+      relic: { caps: [...RW], scope: { all: true } },
+    },
+    personas: { a: { roles: ['admin', 'ghost', 'relic'] } },
   });
   const store = new PermissionsStore(path);
   assert.deepEqual(sorted(store.resolve('a', 'g1', 'anywhere')), [...RW].sort());
-  assert.deepEqual(sorted(store.resolve('a', null, 'dm')), [...RW].sort());
+  // Same role resolves NOTHING in another guild or DM context.
+  assert.deepEqual(sorted(store.resolve('a', 'g2', 'anywhere')), []);
+  assert.deepEqual(sorted(store.resolve('a', null, 'dm')), []);
+  assert.equal(store.getRole('relic'), undefined);
   rmSync(path, { force: true });
 });
 
@@ -173,9 +180,9 @@ test('couldAccessGuild: gates addressing-role minting per guild', () => {
   const path = tmpFile({
     roles: {
       gA: { caps: [...RW], scope: { mirrorRoles: ['rA'] }, guildId: 'gA' },
-      chans: { caps: [...RW], scope: { channels: ['c-in-gB'] } }, // global channels scope
-      everywhere: { caps: ['VIEW_CHANNEL'], scope: { all: true } },
-      empty: { caps: [], scope: { all: true } }, // no caps → grants nothing
+      chans: { caps: [...RW], scope: { channels: ['c-in-gB'] }, guildId: 'gB' },
+      everywhere: { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'gA' },
+      empty: { caps: [], scope: { all: true }, guildId: 'gA' }, // no caps → grants nothing
     },
     personas: {
       mirror: { roles: ['gA'] },
@@ -195,8 +202,9 @@ test('couldAccessGuild: gates addressing-role minting per guild', () => {
   // channels-scope persona: access only in the guild that owns the channel
   assert.equal(store.couldAccessGuild('chan', 'gB', inGuild('gB')), true);
   assert.equal(store.couldAccessGuild('chan', 'gA', inGuild('gA')), false);
-  // all-scope: access everywhere
-  assert.equal(store.couldAccessGuild('admin', 'anyGuild', inGuild('anyGuild')), true);
+  // all-scope: access in the role's own guild only (guild-scoped, PERIOD)
+  assert.equal(store.couldAccessGuild('admin', 'gA', inGuild('gA')), true);
+  assert.equal(store.couldAccessGuild('admin', 'anyGuild', inGuild('anyGuild')), false);
   // empty-caps role: no access anywhere
   assert.equal(store.couldAccessGuild('none', 'gA', inGuild('gA')), false);
   // legacy per-guild policy
@@ -208,7 +216,7 @@ test('couldAccessGuild: gates addressing-role minting per guild', () => {
 });
 
 test('setPersonaPolicy / setPersonaRoles persist and round-trip', () => {
-  const path = tmpFile({ roles: { r: { caps: ['VIEW_CHANNEL'], scope: { all: true } } }, personas: {} });
+  const path = tmpFile({ roles: { r: { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'g1' } }, personas: {} });
   const store = new PermissionsStore(path);
 
   store.setPersonaPolicy('p1', { default: [], guilds: { g1: { default: [], channels: { c1: [...RW] } } } });
@@ -224,5 +232,80 @@ test('setPersonaPolicy / setPersonaRoles persist and round-trip', () => {
   const onDisk = JSON.parse(readFileSync(path, 'utf8')) as PermissionsFile;
   assert.ok('default' in (onDisk.personas.p1 as Record<string, unknown>));
   assert.deepEqual((onDisk.personas.p2 as { roles: string[] }).roles, ['r']);
+  rmSync(path, { force: true });
+});
+
+// ── Guild-scoped roles hardening: review regressions (PR #9) ──
+
+test('couldAccessGuild mirrors resolvePolicy transparency: undefined guild default falls through; explicit [] shadows', () => {
+  const path = tmpFile({
+    personas: {
+      // Canonical legacy shape: nonempty persona default + channel-only guild entry.
+      lena: { policy: { default: ['VIEW_CHANNEL'], guilds: { g1: { channels: { c1: ['VIEW_CHANNEL'] } } } } },
+      // /ban shape: explicit guild deny must SHADOW the nonempty default.
+      banned: { policy: { default: ['VIEW_CHANNEL'], guilds: { g1: { default: [] } } } },
+    },
+  });
+  const store = new PermissionsStore(path);
+  // resolve grants via fall-through — couldAccessGuild must agree (a mismatch
+  // unbinds addressing roles and silences ambient dispatch while the persona
+  // can still act: deaf-but-speaking).
+  assert.deepEqual(sorted(store.resolve('lena', 'g1', 'other-chan')), ['VIEW_CHANNEL']);
+  assert.equal(store.couldAccessGuild('lena', 'g1', () => false), true);
+  // Explicit deny: both sides deny in g1, default still applies elsewhere.
+  assert.deepEqual(sorted(store.resolve('banned', 'g1', 'any')), []);
+  assert.equal(store.couldAccessGuild('banned', 'g1', () => false), false);
+  assert.equal(store.couldAccessGuild('banned', 'g2', () => false), true);
+  rmSync(path, { force: true });
+});
+
+test('clearGuild creates the entry for entry-less personas and contains the side effect to one guild', () => {
+  const path = tmpFile({ default: ['VIEW_CHANNEL'], personas: {} });
+  const store = new PermissionsStore(path);
+  // Entry-less persona rides the FILE default everywhere.
+  assert.deepEqual(sorted(store.resolve('ghost', 'g1', 'c')), ['VIEW_CHANNEL']);
+  assert.deepEqual(sorted(store.resolve('ghost', 'g2', 'c')), ['VIEW_CHANNEL']);
+
+  store.clearGuild('ghost', 'g1');
+
+  // Denied in the banned guild — but NOT fleet-wide: the entry creation
+  // seeded the persona default from the file default, so other guilds keep
+  // working (a guild-scoped /ban must not have fleet-wide collateral).
+  assert.deepEqual(sorted(store.resolve('ghost', 'g1', 'c')), []);
+  assert.equal(store.couldAccessGuild('ghost', 'g1', () => false), false);
+  assert.deepEqual(sorted(store.resolve('ghost', 'g2', 'c')), ['VIEW_CHANNEL']);
+  assert.equal(store.couldAccessGuild('ghost', 'g2', () => false), true);
+  rmSync(path, { force: true });
+});
+
+test('unbound/malformed catalog entries are quarantined: inert in resolution, preserved across persist', () => {
+  const path = tmpFile({
+    roles: {
+      good: { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'g1' },
+      relic: { caps: ['VIEW_CHANNEL'], scope: { all: true } }, // no guildId
+      broken: null, // hand-edit damage — must not crash load
+    },
+    personas: { p: { roles: ['good', 'relic'] } },
+  });
+  const store = new PermissionsStore(path);
+  assert.equal(store.getRole('relic'), undefined, 'quarantined roles resolve to nothing');
+  assert.deepEqual(sorted(store.resolve('p', 'g1', 'c')), ['VIEW_CHANNEL'], 'good role unaffected');
+
+  // A mutation persists — quarantined entries must survive the write.
+  store.setPersonaRoles('p2', ['good']);
+  const onDisk = JSON.parse(readFileSync(path, 'utf8'));
+  assert.ok('relic' in onDisk.roles, 'quarantined entry preserved on save');
+  assert.ok('broken' in onDisk.roles, 'malformed entry preserved on save');
+  assert.ok('good' in onDisk.roles);
+  rmSync(path, { force: true });
+});
+
+test('setRole rejects unbound roles', () => {
+  const path = tmpFile({ personas: {} });
+  const store = new PermissionsStore(path);
+  assert.throws(
+    () => store.setRole('nowhere', { caps: ['VIEW_CHANNEL'], scope: { all: true } } as never),
+    /guild-scoped/,
+  );
   rmSync(path, { force: true });
 });
