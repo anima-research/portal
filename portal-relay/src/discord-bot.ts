@@ -12,6 +12,7 @@ import {
   Partials,
   PermissionsBitField,
   ChannelType,
+  MessageType,
   AttachmentBuilder,
   type Guild,
   type GuildMember,
@@ -99,6 +100,134 @@ export interface IncomingReaction {
   userId: string;
   userName: string;
   isBot: boolean;
+  /** One-line snippet of the reacted-to message's text, or null when it has
+   *  none (attachment/embed-only, or the message couldn't be resolved). */
+  messageSnippet: string | null;
+}
+
+/** Cap for the reacted-to-message snippet carried on reaction events. */
+const REACTION_SNIPPET_MAX = 80;
+
+/** One-line snippet of a message body for reaction events: custom-emoji tokens
+ *  rendered to ':name:', whitespace collapsed, capped. Null when there is no
+ *  text (attachment/embed-only) — callers keep the id-only form then.
+ *  (Emoji rendering is inlined here because snippets ride reaction events,
+ *  which bypass the relay's cleanContent rendering in buildPortalMessage.) */
+export function buildReactionSnippet(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const collapsed = text
+    .replace(/<a?:(\w+):\d+>/g, (_full, name: string) => `:${name}:`)
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!collapsed) return null;
+  return collapsed.length > REACTION_SNIPPET_MAX
+    ? `${collapsed.slice(0, REACTION_SNIPPET_MAX - 1)}…`
+    : collapsed;
+}
+
+/** The slice of a discord.js MessageSnapshot that forward rendering reads. */
+interface ForwardSnapshot {
+  content?: string | null;
+  attachments?: { size: number } | null;
+  embeds?: { length: number } | null;
+}
+
+/** Render a forwarded message's snapshots into visible text. Discord forwards
+ *  carry their body in `messageSnapshots` (discord.js ≥14.16), not `content`,
+ *  so without this a bare forward reaches the agent as an empty message.
+ *  Attachment/embed-only snapshots get a bracketed note instead of silence.
+ *  Snapshots have no `cleanContent`, so mention ids stay raw; custom-emoji
+ *  tokens are rendered downstream (buildPortalMessage's cleanContent pass). */
+export function buildForwardedContent(
+  baseContent: string,
+  snapshots: Iterable<ForwardSnapshot>,
+): string {
+  const parts: string[] = [];
+  for (const snap of snapshots) {
+    const text =
+      typeof snap.content === 'string' && snap.content.trim().length > 0 ? snap.content : null;
+    const attachmentCount = snap.attachments?.size ?? 0;
+    const notes: string[] = [];
+    if (attachmentCount > 0) {
+      notes.push(`[${attachmentCount} attachment${attachmentCount === 1 ? '' : 's'}]`);
+    }
+    if (!text && (snap.embeds?.length ?? 0) > 0) notes.push('[embed]');
+    const body = [text, ...notes].filter(Boolean).join(' ');
+    parts.push(`[forwarded message] ${body || '[no text content]'}`);
+  }
+  if (parts.length === 0) return baseContent;
+  const forwarded = parts.join('\n');
+  return baseContent.trim().length > 0 ? `${baseContent}\n${forwarded}` : forwarded;
+}
+
+/** Render a content-less Discord system message the way the human client
+ *  does — from its type. The author of a system message is its subject
+ *  (e.g. the joining member authors the UserJoin message), so downstream
+ *  "Author: <text>" rendering reads naturally. Unknown/new types degrade to
+ *  a generic marker with the numeric type rather than an empty string. */
+export function systemMessageText(type: MessageType): string {
+  switch (type) {
+    case MessageType.UserJoin:
+      return '[joined the server]';
+    case MessageType.GuildBoost:
+      return '[boosted the server]';
+    case MessageType.GuildBoostTier1:
+    case MessageType.GuildBoostTier2:
+    case MessageType.GuildBoostTier3:
+      return '[boosted the server to a new tier]';
+    case MessageType.ChannelPinnedMessage:
+      return '[pinned a message to this channel]';
+    case MessageType.ChannelFollowAdd:
+      return '[followed a channel into this one]';
+    case MessageType.RecipientAdd:
+      return '[added someone to the group]';
+    case MessageType.RecipientRemove:
+      return '[removed someone from the group]';
+    case MessageType.ChannelNameChange:
+      return '[changed the channel name]';
+    case MessageType.ThreadCreated:
+      return '[started a thread]';
+    case MessageType.AutoModerationAction:
+      return '[automod action]';
+    default:
+      return `[system message: type ${type}]`;
+  }
+}
+
+/** Resolve a message's visible body: `cleanContent` when populated (raw
+ *  content otherwise — partial channels can leave it empty), with forwarded
+ *  snapshots rendered in and content-less system messages synthesized from
+ *  their type. Shared by every path through convert() — live, edits, history,
+ *  pins — so forwards/system messages can't regress to empty on any of them.
+ *  Note: unlike discord-mcpl, Reply is excluded from the system-message gate —
+ *  an attachment-only reply is a user message, not a system affordance. */
+export function resolveVisibleContent(m: {
+  content?: string | null;
+  cleanContent?: string | null;
+  type?: MessageType | null;
+  messageSnapshots?: { size: number; values(): Iterable<ForwardSnapshot> } | null;
+}): string {
+  const base =
+    typeof m.cleanContent === 'string' && m.cleanContent.length > 0
+      ? m.cleanContent
+      : (m.content ?? '');
+  const withForwards =
+    m.messageSnapshots && m.messageSnapshots.size > 0
+      ? buildForwardedContent(base, m.messageSnapshots.values())
+      : base;
+  // Discord SYSTEM messages (member joins, boosts, pins…) carry no content —
+  // the Discord client renders them from the type. Forwarding them raw gave
+  // the agent literally empty messages ("Bob: "). Synthesize the same
+  // affordance the human client shows.
+  if (
+    withForwards.length === 0 &&
+    m.type != null &&
+    m.type !== MessageType.Default &&
+    m.type !== MessageType.Reply
+  ) {
+    return systemMessageText(m.type);
+  }
+  return withForwards;
 }
 
 export interface MemberInfo {
@@ -790,6 +919,13 @@ export class DiscordBot implements WebhookOps, RoleOps {
     const emoji = reaction.emoji.id
       ? `${reaction.emoji.name}:${reaction.emoji.id}`
       : (reaction.emoji.name ?? '?');
+    // The reacted-to message can itself be partial (uncached history); fetch it
+    // so the event can carry a content snippet — an id alone is meaningless to
+    // the agent. Best-effort: unresolvable → null snippet.
+    const resolvedMsg = msg.partial ? await msg.fetch().catch(() => null) : msg;
+    const snippetSource = resolvedMsg
+      ? ((resolvedMsg as { cleanContent?: string | null }).cleanContent ?? resolvedMsg.content)
+      : null;
     const evt: IncomingReaction = {
       messageId: msg.id,
       channelId: parentChannelId,
@@ -799,6 +935,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       userId: user.id,
       userName: user.username ?? '',
       isBot: !!user.bot,
+      messageSnippet: buildReactionSnippet(snippetSource),
     };
     (kind === 'reactionAdd' ? this.handlers.reactionAdd : this.handlers.reactionRemove)?.(evt);
   }
@@ -816,12 +953,18 @@ export class DiscordBot implements WebhookOps, RoleOps {
     const channel = msg.channel as GuildBasedChannel;
     const isThread = channel?.isThread?.() ?? false;
     const parentChannelId = isThread ? ((channel as AnyThreadChannel).parentId ?? msg.channelId) : msg.channelId;
-    const rawClean = (msg as { cleanContent?: string }).cleanContent;
     const author = msg.author as User;
+    // A forward's reference points at its ORIGIN message (reference.type =
+    // Forward); only a real reply (type Default = 0) should read as reply-to —
+    // else a forwarded persona message reads as a reply and can falsely WAKE
+    // that persona through the relay's `reply` address reason.
+    const refType = (msg.reference as { type?: number } | null)?.type ?? 0;
     return {
       id: msg.id,
       content: msg.content ?? '',
-      cleanContent: typeof rawClean === 'string' && rawClean.length ? rawClean : (msg.content ?? ''),
+      // cleanContent fallback + forwarded snapshots + system-message synthesis,
+      // shared by live/edit/history/pins since they all pass through convert().
+      cleanContent: resolveVisibleContent(msg),
       authorId: author?.id ?? '',
       authorName: author?.username ?? '',
       authorDisplayName: author?.displayName ?? author?.username ?? '',
@@ -835,7 +978,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       mentionUserIds: msg.mentions?.users?.map((u) => u.id) ?? [],
       mentionRoleIds: msg.mentions?.roles?.map((r) => r.id) ?? [],
       mentionsEveryone: msg.mentions?.everyone ?? false,
-      replyToId: msg.reference?.messageId ?? undefined,
+      replyToId: refType === 0 ? (msg.reference?.messageId ?? undefined) : undefined,
       replyToUserId: msg.mentions?.repliedUser?.id ?? null,
       attachments:
         [...(msg.attachments?.values() ?? [])].map((a) => ({
