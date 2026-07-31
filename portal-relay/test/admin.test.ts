@@ -570,9 +570,17 @@ test('integration: super-admin authors the role catalog', async () => {
     const res = await fetch(`${base}/admin/roles`, {
       method: 'POST',
       headers: { cookie: `portal_admin_session=${session}`, 'content-type': 'application/json', 'x-csrf-token': me.csrf },
-      body: JSON.stringify({ name: 'newrole', role: { caps: ['VIEW_CHANNEL'], scope: { all: true } } }),
+      body: JSON.stringify({ name: 'newrole', role: { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'G1' } }),
     });
     assert.equal(res.status, 200);
+
+    // Roles are guild-scoped: authoring without a guildId is rejected.
+    const unbound = await fetch(`${base}/admin/roles`, {
+      method: 'POST',
+      headers: { cookie: `portal_admin_session=${session}`, 'content-type': 'application/json', 'x-csrf-token': me.csrf },
+      body: JSON.stringify({ name: 'nowhere', role: { caps: ['VIEW_CHANNEL'], scope: { all: true } } }),
+    });
+    assert.equal(unbound.status, 400);
     assert.ok(ctx.permissions.getRole('newrole'), 'role added to catalog');
     const del = await fetch(`${base}/admin/roles/newrole`, {
       method: 'DELETE',

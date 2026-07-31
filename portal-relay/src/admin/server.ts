@@ -584,6 +584,9 @@ export class AdminServer {
       if (typeof name !== 'string' || !name || !role || !Array.isArray(role.caps) || !role.scope) {
         return sendJson(res, 400, err('INVALID', 'name + role{caps,scope} required'));
       }
+      if (typeof role.guildId !== 'string' || !role.guildId) {
+        return sendJson(res, 400, err('INVALID', 'roles are guild-scoped: role.guildId required'));
+      }
       this.deps.permissions.setRole(name, role);
       this.audit.append({ actor: this.actorOf(session), action: 'role.set', target: name, ok: true, after: role });
       return sendJson(res, 200, { ok: true, catalog: this.deps.permissions.allRoles() });

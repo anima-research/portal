@@ -39,7 +39,6 @@ function makeHandler() {
         'chan-role': { caps: ['VIEW_CHANNEL', 'READ_HISTORY'], scope: { channels: [CHAN] }, guildId: GUILD },
         'guild-role': { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: GUILD },
         'g2-role': { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'g2' },
-        unbound: { caps: ['VIEW_CHANNEL'], scope: { all: true } },
       },
       personas: {
         'ash-1': { roles: ['chan-role'] },
@@ -185,18 +184,17 @@ test('/invite mints a single-use invite carrying the given roles', () => {
   }
 });
 
-test('/ban strips guild-scoped roles and denies direct grants; HONESTLY reports surviving access', () => {
+test('/ban fully revokes in this guild; cross-guild roles survive untouched (and grant nothing here)', () => {
   const t = makeHandler();
   try {
-    t.permissions.addPersonaRoles('ash-1', ['unbound']);
+    t.permissions.addPersonaRoles('ash-1', ['g2-role']);
     const reply = t.handler.handle(t.inv('ban', { identity: 'ash-1' }));
     assert.match(reply, /Removed guild role.*`chan-role`/);
-    // A guild admin must not strip a global role (other guilds' access), so
-    // the reply must NOT claim revocation — it must say access survives.
-    assert.match(reply, /Access NOT fully revoked/);
-    assert.match(reply, /`unbound`/);
-    assert.deepEqual(t.permissions.getRoleNames('ash-1'), ['unbound']);
-    assert.deepEqual([...t.permissions.resolveForRoles(['unbound'], GUILD, CHAN)], ['VIEW_CHANNEL']);
+    assert.match(reply, /No remaining access in this guild/);
+    // The g2 role is outside this admin's authority — kept, but inert here.
+    assert.deepEqual(t.permissions.getRoleNames('ash-1'), ['g2-role']);
+    assert.equal(t.permissions.resolve('ash-1', GUILD, CHAN).size, 0);
+    assert.deepEqual([...t.permissions.resolveForRoles(['g2-role'], 'g2', 'any-g2-chan')], ['VIEW_CHANNEL']);
 
     // rhys (inline only): after ban, nothing resolves anywhere in the guild.
     const clean = t.handler.handle(t.inv('ban', { identity: 'rhys-1' }));
@@ -208,27 +206,26 @@ test('/ban strips guild-scoped roles and denies direct grants; HONESTLY reports 
   }
 });
 
-test('guild containment: cross-guild and global roles are superadmin-only in /add-role, /remove-role, /invite', () => {
+test('guild containment: cross-guild roles are superadmin-only in /add-role, /remove-role, /invite', () => {
   const t = makeHandler();
   try {
-    // A guild-A Manage-Server holder must not assign guild-B or global roles.
+    // A guild-A Manage-Server holder must not assign another guild's roles.
     assert.match(t.handler.handle(t.inv('add-role', { identity: 'evander-1', role: 'g2-role' })), /scoped to another guild/);
-    assert.match(t.handler.handle(t.inv('add-role', { identity: 'evander-1', role: 'unbound' })), /guild-unbound/);
     assert.deepEqual(t.permissions.getRoleNames('evander-1'), []);
 
     // Nor mint invites carrying them.
     assert.match(t.handler.handle(t.inv('invite', { role: 'g2-role' })), /not scoped to this guild/);
-    assert.match(t.handler.handle(t.inv('invite', { role: 'chan-role', role2: 'unbound' })), /not scoped to this guild/);
+    assert.match(t.handler.handle(t.inv('invite', { role: 'chan-role', role2: 'g2-role' })), /not scoped to this guild/);
     assert.equal(t.invites.get('inv_TESTCODE'), undefined);
 
-    // Nor strip them (removal changes access outside this guild too).
-    t.permissions.addPersonaRoles('ash-1', ['unbound']);
-    assert.match(t.handler.handle(t.inv('remove-role', { identity: 'ash-1', role: 'unbound' })), /only a portal superadmin/);
-    assert.deepEqual(t.permissions.getRoleNames('ash-1'), ['chan-role', 'unbound']);
+    // Nor strip them (removal changes access outside this guild).
+    t.permissions.addPersonaRoles('ash-1', ['g2-role']);
+    assert.match(t.handler.handle(t.inv('remove-role', { identity: 'ash-1', role: 'g2-role' })), /only a portal superadmin/);
+    assert.deepEqual(t.permissions.getRoleNames('ash-1'), ['chan-role', 'g2-role']);
 
     // Superadmins are exempt on all three.
-    assert.match(t.handler.handle(t.inv('add-role', { identity: 'evander-1', role: 'unbound' }, SUPER)), /now holds `unbound`/);
-    assert.match(t.handler.handle(t.inv('remove-role', { identity: 'ash-1', role: 'unbound' }, SUPER)), /Removed `unbound`/);
+    assert.match(t.handler.handle(t.inv('add-role', { identity: 'evander-1', role: 'g2-role' }, SUPER)), /now holds `g2-role`/);
+    assert.match(t.handler.handle(t.inv('remove-role', { identity: 'ash-1', role: 'g2-role' }, SUPER)), /Removed `g2-role`/);
     assert.match(t.handler.handle(t.inv('invite', { role: 'g2-role' }, SUPER)), /`inv_TESTCODE`/);
   } finally {
     t.cleanup();
@@ -285,18 +282,15 @@ test('autocomplete narrows identity targets per command', () => {
   }
 });
 
-test('autocomplete narrows roles to the guild (globals superadmin-only), and to held roles for remove-role', () => {
+test('autocomplete narrows roles to the guild, and to held roles for remove-role', () => {
   const t = makeHandler();
   try {
-    const all = t.handler.autocomplete({
-      command: 'add-role', guildId: GUILD, channelId: CHAN, invoker: ADMIN, option: 'role', partial: '', options: {},
-    });
-    assert.deepEqual(all.map((c) => c.value).sort(), ['chan-role', 'guild-role']);
-
-    const asSuper = t.handler.autocomplete({
-      command: 'add-role', guildId: GUILD, channelId: CHAN, invoker: SUPER, option: 'role', partial: '', options: {},
-    });
-    assert.deepEqual(asSuper.map((c) => c.value).sort(), ['chan-role', 'guild-role', 'unbound']);
+    for (const invoker of [ADMIN, SUPER]) {
+      const choices = t.handler.autocomplete({
+        command: 'add-role', guildId: GUILD, channelId: CHAN, invoker, option: 'role', partial: '', options: {},
+      });
+      assert.deepEqual(choices.map((c) => c.value).sort(), ['chan-role', 'guild-role']);
+    }
 
     const held = t.handler.autocomplete({
       command: 'remove-role', guildId: GUILD, channelId: CHAN, invoker: ADMIN, option: 'role', partial: '', options: { identity: 'ash-1' },
