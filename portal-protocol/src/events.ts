@@ -31,6 +31,11 @@ export type PortalEvent =
       threadId?: ThreadId;
       messageId: RelayMessageId;
       reaction: PortalReaction;
+      /** One-line snippet of the reacted-to message's text (custom emojis
+       *  rendered, whitespace collapsed, capped) — absent when it has none
+       *  (attachment/embed-only) or on pseudo reactions (the relay stores no
+       *  message bodies to quote from). */
+      messageSnippet?: string;
     }
   | {
       type: 'reaction_remove';
@@ -39,6 +44,8 @@ export type PortalEvent =
       messageId: RelayMessageId;
       emoji: string;
       actor: ReactionActor;
+      /** See reaction_add.messageSnippet. */
+      messageSnippet?: string;
     }
   | { type: 'typing'; channelId: ChannelId; threadId?: ThreadId; author: MessageAuthor }
   /** A channel's pinned-message set changed; clients refetch via list_pins. */

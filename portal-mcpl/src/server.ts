@@ -325,11 +325,11 @@ export class PortalMcplServer {
     // closed channel does not. This is the same lifecycle boundary as messages.
     this.client.on('reactionAdd', (e) => {
       if (e.reaction.kind === 'pseudo') return;
-      this.pushReaction('add', e.channelId, e.messageId, e.reaction.emoji, e.reaction.by[0]?.name ?? 'someone');
+      this.pushReaction('add', e.channelId, e.messageId, e.reaction.emoji, e.reaction.by[0]?.name ?? 'someone', e.messageSnippet);
     });
     this.client.on('reactionRemove', (e) => {
       if (e.actor.kind === 'persona') return;
-      this.pushReaction('remove', e.channelId, e.messageId, e.emoji, e.actor.name);
+      this.pushReaction('remove', e.channelId, e.messageId, e.emoji, e.actor.name, e.messageSnippet);
     });
     this.client.on('messageDelete', (e) => {
       if (!this.conn || !this.mcplEnabled) return;
@@ -444,12 +444,16 @@ export class PortalMcplServer {
     messageId: string,
     emoji: string,
     reactorName: string,
+    messageSnippet?: string,
   ): void {
     if (!this.conn || !this.mcplEnabled) return;
     if (!this.openChannels.has(channelId)) return;
     const verb = action === 'add' ? 'reacted' : 'removed a reaction';
     const shown = renderReactionEmoji(emoji);
-    const line = `[reaction] @${reactorName} ${verb} ${shown} on message ${messageId} in ${this.channelLabel(channelId)}`;
+    // Carry a snippet of the reacted-to message when it has text — a bare
+    // message id is meaningless to the agent (it can't look messages up).
+    const quoted = messageSnippet ? ` — "${messageSnippet}"` : '';
+    const line = `[reaction] @${reactorName} ${verb} ${shown} on message ${messageId} in ${this.channelLabel(channelId)}${quoted}`;
     this.conn
       .sendRequest(method.PUSH_EVENT, {
         featureSet: 'portal.messaging',

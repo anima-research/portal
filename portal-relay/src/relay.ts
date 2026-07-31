@@ -1032,6 +1032,7 @@ export class Relay implements GatewayHooks {
           threadId: r.threadId,
           messageId: relayId,
           reaction: { emoji: r.emoji, count: 1, kind: 'native', by: [actor] },
+          messageSnippet: r.messageSnippet ?? undefined,
         });
       } else {
         this.gateway.dispatch(personaId, {
@@ -1041,6 +1042,7 @@ export class Relay implements GatewayHooks {
           messageId: relayId,
           emoji: r.emoji,
           actor,
+          messageSnippet: r.messageSnippet ?? undefined,
         });
       }
     }

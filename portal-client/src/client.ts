@@ -56,6 +56,9 @@ export interface PortalClientEvents extends Record<string, (...args: never[]) =>
     threadId?: string;
     messageId: string;
     reaction: PortalReaction;
+    /** One-line snippet of the reacted-to message's text — absent on pseudo
+     *  reactions and text-less (attachment/embed-only) messages. */
+    messageSnippet?: string;
   }) => void;
   reactionRemove: (e: {
     channelId: string;
@@ -63,6 +66,8 @@ export interface PortalClientEvents extends Record<string, (...args: never[]) =>
     messageId: string;
     emoji: string;
     actor: ReactionActor;
+    /** See reactionAdd.messageSnippet. */
+    messageSnippet?: string;
   }) => void;
   /** Any dispatch event, after the cache has been updated. */
   event: (e: PortalEvent) => void;
@@ -293,6 +298,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
           threadId: event.threadId,
           messageId: event.messageId,
           reaction: event.reaction,
+          messageSnippet: event.messageSnippet,
         });
         break;
       case 'reaction_remove':
@@ -302,6 +308,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
           messageId: event.messageId,
           emoji: event.emoji,
           actor: event.actor,
+          messageSnippet: event.messageSnippet,
         });
         break;
       case 'channel_create':
