@@ -33,6 +33,7 @@ import { RolePool } from './role-pool.js';
 import { WebhookPool } from './webhook-pool.js';
 import { AdminServer, type AdminDeps } from './admin/server.js';
 import { AuditLog } from './admin/audit.js';
+import { SlashHandler } from './slash.js';
 
 export class Relay implements GatewayHooks {
   private bot: DiscordBot;
@@ -58,6 +59,7 @@ export class Relay implements GatewayHooks {
    */
   private deliveredCaps = new Map<string, Map<string, string>>();
   private admin?: AdminServer;
+  private slash: SlashHandler;
   /** Shared audit log (RFC-005). Present only when the admin panel is enabled;
    *  self-service ops (claim_invite / rotate_token) audit here too. */
   private audit?: AuditLog;
@@ -124,6 +126,21 @@ export class Relay implements GatewayHooks {
       };
       this.admin = new AdminServer(deps);
     }
+    // In-Discord admin: slash commands over the same stores the panel uses.
+    // Gate = Manage-Server in the guild OR a configured superadmin; every
+    // invocation audits alongside panel actions.
+    this.slash = new SlashHandler({
+      identity: this.identity,
+      permissions: this.permissions,
+      invites: this.invites,
+      audit: this.audit,
+      superadmins: config.admin?.superadmins ?? [],
+      guildAdmins: config.admin?.guildAdmins ?? {},
+      capsFor: (personaId, channelId, guildId) => this.capsFor(personaId, channelId, guildId),
+      canAccessGuild: (personaId, guildId) => this.personaCanAccessGuild(personaId, guildId),
+      resync: (personaId) => this.resyncPersona(personaId),
+      newInviteCode: () => `inv_${randomBytes(18).toString('base64url')}`,
+    });
   }
 
   async start(): Promise<void> {
@@ -141,6 +158,8 @@ export class Relay implements GatewayHooks {
     });
     this.bot.on('channelChange', (meta, kind) => this.onBotChannelChange(meta, kind));
     this.bot.on('channelDelete', (channelId, guildId) => this.onBotChannelDelete(channelId, guildId));
+    this.bot.on('slashCommand', (inv) => this.slash.handle(inv));
+    this.bot.on('slashAutocomplete', (req) => this.slash.autocomplete(req));
     this.bot.on('ready', () => this.mirror.clear());
     // A pre-authorized guild (allow-listed before the bot joined) lights up the
     // moment the bot joins it; discord-bot only fires this for allowed guilds.
@@ -229,6 +248,7 @@ export class Relay implements GatewayHooks {
   private onGuildAllowChange(c: GuildAllowChange): void {
     for (const gid of c.added) {
       this.mirror.invalidateGuild(gid);
+      void this.bot.syncSlashCommands(gid).catch((e) => console.error('[portal-relay] slash sync:', (e as Error).message));
       // Accessor is live: an allowed+joined guild shows up here. Not found ⇒
       // pre-authorized but not joined yet — dormant until guildCreate fires.
       const g = this.bot.listGuilds().find((x) => x.id === gid);
@@ -332,6 +352,31 @@ export class Relay implements GatewayHooks {
 
   private forgetChannelCaps(channelId: string): void {
     for (const byChannel of this.deliveredCaps.values()) byChannel.delete(channelId);
+  }
+
+  /**
+   * Force-push the full channel set (with current caps) to one persona's
+   * stream (/resync). Upserts fix missing channels and stale caps; it cannot
+   * remove stale extras the client invented — a fresh identify does that.
+   * No-op for personas with no retained stream (never identified since boot):
+   * dispatch() would CREATE a stream, silently flipping them into the
+   * stream-retained fan-out set.
+   */
+  resyncPersona(personaId: string): number {
+    if (!this.gateway.hasStream(personaId)) return 0;
+    let pushed = 0;
+    for (const g of this.bot.listGuilds()) {
+      for (const meta of this.bot.listChannelMetas(g.id)) {
+        const channel = this.toPortalChannel(meta, personaId);
+        this.rememberCaps(personaId, channel.id, channel.capabilities);
+        this.gateway.dispatch(
+          personaId,
+          meta.isThread ? { type: 'thread_update', channel } : { type: 'channel_update', channel },
+        );
+        pushed++;
+      }
+    }
+    return pushed;
   }
 
   /** Ensure every connected persona has an addressing role wherever it can act,

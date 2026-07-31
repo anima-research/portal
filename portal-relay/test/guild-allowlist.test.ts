@@ -123,6 +123,7 @@ function makeRelay() {
     channelForPerms: () => ({ guildId: GUILD, permissionsFor: () => ({ has: () => true }) }),
     meIn: () => ({}),
     isGuildAllowed: (gid: string) => store.has(gid),
+    syncSlashCommands: async () => {},
   };
   const dispatched: Array<{ personaId: string; event: any }> = [];
   relay.gateway = {

@@ -98,8 +98,21 @@ export class PermissionsStore {
   resolve(personaId: string, guildId: string | null, channelId: string): Set<Capability> {
     const entry = this.personas.get(personaId);
     if (!entry) return new Set(this.fileDefault);
+    const out = this.resolveForRoles(entry.roles ?? [], guildId, channelId);
+    if (entry.policy) {
+      for (const c of this.resolvePolicy(entry.policy, guildId, channelId)) out.add(c);
+    }
+    return out;
+  }
+
+  /**
+   * Policy-level caps a hypothetical persona holding exactly `roleNames` would
+   * have in (guildId, channelId). Backs resolve(), and lets callers attribute
+   * WHICH held role contributes access (slash /caps, /remove explanations).
+   */
+  resolveForRoles(roleNames: string[], guildId: string | null, channelId: string): Set<Capability> {
     const out = new Set<Capability>();
-    for (const name of entry.roles ?? []) {
+    for (const name of roleNames) {
       const role = this.roles.get(name);
       if (!role) continue;
       const isMirror = 'mirrorRole' in role.scope || 'mirrorRoles' in role.scope;
@@ -110,9 +123,6 @@ export class PermissionsStore {
       } else if (this.scopeIncludes(role.scope, role.guildId, guildId, channelId)) {
         for (const c of role.caps) out.add(c);
       }
-    }
-    if (entry.policy) {
-      for (const c of this.resolvePolicy(entry.policy, guildId, channelId)) out.add(c);
     }
     return out;
   }
@@ -304,6 +314,19 @@ export class PermissionsStore {
       this.persist();
       this.emit({ personaId, scope: 'channel', guildId, channelId });
     }
+  }
+
+  /** Hard-deny a persona's inline policy in one guild: drops every channel
+   *  grant and pins the guild default to [] (an explicit deny — deleting the
+   *  subtree would fall back to the persona default instead). Used by /ban;
+   *  guild-scoped access ROLES are removed separately by the caller. */
+  clearGuild(personaId: string, guildId: string): void {
+    const entry = this.personas.get(personaId);
+    if (!entry) return;
+    const policy = (entry.policy ??= { default: [] });
+    (policy.guilds ??= {})[guildId] = { default: [] };
+    this.persist();
+    this.emit({ personaId, scope: 'guild', guildId });
   }
 
   /** Create/replace a named access role in the catalog (super-admin authoring,
