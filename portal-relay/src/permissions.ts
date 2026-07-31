@@ -56,6 +56,10 @@ export type PermissionChange = {
 export class PermissionsStore {
   private personas = new Map<string, PersonaEntry>();
   private roles = new Map<string, AccessRole>();
+  /** Catalog entries refused at load (no guildId / malformed): excluded from
+   *  resolution but written back verbatim on persist — quarantine, not
+   *  deletion. A live entry created under the same name wins on merge. */
+  private quarantinedRoles: Record<string, unknown> = {};
   private fileDefault: Capability[] = [];
   private listeners: Array<(c: PermissionChange) => void> = [];
   private file?: WatchedFile;
@@ -159,7 +163,7 @@ export class PermissionsStore {
     }
     // mirror{Role,Roles}: inherently per-guild; deny if no guild, cross-guild, or no lookup.
     if (!guildId) return false;
-    if (roleGuildId && roleGuildId !== guildId) return false;
+    if (!roleGuildId || roleGuildId !== guildId) return false;
     const mv = this.mirrorLookup;
     if (!mv) return false; // fail-closed: never a stale allow
     // Union: in scope iff ANY mirrored role can view the channel.
@@ -179,7 +183,7 @@ export class PermissionsStore {
     const out = new Set<Capability>();
     if (!('mirrorRole' in scope) && !('mirrorRoles' in scope)) return out;
     if (!guildId) return out;
-    if (roleGuildId && roleGuildId !== guildId) return out;
+    if (!roleGuildId || roleGuildId !== guildId) return out;
     const mv = this.mirrorLookup;
     if (!mv) return out; // fail-closed
     const roleIds = 'mirrorRoles' in scope ? scope.mirrorRoles : [scope.mirrorRole];
@@ -254,11 +258,17 @@ export class PermissionsStore {
     if (pol) {
       const g = pol.guilds?.[guildId];
       if (g) {
-        // A guild entry SHADOWS the legacy global default (mirrors
-        // resolvePolicy's channel ?? guild ?? default order) — an explicit
-        // deny ({default: []}, e.g. /ban) must not fall through to it.
         if (g.default && g.default.length > 0) return true;
         if (g.channels && Object.values(g.channels).some((caps) => caps.length > 0)) return true;
+        // Mirror resolvePolicy exactly (channel ?? guild ?? default): an
+        // UNDEFINED g.default is transparent — channels not in g.channels
+        // still fall through to the legacy persona default — while an
+        // explicit deny ({default: []}, e.g. /ban) shadows it. Getting this
+        // wrong under-reports for the canonical legacy persona shape
+        // (nonempty default + channel-only guild entries) and unbinds
+        // addressing roles / silences ambient dispatch while resolve()
+        // still grants.
+        if (g.default === undefined && pol.default.length > 0) return true;
       } else if (pol.default.length > 0) {
         return true; // legacy global default applies where no guild entry says otherwise
       }
@@ -338,6 +348,15 @@ export class PermissionsStore {
     // ensureGuild (not personas.get) so a persona with NO permissions entry
     // gets one pinned to deny — otherwise a /ban of a file-default persona
     // would silently no-op and the file default would keep applying.
+    //
+    // Guild containment of the side effect: creating the entry stops the
+    // FILE default from applying to this persona ANYWHERE (resolve() only
+    // consults it for entry-less personas). Seed the persona default from a
+    // snapshot of it so a guild-scoped ban denies exactly this guild and
+    // leaves the persona's standing in every other guild unchanged.
+    if (!this.personas.has(personaId) && this.fileDefault.length > 0) {
+      this.ensurePolicy(personaId).default = [...this.fileDefault];
+    }
     const g = this.ensureGuild(personaId, guildId);
     g.default = [];
     delete g.channels;
@@ -397,15 +416,20 @@ export class PermissionsStore {
     const oldJson = new Map([...this.personas].map(([id, p]) => [id, JSON.stringify(p)]));
     const oldRolesJson = JSON.stringify([...this.roles].sort());
     this.fileDefault = next.default ?? [];
-    // Roles are guild-scoped, PERIOD: a role without a guild binding is
-    // ignored (fail-closed) rather than resolving fleet-wide. Loud, because a
-    // hand-edited catalog entry silently granting nothing is a debugging trap.
+    // Roles are guild-scoped, PERIOD: a role without a guild binding (or a
+    // malformed entry) is INERT (fail-closed) rather than resolving
+    // fleet-wide. Loud, because a catalog entry silently granting nothing is
+    // a debugging trap. Quarantined — not dropped — so the next persist()
+    // doesn't destroy config the operator intends to repair.
+    this.quarantinedRoles = {};
     this.roles = new Map(
       Object.entries(next.roles ?? {}).filter(([name, role]) => {
-        if (!role.guildId) {
+        if (!role || !role.guildId) {
           console.error(
-            `[portal-relay] permissions: role "${name}" has no guildId — roles are guild-scoped; ignoring it (fail-closed)`,
+            `[portal-relay] permissions: role "${name}" has no guildId — roles are guild-scoped; ` +
+              `treating it as INERT until it gets one (entry preserved on save)`,
           );
+          this.quarantinedRoles[name] = role;
           return false;
         }
         return true;
@@ -431,9 +455,13 @@ export class PermissionsStore {
   }
 
   private persist(): void {
+    const quarantined = Object.keys(this.quarantinedRoles).length;
     const data: PermissionsFile = {
       default: this.fileDefault.length ? this.fileDefault : undefined,
-      roles: this.roles.size ? Object.fromEntries(this.roles) : undefined,
+      roles:
+        this.roles.size || quarantined
+          ? ({ ...this.quarantinedRoles, ...Object.fromEntries(this.roles) } as PermissionsFile['roles'])
+          : undefined,
       personas: Object.fromEntries(
         [...this.personas].map(([id, e]) => [id, fromEntry(e)]),
       ),

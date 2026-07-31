@@ -234,3 +234,78 @@ test('setPersonaPolicy / setPersonaRoles persist and round-trip', () => {
   assert.deepEqual((onDisk.personas.p2 as { roles: string[] }).roles, ['r']);
   rmSync(path, { force: true });
 });
+
+// ── Guild-scoped roles hardening: review regressions (PR #9) ──
+
+test('couldAccessGuild mirrors resolvePolicy transparency: undefined guild default falls through; explicit [] shadows', () => {
+  const path = tmpFile({
+    personas: {
+      // Canonical legacy shape: nonempty persona default + channel-only guild entry.
+      lena: { policy: { default: ['VIEW_CHANNEL'], guilds: { g1: { channels: { c1: ['VIEW_CHANNEL'] } } } } },
+      // /ban shape: explicit guild deny must SHADOW the nonempty default.
+      banned: { policy: { default: ['VIEW_CHANNEL'], guilds: { g1: { default: [] } } } },
+    },
+  });
+  const store = new PermissionsStore(path);
+  // resolve grants via fall-through — couldAccessGuild must agree (a mismatch
+  // unbinds addressing roles and silences ambient dispatch while the persona
+  // can still act: deaf-but-speaking).
+  assert.deepEqual(sorted(store.resolve('lena', 'g1', 'other-chan')), ['VIEW_CHANNEL']);
+  assert.equal(store.couldAccessGuild('lena', 'g1', () => false), true);
+  // Explicit deny: both sides deny in g1, default still applies elsewhere.
+  assert.deepEqual(sorted(store.resolve('banned', 'g1', 'any')), []);
+  assert.equal(store.couldAccessGuild('banned', 'g1', () => false), false);
+  assert.equal(store.couldAccessGuild('banned', 'g2', () => false), true);
+  rmSync(path, { force: true });
+});
+
+test('clearGuild creates the entry for entry-less personas and contains the side effect to one guild', () => {
+  const path = tmpFile({ default: ['VIEW_CHANNEL'], personas: {} });
+  const store = new PermissionsStore(path);
+  // Entry-less persona rides the FILE default everywhere.
+  assert.deepEqual(sorted(store.resolve('ghost', 'g1', 'c')), ['VIEW_CHANNEL']);
+  assert.deepEqual(sorted(store.resolve('ghost', 'g2', 'c')), ['VIEW_CHANNEL']);
+
+  store.clearGuild('ghost', 'g1');
+
+  // Denied in the banned guild — but NOT fleet-wide: the entry creation
+  // seeded the persona default from the file default, so other guilds keep
+  // working (a guild-scoped /ban must not have fleet-wide collateral).
+  assert.deepEqual(sorted(store.resolve('ghost', 'g1', 'c')), []);
+  assert.equal(store.couldAccessGuild('ghost', 'g1', () => false), false);
+  assert.deepEqual(sorted(store.resolve('ghost', 'g2', 'c')), ['VIEW_CHANNEL']);
+  assert.equal(store.couldAccessGuild('ghost', 'g2', () => false), true);
+  rmSync(path, { force: true });
+});
+
+test('unbound/malformed catalog entries are quarantined: inert in resolution, preserved across persist', () => {
+  const path = tmpFile({
+    roles: {
+      good: { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'g1' },
+      relic: { caps: ['VIEW_CHANNEL'], scope: { all: true } }, // no guildId
+      broken: null, // hand-edit damage — must not crash load
+    },
+    personas: { p: { roles: ['good', 'relic'] } },
+  });
+  const store = new PermissionsStore(path);
+  assert.equal(store.getRole('relic'), undefined, 'quarantined roles resolve to nothing');
+  assert.deepEqual(sorted(store.resolve('p', 'g1', 'c')), ['VIEW_CHANNEL'], 'good role unaffected');
+
+  // A mutation persists — quarantined entries must survive the write.
+  store.setPersonaRoles('p2', ['good']);
+  const onDisk = JSON.parse(readFileSync(path, 'utf8'));
+  assert.ok('relic' in onDisk.roles, 'quarantined entry preserved on save');
+  assert.ok('broken' in onDisk.roles, 'malformed entry preserved on save');
+  assert.ok('good' in onDisk.roles);
+  rmSync(path, { force: true });
+});
+
+test('setRole rejects unbound roles', () => {
+  const path = tmpFile({ personas: {} });
+  const store = new PermissionsStore(path);
+  assert.throws(
+    () => store.setRole('nowhere', { caps: ['VIEW_CHANNEL'], scope: { all: true } } as never),
+    /guild-scoped/,
+  );
+  rmSync(path, { force: true });
+});
