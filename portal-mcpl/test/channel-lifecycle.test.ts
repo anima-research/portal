@@ -5,6 +5,27 @@ import type { PortalChannel, PortalMessage } from '@animalabs/portal-protocol';
 import { AgentState } from '../src/agent-state.js';
 import { PortalAgent } from '../src/agent.js';
 import { PortalMcplServer } from '../src/server.js';
+import { featureSets } from '../src/feature-sets.js';
+
+/**
+ * Stand in for the host's §5.3 initial policy Request with a full grant.
+ *
+ * Every server→host channel and push path is capability-gated now (§5.4), so a
+ * harness that skips this is exercising a server that has correctly refused to
+ * do anything. `grant()` is what a conforming host does before any of it runs.
+ */
+function grant(server: PortalMcplServer, effectiveCapabilities?: string[]): void {
+  const internal = server as unknown as {
+    mcplEnabled: boolean;
+    policy: { applyRequest(params: unknown): unknown };
+  };
+  internal.mcplEnabled = true;
+  internal.policy.applyRequest({
+    effectiveCapabilities:
+      effectiveCapabilities ??
+      [...new Set(Object.values(featureSets).flatMap((set) => set.uses as string[]))],
+  });
+}
 
 const channel: PortalChannel = {
   id: '1526659685036331058',
@@ -70,7 +91,7 @@ test('initial registration migrates legacy subscriptions and advertises capabili
     },
     sendNotification() {},
   };
-  internal.mcplEnabled = true;
+  grant(server);
 
   await internal.registerChannels();
 
@@ -216,7 +237,7 @@ test('a ping in a closed channel carries its exact MCPL channel id', async () =>
       return {};
     },
   };
-  internal.mcplEnabled = true;
+  grant(server);
 
   internal.pushMessage(message('m1', '2026-01-01T00:00:00Z'), true, ['role_mention']);
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -283,7 +304,7 @@ async function registeredServer() {
       notifications.push({ method, params });
     },
   };
-  internal.mcplEnabled = true;
+  grant(server);
   internal.wireClient();
   await internal.registerChannels();
   requests.length = 0;
@@ -403,7 +424,7 @@ test('a removal landing during the in-flight initial register is retracted after
       notifications.push({ method, params });
     },
   };
-  internal.mcplEnabled = true;
+  grant(server);
   internal.wireClient();
 
   const registration = internal.registerChannels();
