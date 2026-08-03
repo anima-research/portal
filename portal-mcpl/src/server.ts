@@ -39,7 +39,65 @@ import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
 import type { PortalAgent } from './agent.js';
 import type { PendingPing } from './agent-state.js';
 import { parsePortalChannelId, portalChannelId, toDescriptor } from './channels.js';
-import { featureSets } from './feature-sets.js';
+import { featureSets, TOOL_FEATURE_SETS } from './feature-sets.js';
+import {
+  McplPolicy,
+  MalformedPolicyError,
+  type CapabilityPath,
+  type FeatureSetsUpdateParams,
+} from './policy.js';
+
+/** Appendix A error codes. */
+const ERR_FEATURE_SET_NOT_ENABLED = -32001;
+const ERR_CAPABILITY_DENIED = -32002;
+const ERR_INVALID_PARAMS = -32602;
+
+/** The feature set every server-initiated message on the message path is
+ *  tagged with (§6.5). */
+const MESSAGING = 'portal.messaging';
+
+/**
+ * SPEC §14.1's table, plus MCP's tool methods, expressed as the capability each
+ * INBOUND method requires. Channel methods carry no `featureSet` field and are
+ * authorized by the grant alone — §14.1 is explicit that feature sets "are not
+ * the authorization" for them. Tool calls additionally check the feature set
+ * that owns the tool, because a feature set is a named bundle of behavior (§6)
+ * and a disabled bundle must stop answering.
+ */
+const INBOUND_CAPABILITY: Readonly<Record<string, CapabilityPath>> = {
+  'tools/call': 'tools',
+  [method.CHANNELS_LIST]: 'channels.register',
+  [method.CHANNELS_OPEN]: 'channels.lifecycle',
+  [method.CHANNELS_CLOSE]: 'channels.lifecycle',
+  [method.CHANNELS_ACKNOWLEDGE]: 'channels.acknowledge',
+  [method.CHANNELS_PUBLISH]: 'channels.publish',
+};
+
+/**
+ * MCPL channel capabilities as §14.1 defines them — an object whose members are
+ * the leaves of §6.2's vocabulary. The resolved @animalabs/mcpl-core 0.2.2 types
+ * still declare `channels` as a bare boolean and `featureSets` as an array, so
+ * the 0.5 shapes are declared locally and cast at the wire boundary.
+ */
+interface ChannelsCapability {
+  register?: boolean;
+  lifecycle?: boolean;
+  publish?: boolean;
+  incoming?: boolean;
+  streaming?: boolean;
+  acknowledge?: boolean;
+  typing?: boolean;
+}
+
+/**
+ * §14.5 — `channels/register` and `channels/changed` carry *arrays* of
+ * descriptors and the host MUST authorize each independently, so the Request
+ * form returns one entry per submitted descriptor. Not in the resolved core
+ * types; declared here so the itemization can actually be read.
+ */
+interface ChannelRegistrationResults {
+  results?: Array<{ id?: unknown; accepted?: unknown; reason?: unknown }>;
+}
 
 export class PortalMcplServer {
   private conn: McplConnection | null = null;
@@ -51,6 +109,12 @@ export class PortalMcplServer {
    * and the host needs a channels/changed `updated` entry (issue #5).
    */
   private advertised = new Map<string, string>();
+  /** Descriptors the host itemized as *rejected* (§14.5): id → the descriptor
+   *  key it refused. Kept so re-registration does not hot-loop on a channel the
+   *  host will keep refusing. A rejection is diagnostics (§6.6) — it narrows
+   *  what we believe is registered and never re-grants anything; a changed
+   *  descriptor is offered once more, because it is a different question. */
+  private rejected = new Map<string, string>();
   /** Raw relay channel ids whose removal was observed but not yet retracted
    *  (a removal can land while channels/register is in flight, before
    *  `advertised` is stamped — retracting inline would silently miss it). */
@@ -65,6 +129,13 @@ export class PortalMcplServer {
    *  reconnect doesn't re-wake for the same offline-accrued pings. */
   private wokenPings = new Set<string>();
   private eventSeq = 0;
+  /**
+   * The connection's effective capability grant and derived feature sets
+   * (§5.4/§6.4). Nothing capability-dependent runs until the host's initial
+   * `featureSets/update` Request lands (§5.3) — `McplPolicy` denies everything
+   * until then, and this object is the ONLY thing consulted for authorization.
+   */
+  private policy = new McplPolicy(featureSets);
 
   constructor(
     private client: PortalClient,
@@ -74,17 +145,19 @@ export class PortalMcplServer {
   async serve(conn: McplConnection): Promise<void> {
     this.conn = conn;
     this.advertised.clear();
+    this.rejected.clear();
     this.pendingRemovals.clear();
     this.openChannels.clear();
     this.initialRegistrationComplete = false;
     this.registrationInFlight = null;
+    this.policy.reset();
+    for (const diagnostic of this.policy.declarationDiagnostics()) {
+      console.error('[portal-mcpl] declaration problem:', diagnostic);
+    }
     this.wireClient();
     await this.handleInitialize();
-    if (this.mcplEnabled) {
-      void this.registerChannels().catch((err) =>
-        console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
-      );
-    }
+    // §5.3: no channels/register, no push, no anything until policy arrives.
+    // `onPolicyActivated()` starts registration once the host has spoken.
 
     try {
       while (!conn.isClosed) {
@@ -112,16 +185,28 @@ export class PortalMcplServer {
     const params = msg.request.params as McplInitializeParams | undefined;
     this.mcplEnabled = params?.capabilities?.experimental?.mcpl !== undefined;
 
-    const serverCaps: McplCapabilities = {
-      version: '0.4',
+    // §5.1: the advertisement mirrors the capability paths, leaf by leaf. Only
+    // what this server actually implements is claimed — no `channels.streaming`
+    // (no channels/outgoing/* handler) and no `channels.typing`.
+    const serverCaps: Omit<McplCapabilities, 'channels'> & { channels: ChannelsCapability } = {
+      version: '0.5',
       pushEvents: true,
-      channels: true,
+      channels: {
+        register: true,
+        lifecycle: true,
+        publish: true,
+        incoming: true,
+        acknowledge: true,
+      },
       rollback: false,
-      featureSets,
+      // §6.1 / App. B.2: keyed by name, not an array with a `name` member.
+      featureSets: featureSets as unknown as McplCapabilities['featureSets'],
     };
     const capabilities: InitializeCapabilities = {
-      tools: {},
-      ...(this.mcplEnabled && { experimental: { mcpl: serverCaps } }),
+      // listChanged: the tool surface follows the enabled feature sets, so it
+      // changes when policy lands or is narrowed (§6.4).
+      tools: { listChanged: true },
+      ...(this.mcplEnabled && { experimental: { mcpl: serverCaps as unknown as McplCapabilities } }),
     };
     const result: McplInitializeResult = {
       protocolVersion: '2024-11-05',
@@ -138,17 +223,74 @@ export class PortalMcplServer {
 
   // ── Requests ──
 
+  /**
+   * Refuse anything the host did not grant, before the handler runs.
+   *
+   * Returns false when it has already answered with an error. §6.6: a method
+   * that will never be answered MUST return an error, and the rejection is
+   * diagnostics — it never re-opens anything.
+   */
+  private authorizeInbound(req: JsonRpcRequest): boolean {
+    const conn = this.conn!;
+    if (!this.mcplEnabled) return true; // plain MCP host: §3.2, MCPL never applies
+    const required = INBOUND_CAPABILITY[req.method];
+    if (required === undefined) return true;
+    if (!this.policy.isReady) {
+      conn.sendError(
+        req.id,
+        ERR_CAPABILITY_DENIED,
+        `capability denied: ${required} — no featureSets/update policy received yet (SPEC §5.3)`,
+      );
+      return false;
+    }
+    if (!this.policy.allows(required)) {
+      conn.sendError(req.id, ERR_CAPABILITY_DENIED, `capability denied: ${required}`);
+      return false;
+    }
+    return true;
+  }
+
+  /** The tools whose owning feature set is currently enabled. Empty before the
+   *  initial policy exchange (§5.3) — the surface is honest about being off. */
+  private availableTools(): typeof this.agent.tools {
+    if (!this.mcplEnabled) return this.agent.tools;
+    if (!this.policy.allows('tools')) return [];
+    return this.agent.tools.filter((tool) =>
+      this.policy.featureEnabled(TOOL_FEATURE_SETS[tool.name] ?? ''),
+    );
+  }
+
   private async handleRequest(req: JsonRpcRequest): Promise<void> {
     const conn = this.conn!;
     const params = (req.params ?? {}) as Record<string, unknown>;
+    // Policy itself is never gated by policy.
+    if (req.method === method.FEATURE_SETS_UPDATE) {
+      this.handlePolicyRequest(req);
+      return;
+    }
+    if (!this.authorizeInbound(req)) return;
     try {
       switch (req.method) {
         case 'tools/list':
-          conn.sendResponse(req.id, { tools: this.agent.tools });
+          conn.sendResponse(req.id, { tools: this.availableTools() });
           break;
         case 'tools/call': {
+          const toolName = params.name as string;
+          // A tool with no declared feature set is unauthorizable, so it is
+          // refused rather than defaulted on (§6.4 fails closed).
+          const owningSet = TOOL_FEATURE_SETS[toolName];
+          if (this.mcplEnabled && (owningSet === undefined || !this.policy.featureEnabled(owningSet))) {
+            conn.sendError(
+              req.id,
+              owningSet === undefined ? ERR_CAPABILITY_DENIED : ERR_FEATURE_SET_NOT_ENABLED,
+              owningSet === undefined
+                ? `tool ${toolName} has no declared feature set`
+                : `feature set not enabled: ${owningSet}`,
+            );
+            break;
+          }
           const out = await this.agent.handleToolCall(
-            params.name as string,
+            toolName,
             (params.arguments ?? {}) as Record<string, unknown>,
           );
           conn.sendResponse(req.id, { content: [textContent(stringify(out))] });
@@ -196,8 +338,77 @@ export class PortalMcplServer {
     }
   }
 
-  private handleNotification(_n: JsonRpcNotification): void {
-    /* featureSets/update etc. — no-op for now (all sets enabled by default). */
+  /**
+   * `featureSets/update` as a **Request** (§5.3 / §6.7): the host's effective
+   * grant arrives, and the response is a degradation receipt.
+   *
+   * The receipt is consequence testimony only (§6.7): it names which declared
+   * feature sets stopped working and what each was missing. It never asserts an
+   * entitlement, and this server never refuses — a portal connector degrades
+   * usefully (its tools and publish path are independent of its push path), so
+   * `accepted: false` would be a coercion-shaped message with no honest content.
+   */
+  private handlePolicyRequest(req: JsonRpcRequest): void {
+    const conn = this.conn!;
+    try {
+      const receipt = this.policy.applyRequest(req.params as FeatureSetsUpdateParams | undefined);
+      conn.sendResponse(req.id, receipt);
+      for (const note of receipt.notes) console.error('[portal-mcpl] policy note:', note);
+      for (const gone of receipt.unavailableFeatures) {
+        console.error(
+          `[portal-mcpl] feature set disabled: ${gone.featureSet} (${gone.reason}` +
+            `${gone.missingCapabilities ? `: ${gone.missingCapabilities.join(', ')}` : ''})`,
+        );
+      }
+      // The tool surface follows the enabled sets, so the host must re-list.
+      conn.sendNotification('notifications/tools/list_changed', {});
+      this.onPolicyActivated();
+    } catch (err) {
+      // §5.4: a malformed policy message fails closed. `applyRequest` has
+      // already dropped us back to "nothing granted"; say so and stop.
+      const message = (err as Error).message;
+      console.error('[portal-mcpl] policy rejected, all capabilities denied:', message);
+      conn.sendError(
+        req.id,
+        err instanceof MalformedPolicyError ? ERR_INVALID_PARAMS : -32000,
+        `malformed featureSets/update: ${message}`,
+      );
+    }
+  }
+
+  /**
+   * Work that was held back waiting for a grant (§5.3), or newly permitted by an
+   * expansion. §6.7's expansion ordering is the host's: it sends the Request and
+   * waits for the receipt before it begins accepting newly granted traffic — so
+   * this runs *after* `sendResponse`, never before. Both are idempotent
+   * (`advertised` / `wokenPings`), so re-running on an unchanged policy is a
+   * no-op rather than duplicate traffic.
+   */
+  private onPolicyActivated(): void {
+    if (this.canRegister()) {
+      void this.registerChannels().catch((err) =>
+        console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
+      );
+    }
+    if (this.canPush()) {
+      void this.catchUp().catch((err) =>
+        console.error('[portal-mcpl] catch-up failed:', (err as Error).message),
+      );
+    }
+  }
+
+  private handleNotification(n: JsonRpcNotification): void {
+    if (n.method === method.FEATURE_SETS_UPDATE) {
+      // §6.7: a Notification may not alter the grant and cannot establish a
+      // ready state. Reductions are applied; everything else is logged and
+      // dropped, because honouring an expansion here would let the host widen
+      // us on a path neither side has acknowledged.
+      const diagnostics = this.policy.applyNotification(
+        n.params as FeatureSetsUpdateParams | undefined,
+      );
+      for (const diagnostic of diagnostics) console.error('[portal-mcpl] policy:', diagnostic);
+      if (diagnostics.length) this.conn?.sendNotification('notifications/tools/list_changed', {});
+    }
   }
 
   private async handlePublish(pub: ChannelsPublishParams): Promise<ChannelsPublishResult> {
@@ -281,18 +492,55 @@ export class PortalMcplServer {
     }
   }
 
+  // ── Outbound authorization (§5.4; absence of a capability is denial) ──
+
+  /** `push/event` carries a `featureSet` (§6.5), so it needs both the
+   *  `pushEvents` grant and that set to be enabled. */
+  private canPush(): boolean {
+    return this.mcplEnabled && this.policy.allows('pushEvents') && this.policy.featureEnabled(MESSAGING);
+  }
+
+  /** `channels/incoming` carries no `featureSet`; §14.1 authorizes it on the
+   *  grant alone. It is server→host content injection plus wake authority. */
+  private canSendIncoming(): boolean {
+    return this.mcplEnabled && this.policy.allows('channels.incoming');
+  }
+
+  /** `channels/register` and `channels/changed` (§14.1). */
+  private canRegister(): boolean {
+    return this.mcplEnabled && this.policy.allows('channels.register');
+  }
+
+  /**
+   * §6.6: rejection is diagnostics, not authorization. A refused push tells us
+   * the host would not take that message. It does not re-grant, re-enable or
+   * re-negotiate anything, so nothing here touches `this.policy` and nothing
+   * retries — the only correct response is to say so out loud.
+   */
+  private notePushRejection(what: string, err: unknown): void {
+    const e = err as { code?: number; message?: string } | undefined;
+    const code = typeof e?.code === 'number' ? ` (code ${e.code})` : '';
+    console.error(`[portal-mcpl] host rejected ${what}${code}:`, e?.message ?? String(err));
+  }
+
   // ── Client → host event forwarding ──
 
   private wireClient(): void {
     this.client.on('ready', () => {
-      if (this.mcplEnabled) {
+      // Both of these are server→host sends on granted paths; a relay `ready`
+      // arriving before (or after a reduction removes) the grant must not put
+      // them on the wire (§5.3, §5.4). `registerChannels`/`catchUp` re-check as
+      // well — they run from other triggers too.
+      if (this.canRegister()) {
         void this.registerChannels().catch((err) =>
           console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
         );
       }
-      void this.catchUp().catch((err) =>
-        console.error('[portal-mcpl] catch-up failed:', (err as Error).message),
-      );
+      if (this.canPush()) {
+        void this.catchUp().catch((err) =>
+          console.error('[portal-mcpl] catch-up failed:', (err as Error).message),
+        );
+      }
     });
     this.client.on('resumed', () => {
       // A Portal transport resume restores event delivery but the relay session
@@ -332,14 +580,14 @@ export class PortalMcplServer {
       this.pushReaction('remove', e.channelId, e.messageId, e.emoji, e.actor.name, e.messageSnippet);
     });
     this.client.on('messageDelete', (e) => {
-      if (!this.conn || !this.mcplEnabled) return;
+      if (!this.conn || !this.canPush()) return;
       // Only surface deletions for channels the host actually has open — a delete
       // in a channel the agent isn't following is zero-signal context noise.
       // (The relay also gates deletes by subscription; this is belt-and-braces.)
       if (!this.openChannels.has(e.channelId)) return;
       this.conn
         .sendRequest(method.PUSH_EVENT, {
-          featureSet: 'portal.messaging',
+          featureSet: MESSAGING,
           eventId: `portal_del_${e.messageId}`,
           timestamp: new Date().toISOString(),
           origin: {
@@ -350,16 +598,16 @@ export class PortalMcplServer {
           tags: ['chat:deleted'],
           payload: { content: [textContent(`[message deleted] ${e.messageId}`)] },
         } satisfies PushEventParams)
-        .catch(() => {});
+        .catch((err) => this.notePushRejection('message delete', err));
     });
     this.client.on('channelChange', (channel) => {
-      if (!this.conn || !this.mcplEnabled) return;
+      if (!this.conn || !this.canRegister()) return;
       void this.registerChannels().catch((err) =>
         console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
       );
     });
     this.client.on('channelRemove', ({ channelId }) => {
-      if (!this.conn || !this.mcplEnabled) return;
+      if (!this.conn || !this.canRegister()) return;
       // Queue rather than retract inline: a removal landing while
       // channels/register is in flight finds `advertised` still unstamped, and
       // the ack would then stamp the dead channel in from its stale descriptor
@@ -380,13 +628,21 @@ export class PortalMcplServer {
    * relay's per-persona AddressInfo — no client-side guessing.
    */
   private pushMessage(message: PortalMessage, addressedToMe: boolean, reasons: AddressReason[]): void {
-    if (!this.conn || !this.mcplEnabled) return;
+    if (!this.conn) return;
+    // The two branches ride different capabilities (§14.1), so each is checked
+    // against the one it actually uses — and re-checked after the async content
+    // build, because a reduction MUST take effect immediately (§6.7) and the
+    // grant that matters is the one current when the message goes out (§5.4).
+    const open = this.openChannels.has(message.channelId);
+    if (open ? !this.canSendIncoming() : !this.canPush()) return;
     const conn = this.conn;
     const meta = wakeMetadata(message, addressedToMe, reasons);
     const tags = deriveTags(message, addressedToMe, reasons);
     const channelMcplId = portalChannelId(message.channelId);
     void buildContent(message).then((content) => {
+      if (this.conn !== conn) return;
       if (this.openChannels.has(message.channelId)) {
+        if (!this.canSendIncoming()) return;
         conn
           .sendRequest(method.CHANNELS_INCOMING, {
             messages: [
@@ -402,11 +658,12 @@ export class PortalMcplServer {
               },
             ],
           } satisfies ChannelsIncomingParams)
-          .catch(() => {});
+          .catch((err) => this.notePushRejection('inbound message', err));
       } else {
+        if (!this.canPush()) return;
         conn
           .sendRequest(method.PUSH_EVENT, {
-            featureSet: 'portal.messaging',
+            featureSet: MESSAGING,
             eventId: `portal_msg_${message.id}_${this.eventSeq++}`,
             timestamp: message.createdAt,
             // Flat on origin (discord-mcpl parity) — the wake gate reads these.
@@ -425,7 +682,7 @@ export class PortalMcplServer {
             tags, // MCPL RFC-001 — the host routes/gates on these
             payload: { content },
           } satisfies PushEventParams)
-          .catch(() => {});
+          .catch((err) => this.notePushRejection('message push', err));
       }
     });
   }
@@ -446,7 +703,7 @@ export class PortalMcplServer {
     reactorName: string,
     messageSnippet?: string,
   ): void {
-    if (!this.conn || !this.mcplEnabled) return;
+    if (!this.conn || !this.canPush()) return;
     if (!this.openChannels.has(channelId)) return;
     const verb = action === 'add' ? 'reacted' : 'removed a reaction';
     const shown = renderReactionEmoji(emoji);
@@ -456,7 +713,7 @@ export class PortalMcplServer {
     const line = `[reaction] @${reactorName} ${verb} ${shown} on message ${messageId} in ${this.channelLabel(channelId)}${quoted}`;
     this.conn
       .sendRequest(method.PUSH_EVENT, {
-        featureSet: 'portal.messaging',
+        featureSet: MESSAGING,
         eventId: `portal_reaction_${action}_${messageId}_${emoji}_${reactorName}_${this.eventSeq++}`,
         timestamp: new Date().toISOString(),
         // Deliberately NO wake flags on origin — reactions must never wake.
@@ -469,16 +726,20 @@ export class PortalMcplServer {
           emoji: shown,
           action,
         },
-        tags: ['chat:reaction'], // matches no wake policy → shown, not woken
+        // §16.2: `chat:reaction-remove` is a DISTINCT tag. Emitting
+        // `chat:reaction` for a removal makes "wake on reactions to my
+        // messages" fire on un-reactions. Either way this push carries no wake
+        // flags, so it is shown, not woken.
+        tags: [action === 'add' ? 'chat:reaction' : 'chat:reaction-remove'],
         payload: { content: [textContent(line)] },
       } satisfies PushEventParams)
-      .catch(() => {});
+      .catch((err) => this.notePushRejection(`reaction ${action}`, err));
   }
 
   /** On (re)connect, wake once for pings the relay accrued while we were away.
    *  Server-authoritative — an O(missed) read, no Discord history scan. */
   private async catchUp(): Promise<void> {
-    if (!this.conn || !this.mcplEnabled) return;
+    if (!this.conn || !this.canPush()) return;
     const conn = this.conn;
     let pings: PendingPing[];
     try {
@@ -486,6 +747,10 @@ export class PortalMcplServer {
     } catch {
       return; // relay not ready yet; a later ready will retry
     }
+    // Re-check after the await: `pendingPingsFromRelay()` is a round trip, and a
+    // reduction landing inside it MUST be respected immediately (§6.7). The
+    // watermark below is consumed, so this has to happen before it moves.
+    if (this.conn !== conn || !this.canPush()) return;
     const fresh = pings.filter((p) => !this.wokenPings.has(p.message.id));
     if (fresh.length === 0) return;
     for (const p of fresh) this.wokenPings.add(p.message.id);
@@ -499,7 +764,7 @@ export class PortalMcplServer {
     const latest = fresh[fresh.length - 1].message;
     conn
       .sendRequest(method.PUSH_EVENT, {
-        featureSet: 'portal.messaging',
+        featureSet: MESSAGING,
         eventId: `portal_catchup_${latest.id}_${this.eventSeq++}`,
         timestamp: latest.createdAt,
         // isExplicitMention=true so the host's wake gate surfaces the catch-up.
@@ -518,7 +783,7 @@ export class PortalMcplServer {
         tags: ['chat:addressed', 'chat:mention'],
         payload: { content: [textContent(lines.join('\n'))] },
       } satisfies PushEventParams)
-      .catch(() => {});
+      .catch((err) => this.notePushRejection('catch-up push', err));
   }
 
   private channelLabel(channelId: string): string {
@@ -549,7 +814,10 @@ export class PortalMcplServer {
 
     const run = async (): Promise<void> => {
       const conn = this.conn;
-      if (!conn || !this.mcplEnabled) return;
+      // §14.1: `channels/register` and `channels/changed` both require
+      // `channels.register`. Absence of the capability is denial (§5.4), so this
+      // whole path stays off until the grant names it.
+      if (!conn || !this.canRegister()) return;
       const descriptors = this.allDescriptors();
 
       // The first complete enumeration is a request so the host can durably
@@ -557,8 +825,14 @@ export class PortalMcplServer {
       if (!this.initialRegistrationComplete) {
         if (descriptors.length === 0) return;
         const params: ChannelsRegisterParams = { channels: descriptors };
-        await conn.sendRequest(method.CHANNELS_REGISTER, params);
-        for (const descriptor of descriptors) {
+        const result = await conn.sendRequest(method.CHANNELS_REGISTER, params);
+        if (this.conn !== conn || !this.canRegister()) return;
+        // §14.5: the Request form returns one entry per submitted descriptor,
+        // because the host authorizes each independently. Believing a rejected
+        // descriptor is registered is exactly the disagreement §14.5 forbids —
+        // and it would retire that channel's local subscription for nothing.
+        const { accepted } = this.applyRegistrationResults(descriptors, result);
+        for (const descriptor of accepted) {
           this.advertised.set(descriptor.id, descriptorKey(descriptor));
         }
         this.initialRegistrationComplete = true;
@@ -570,11 +844,17 @@ export class PortalMcplServer {
         // "every bot loses its subscriptions on migration" failure mode.
         // Anything not yet advertised survives for a later register/changed
         // cycle, mirroring discord-mcpl's keep-the-bootstrap-hint approach.
-        this.retireAdvertisedSubscriptions(descriptors);
+        this.retireAdvertisedSubscriptions(accepted);
         return;
       }
 
-      const added = descriptors.filter((descriptor) => !this.advertised.has(descriptor.id));
+      const added = descriptors.filter(
+        (descriptor) =>
+          !this.advertised.has(descriptor.id) &&
+          // A descriptor the host already itemized as rejected is not re-offered
+          // unchanged; re-asking every cycle is a hot loop, not enforcement.
+          this.rejected.get(descriptor.id) !== descriptorKey(descriptor),
+      );
       // A known channel whose descriptor content drifted (rename, live rights
       // change → new caps in metadata) refreshes the host registry in place.
       const updated = descriptors.filter((descriptor) => {
@@ -607,11 +887,56 @@ export class PortalMcplServer {
   }
 
   /** Any cached channel the host hasn't seen (or has seen with a stale
-   *  descriptor)? Used to re-arm registration after an in-flight cycle. */
+   *  descriptor)? Used to re-arm registration after an in-flight cycle. A
+   *  descriptor the host itemized as rejected (§14.5) is not "work": re-arming
+   *  on it would spin. */
   private hasUnadvertisedWork(): boolean {
-    return this.allDescriptors().some(
-      (descriptor) => this.advertised.get(descriptor.id) !== descriptorKey(descriptor),
-    );
+    return this.allDescriptors().some((descriptor) => {
+      const key = descriptorKey(descriptor);
+      return this.advertised.get(descriptor.id) !== key && this.rejected.get(descriptor.id) !== key;
+    });
+  }
+
+  /**
+   * Split a `channels/register` (or `channels/changed`) Request result into the
+   * descriptors the host accepted and those it refused, per §14.5's itemization.
+   *
+   * Fail-closed on a present-but-partial `results` array: a descriptor with no
+   * entry is treated as NOT accepted, because §14.5 requires one entry per
+   * submitted descriptor and a missing verdict is not a verdict. A result with
+   * no `results` member at all is a host that predates the itemization; there is
+   * nothing to read, so the submission stands as before. Either way this only
+   * narrows what *we* believe — the host is the authorizer and a rejection here
+   * grants nothing (§6.6).
+   */
+  private applyRegistrationResults(
+    submitted: ChannelDescriptor[],
+    result: unknown,
+  ): { accepted: ChannelDescriptor[] } {
+    const results = (result as ChannelRegistrationResults | undefined)?.results;
+    if (!Array.isArray(results)) return { accepted: submitted };
+    const verdict = new Map<string, { accepted?: unknown; reason?: unknown }>();
+    for (const entry of results) {
+      if (entry && typeof entry === 'object' && typeof entry.id === 'string') {
+        verdict.set(entry.id, entry);
+      }
+    }
+    const accepted: ChannelDescriptor[] = [];
+    for (const descriptor of submitted) {
+      const entry = verdict.get(descriptor.id);
+      if (entry?.accepted === true) {
+        accepted.push(descriptor);
+        this.rejected.delete(descriptor.id);
+        continue;
+      }
+      this.rejected.set(descriptor.id, descriptorKey(descriptor));
+      this.advertised.delete(descriptor.id);
+      console.error(
+        `[portal-mcpl] host did not register channel ${descriptor.id}` +
+          (typeof entry?.reason === 'string' ? `: ${entry.reason}` : entry ? '' : ' (no verdict returned)'),
+      );
+    }
+    return { accepted };
   }
 
   /**
@@ -626,10 +951,12 @@ export class PortalMcplServer {
   private async flushRemovals(): Promise<void> {
     while (this.registrationInFlight) await this.registrationInFlight;
     const conn = this.conn;
-    if (!conn || !this.mcplEnabled || this.pendingRemovals.size === 0) return;
+    // `channels/changed` requires `channels.register` (§14.1).
+    if (!conn || !this.canRegister() || this.pendingRemovals.size === 0) return;
     const removed: string[] = [];
     for (const channelId of this.pendingRemovals) {
       const id = portalChannelId(channelId);
+      this.rejected.delete(id); // the channel is gone; nothing left to re-offer
       if (!this.advertised.delete(id)) continue;
       removed.push(id);
       this.openChannels.delete(channelId); // openChannels holds RAW relay ids
@@ -669,7 +996,9 @@ function wakeMetadata(
     message.author.kind === 'persona' || (message.author.kind === 'user' && message.author.bot);
   return {
     addressed: addressedToMe,
-    reasons: reasons.join(','),
+    // An array, not `reasons.join(',')`. The comma-joined form matched nothing
+    // in the spec and forced any host that wanted a reason to re-split a string.
+    reasons: [...reasons],
     isMention,
     isExplicitMention,
     isReplyToBot,
@@ -691,10 +1020,21 @@ function deriveTags(
 ): string[] {
   const t = new Set<string>();
   const mention = reasons.includes('role_mention') || reasons.includes('name_mention');
+  const reply = reasons.includes('reply');
+  const dm = message.guildId === null || reasons.includes('dm');
   if (mention) t.add('chat:mention');
-  if (reasons.includes('reply')) t.add('chat:reply');
-  if (message.guildId === null || reasons.includes('dm')) t.add('chat:dm');
-  t.add(addressedToMe ? 'chat:addressed' : 'chat:ambient');
+  if (reply) t.add('chat:reply');
+  if (dm) {
+    t.add('chat:dm');
+    t.add('chat:private'); // §16.3: chat:dm ⇒ chat:addressed, chat:private
+  }
+  // §16.3: `chat:mention`/`chat:reply`/`chat:dm` all imply `chat:addressed`, and
+  // "producers SHOULD NOT emit chat:ambient alongside anything implying
+  // chat:addressed". A relay that reports a mention but not `addressedToMe`
+  // previously produced both, which is not interpretable by a first-match-wins
+  // rule list — the outcome would depend on rule ordering, not on the event.
+  if (addressedToMe || mention || reply || dm) t.add('chat:addressed');
+  else t.add('chat:ambient');
   // sender
   if (message.author.kind === 'persona') {
     t.add('chat:from-agent');
