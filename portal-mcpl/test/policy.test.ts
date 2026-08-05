@@ -76,6 +76,7 @@ test('feature sets are keyed by name, not an array with a name member (§6.1)', 
     'portal.history',
     'portal.messaging',
     'portal.subscriptions',
+    'portal.voice',
   ]);
   for (const declaration of Object.values(featureSets)) {
     assert.equal('name' in declaration, false);
@@ -162,7 +163,7 @@ test('host selection narrows and never widens (§6.4 rule 3)', () => {
   });
   assert.deepEqual(
     enabledOnly.unavailableFeatures.filter((f) => f.reason === 'not_selected').map((f) => f.featureSet).sort(),
-    ['portal.channels', 'portal.messaging', 'portal.subscriptions'],
+    ['portal.channels', 'portal.messaging', 'portal.subscriptions', 'portal.voice'],
   );
 
   const p = policy();
