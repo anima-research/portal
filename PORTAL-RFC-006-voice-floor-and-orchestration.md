@@ -23,15 +23,23 @@ Topology is **shared-Portal-voice-bot first** (one mixer, one connection,
 identity via voice + caption). The lease protocol is designed so per-resident
 Discord bot bodies can consume it later with a floor-token check before
 `TtsProvider.openStream()`; that follow-up inherits this RFC unchanged.
-Melodeus client/relay heritage is inherited as *useful voice work* (STT/TTS
-provider code, interruption accounting), never as a critical-path architecture.
+
+**Stack boundary (antra, 2026-08-05):** Melodeus — the iOS client, the
+legacy TTS relay, Host `modules.ttsRelay`, and AF PR #68 — is a **separate
+stack**. This RFC does not touch it: no component of Melodeus is converted,
+repointed, retired, or superseded here, and no mutual compatibility is
+required. Melodeus findings from the audit appear below strictly as
+prior-art evidence — lessons that shaped this design, about a stack this
+design leaves alone. Any Melodeus-side migration is separately scoped by
+antra if and when she chooses.
 
 ## 2. Motivation
 
 Sol's 2026-08-05 audit: every hard primitive exists at least once, but nothing
 grants a floor before inference/TTS, so the stated goals — one speaker, no
 overlap, no wasted TTS fees — are structurally unmet. Two findings sharpen the
-requirements:
+requirements. Both are prior-art evidence from the separate Melodeus stack
+(§1 boundary) — cited as lessons, not as components this RFC modifies:
 
 - **Cost leaks are pre-acoustic.** The legacy relay lets every listening
   client synthesize the same utterance (duplicate billing); the Discord
@@ -115,8 +123,8 @@ behavior on its own.
 5. Response text streams toward the output path; carrier-clear + lease
    liveness checked; only then `openStream()` through voice-kit, voice chosen
    from voice-registry, keys server-side only (no client-distributed
-   ElevenLabs keys, no per-device duplicate synthesis — the Melodeus holes,
-   closed by construction).
+   ElevenLabs keys, no per-device duplicate synthesis — the prior-art cost
+   holes from §2, excluded by construction).
 6. Human barge-in (energy VAD) ⇒ abort playback and synthesis and — where
    still live — the inference; terminal receipt `aborted` with the boundary;
    transcript reflects what was actually heard.
@@ -142,11 +150,15 @@ body presents its lease token; discord-mcpl checks it before
 held unmerged) becomes v2's base once its synthesis-open moves behind the
 floor check. Nothing in §3 changes between v1 and v2.
 
-**Host `modules.ttsRelay` is reusable evidence, not a preserved seam.** It is
-repointed only if the Portal protocol fits it cleanly; otherwise it is
-replaced by a narrowly named Portal voice-output transport. AF #68 closes as
-superseded after its abort/keep-spoken-text semantics are ported (they are the
-one piece the current host tap lacks).
+**The voice output seam is new and Portal-owned.** A narrowly named Portal
+voice-output transport carries the selected resident's response text from the
+host to the Portal synthesis path under the lease. Per the §1 stack boundary,
+this is built fresh: Host `modules.ttsRelay`, the Melodeus relay, and AF #68
+are not repointed, retired, or closed by this train — they belong to the
+other stack and stay exactly as they are. (AF #68's abort/keep-spoken-text
+*idea* — inference abort on barge-in with the voiced prefix preserved — is
+prior art this design independently needs; it is re-implemented at the new
+seam, not migrated.)
 
 ## 5. Usage ledger
 
