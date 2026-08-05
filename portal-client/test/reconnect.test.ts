@@ -59,3 +59,72 @@ test('reconnect survives a throwing close listener and opens a new connection', 
   assert.ok(created.length >= 2, 'a new connection was opened despite the throwing listener');
   client.close(); // stop further reconnects
 });
+
+test('a synchronous reconnect open failure emits error and keeps retrying', async () => {
+  const created: FakeWs[] = [];
+  let attempts = 0;
+  const errors: Error[] = [];
+  const client = new PortalClient({
+    url: 'ws://test',
+    token: 't',
+    personaId: 'p',
+    maxBackoffMs: 20,
+    wsFactory: () => {
+      attempts++;
+      if (attempts === 2) throw new Error('factory boom');
+      const w = new FakeWs();
+      created.push(w);
+      return w;
+    },
+  });
+  client.on('error', (error) => errors.push(error));
+
+  client.connect().catch(() => {});
+  assert.equal(attempts, 1);
+  created[0].emit('close', 1006);
+  await new Promise((r) => setTimeout(r, 100));
+
+  assert.ok(errors.some((error) => error.message === 'factory boom'));
+  assert.ok(attempts >= 3, 'the reconnect loop retried after the synchronous throw');
+  assert.ok(created.length >= 2, 'a later reconnect produced a socket');
+  client.close();
+});
+
+test('auth rejection reconnects with the same persona credentials', async () => {
+  const created: FakeWs[] = [];
+  const client = new PortalClient({
+    url: 'ws://test',
+    token: 'stable-token',
+    personaId: 'stable-persona',
+    maxBackoffMs: 20,
+    wsFactory: () => {
+      const w = new FakeWs();
+      created.push(w);
+      return w;
+    },
+  });
+
+  client.connect().catch(() => {});
+  created[0].emit('message', JSON.stringify({
+    op: 'hello',
+    d: { heartbeatIntervalMs: 60_000 },
+  }));
+  const firstIdentify = JSON.parse(created[0].sent.at(-1)!);
+  assert.equal(firstIdentify.op, 'identify');
+  assert.equal(firstIdentify.d.token, 'stable-token');
+  assert.equal(firstIdentify.d.personaId, 'stable-persona');
+
+  created[0].emit('close', 4001);
+  await new Promise((r) => setTimeout(r, 60));
+  assert.ok(created.length >= 2);
+  const next = created.at(-1)!;
+  next.emit('message', JSON.stringify({
+    op: 'hello',
+    d: { heartbeatIntervalMs: 60_000 },
+  }));
+  const secondIdentify = JSON.parse(next.sent.at(-1)!);
+  assert.equal(secondIdentify.op, 'identify');
+  assert.deepEqual(secondIdentify.d, firstIdentify.d,
+    '4001 reconnect preserves the complete identity payload');
+  client.close();
+});

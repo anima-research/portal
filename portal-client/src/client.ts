@@ -377,7 +377,18 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       // lockstep — avoids a thundering-herd reconnect + role-rebind burst.
       const delay = capped / 2 + Math.random() * (capped / 2);
       this.backoff = Math.min(this.backoff * 2, this.opts.maxBackoffMs);
-      setTimeout(() => this.open(), delay);
+      setTimeout(() => {
+        try {
+          this.open();
+        } catch (err) {
+          // A synchronous open() failure must not end the reconnect loop:
+          // before this guard, one throw inside the timer left the client
+          // wedged forever — no socket, no retries, every RPC timing out
+          // (field-observed as the "wedged portal MCP client" gotcha).
+          this.emit('error', err instanceof Error ? err : new Error(String(err)));
+          this.onClose(0);
+        }
+      }, delay);
     }
 
     this.emit('close', { code, willReconnect });
