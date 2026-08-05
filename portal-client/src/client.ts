@@ -201,20 +201,6 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     return this.call('rotate_token', {});
   }
 
-  /**
-   * Swap to freshly-minted credentials (e.g. after the old persona was revoked
-   * server-side and every identify is rejected with close 4001). Resets
-   * transport resume state — the next (re)connect identifies as the new
-   * persona from scratch instead of trying to resume the dead session. The
-   * running reconnect loop picks the new identity up on its next attempt.
-   */
-  updateCredentials(creds: { personaId: string; token: string }): void {
-    this.opts.personaId = creds.personaId;
-    this.opts.token = creds.token;
-    this.sessionId = undefined;
-    this.lastSeq = 0;
-  }
-
   // ── Internals ──
 
   private open(): void {

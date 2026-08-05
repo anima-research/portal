@@ -48,7 +48,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { McplConnection } from '@animalabs/mcpl-core';
-import { PortalClient, loadOrEnrollCreds, enroll, fileCredsStore } from '@animalabs/portal-client';
+import { PortalClient, loadOrEnrollCreds } from '@animalabs/portal-client';
 import { PortalAgent } from './agent.js';
 import { AgentState } from './agent-state.js';
 import { PortalCcChannelServer } from './server-cc.js';
@@ -113,38 +113,6 @@ async function main(): Promise<void> {
     personaId: creds.personaId,
     subscriptions: state.subscriptionList(), // identify replays these on (re)connect
   });
-  // Self-heal a revoked/pruned persona. The relay closes auth failures with
-  // 4001, and cached-but-dead creds otherwise 4001-loop forever: enrollment
-  // only runs when the creds FILE is missing, so a valid file holding a dead
-  // token wedges the session permanently (every RPC times out). With an
-  // invite on hand, treat repeated auth rejection as "creds are dead": mint a
-  // fresh persona, persist it over the stale file, and hand it to the running
-  // client — its reconnect loop identifies as the new persona on the next
-  // attempt. Latched until a successful ready so a bad invite cannot drain
-  // its remaining uses in a retry loop.
-  let authFails = 0;
-  let reEnrollAttempted = false;
-  client.on('ready', () => {
-    authFails = 0;
-    reEnrollAttempted = false;
-  });
-  client.on('close', ({ code }) => {
-    if (code !== 4001 || reEnrollAttempted || !invite) return;
-    if (++authFails < 2) return; // tolerate a one-off relay hiccup
-    reEnrollAttempted = true;
-    void enroll({ url, invite, desiredName })
-      .then((fresh) => {
-        fileCredsStore(credsPath).save(fresh);
-        client.updateCredentials(fresh);
-        console.error(
-          `[portal-cc] auth rejected for stale persona — re-enrolled as "${fresh.personaId}" (creds updated at ${credsPath})`,
-        );
-      })
-      .catch((err) => {
-        console.error('[portal-cc] re-enroll after auth failure failed:', (err as Error).message);
-      });
-  });
-
   const agent = new PortalAgent(client, { state });
   const server = new PortalCcChannelServer(client, agent);
 
