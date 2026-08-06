@@ -39,7 +39,14 @@ export class InviteStore {
   check(code: string, nowMs: number): InviteTemplate | InviteRejection {
     const inv = this.byCode.get(code);
     if (!inv) return 'unknown';
-    if (inv.expiresAt && Date.parse(inv.expiresAt) <= nowMs) return 'expired';
+    if (inv.expiresAt) {
+      const at = Date.parse(inv.expiresAt);
+      // Fail CLOSED on an unparseable expiry: `NaN <= now` is false, so the
+      // naive comparison silently turned a malformed timestamp into a
+      // never-expiring invite — the most dangerous default a bearer-code
+      // store can have.
+      if (!Number.isFinite(at) || at <= nowMs) return 'expired';
+    }
     if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return 'exhausted';
     return inv;
   }
@@ -93,9 +100,26 @@ export class InviteStore {
   }
 
   private persist(): void {
+    this.pruneExpired();
     const data: InvitesFile = { invites: this.all() };
     const json = JSON.stringify(data, null, 2) + '\n';
     if (this.file) this.file.write(json);
     else writeFileSync(this.path, json);
+  }
+
+  /**
+   * Drop invites that expired more than 24h ago. Machine mints (mint_invite,
+   * TTL ≤ 60min) would otherwise accumulate forever and every persist() is a
+   * full-file rewrite — O(total) bytes per mint. The 24h grace keeps a short
+   * forensic tail on disk; the audit log holds provenance permanently. An
+   * unparseable expiresAt counts as long-expired (fail closed, matches check).
+   */
+  private pruneExpired(): void {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [code, inv] of this.byCode) {
+      if (!inv?.expiresAt) continue;
+      const at = Date.parse(inv.expiresAt);
+      if (!Number.isFinite(at) || at <= cutoff) this.byCode.delete(code);
+    }
   }
 }

@@ -489,7 +489,7 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
   MANAGE_CHANNELS: F.ManageChannels,
 };
 
-const ALL_CAPS: Capability[] = [
+export const ALL_CAPS: Capability[] = [
   'VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES', 'SEND_IN_THREADS', 'CREATE_THREADS',
   'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'EDIT_OWN', 'DELETE_OWN',
   'MANAGE_MESSAGES', 'MANAGE_CHANNELS',

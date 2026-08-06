@@ -148,6 +148,13 @@ export interface InviteTemplate {
    *   'both'    — either path is allowed.
    */
   mode?: 'mint' | 'augment' | 'both';
+  /**
+   * Persona that machine-minted this invite via the mint_invite RPC. Presence
+   * marks a machine mint: the subset-of-own-rights rule is re-verified against
+   * this persona at CLAIM time, so revoking/demoting the minter kills its
+   * outstanding unclaimed codes. Also forensic provenance in invites.json.
+   */
+  mintedBy?: string;
 }
 
 export interface InvitesFile {
@@ -212,6 +219,14 @@ export interface RelayConfig {
   permissionsPath: string;
   /** Optional invites file. When set, agents may self-register via `register`. */
   invitesPath?: string;
+  /**
+   * Persona ids allowed to machine-mint invites via the mint_invite RPC
+   * (PORTAL_INVITE_MINTERS, comma-separated). Empty/absent = the RPC is
+   * disabled (fail closed) — same semantics as the guild allow-list store.
+   * Optional because absence and emptiness mean the same thing and existing
+   * config constructions (tests included) predate the field.
+   */
+  inviteMinters?: string[];
   /** Optional path to persist message attribution (id→persona/webhook). Enables
    *  per-persona edit/delete ownership of pre-restart messages. */
   attributionPath?: string;
@@ -256,6 +271,7 @@ export function loadConfig(): RelayConfig {
     identityPath: requireEnv('PORTAL_IDENTITY'),
     permissionsPath: requireEnv('PORTAL_PERMISSIONS'),
     invitesPath: process.env.PORTAL_INVITES || undefined,
+    inviteMinters: splitCsv(process.env.PORTAL_INVITE_MINTERS),
     attributionPath: process.env.PORTAL_ATTRIBUTION || undefined,
     readStatePath: process.env.PORTAL_READSTATE || undefined,
     readStatePingsCap: process.env.PORTAL_READSTATE_PINGS_CAP

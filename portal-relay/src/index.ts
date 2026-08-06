@@ -8,6 +8,9 @@
  *   PORTAL_PERMISSIONS      Required. Path to the permissions JSON (per-persona capability policy).
  *   PORTAL_INVITES          Optional. Path to the invites JSON. When set, agents may
  *                           self-register via `register` (invite = access-rights template).
+ *   PORTAL_INVITE_MINTERS   Optional. Comma-separated persona ids allowed to machine-mint
+ *                           single-use channel-scoped invites via the mint_invite RPC
+ *                           (spawner/daemon door). Empty or unset = RPC disabled (fail closed).
  *   PORTAL_AVATAR_BASE_URL  Base URL for relative persona avatar filenames.
  *   PORTAL_WATCH_CONFIG     Hot-reload identity/permissions on file edit (default true).
  *   PORTAL_ROLE_POOL_SIZE / PORTAL_ROLE_POOL_PREFIX  Per-guild role pool (default 50 / "portal-").
