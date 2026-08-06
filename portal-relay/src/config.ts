@@ -221,10 +221,12 @@ export interface RelayConfig {
   invitesPath?: string;
   /**
    * Persona ids allowed to machine-mint invites via the mint_invite RPC
-   * (PORTAL_INVITE_MINTERS, comma-separated). Empty = the RPC is disabled
-   * (fail closed) — same semantics as the guild allow-list store.
+   * (PORTAL_INVITE_MINTERS, comma-separated). Empty/absent = the RPC is
+   * disabled (fail closed) — same semantics as the guild allow-list store.
+   * Optional because absence and emptiness mean the same thing and existing
+   * config constructions (tests included) predate the field.
    */
-  inviteMinters: string[];
+  inviteMinters?: string[];
   /** Optional path to persist message attribution (id→persona/webhook). Enables
    *  per-persona edit/delete ownership of pre-restart messages. */
   attributionPath?: string;

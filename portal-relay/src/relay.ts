@@ -505,13 +505,6 @@ export class Relay implements GatewayHooks {
   }
 
   /**
-   * Augment an EXISTING persona with an invite's grant (RFC-005 §5.6). Shared by
-   * the `claim_invite` op (actor = the persona) and admin-initiated claim (actor =
-   * an admin). Validates the invite + its `mode`, unions roles / merges inline
-   * grant, consumes a use, and returns the resulting role set. Throws rpcError on
-   * any rejection. Auditing is the caller's responsibility (actor differs).
-   */
-  /**
    * Machine-mint a single-use, short-lived, channel-scoped invite (the
    * daemon/spawner door — the admin API is OAuth-session-only). Authorization:
    *   1. PORTAL_INVITE_MINTERS allowlist (empty ⇒ RPC disabled, fail closed).
@@ -527,11 +520,11 @@ export class Relay implements GatewayHooks {
    * Every attempt — including rejections — audits with actor.kind 'persona'.
    */
   private mintInviteRpc(personaId: string, p: MintInviteParams): MintInviteResult {
-    const reject = (code: 'FORBIDDEN' | 'INVALID_PARAMS', message: string): never => {
+    const reject: (code: 'FORBIDDEN' | 'INVALID_PARAMS', message: string) => never = (code, message) => {
       this.audit?.append({
         actor: { id: personaId, name: this.displayName(personaId), kind: 'persona' },
         action: 'invite.mint',
-        guildId: p?.guildId,
+        guildId: typeof p?.guildId === 'string' ? p.guildId : undefined,
         ok: false,
         detail: { via: 'rpc', reason: message },
       });
@@ -541,25 +534,43 @@ export class Relay implements GatewayHooks {
     if (!(this.config.inviteMinters ?? []).includes(personaId)) {
       reject('FORBIDDEN', 'persona is not an authorized invite minter (PORTAL_INVITE_MINTERS)');
     }
-    // Shape: channels-only scope, known caps, bounded fan-out.
+    // Rate limit (token bucket, per minter): a compromised or looping spawner
+    // must not drive unbounded store rewrites / persona floods. Consumed per
+    // authorized ATTEMPT so validation-storms are throttled too.
+    if (!this.takeMintToken(personaId)) {
+      reject('FORBIDDEN', 'mint rate limit exceeded — retry shortly');
+    }
+    // Every param pathology routes through reject() so the audited-attempt
+    // guarantee is real (raw throws would escape unaudited as INTERNAL).
+    if (!p || typeof p !== 'object') reject('INVALID_PARAMS', 'params object required');
     const scope = p.grant?.scope as Record<string, unknown> | undefined;
     if (!scope || !Array.isArray(scope.channels) || Object.keys(scope).length !== 1) {
       reject('INVALID_PARAMS', 'machine-minted grants are channels-scoped only (scope: {channels})');
     }
-    const channels = [...new Set((p.grant.scope.channels ?? []).map(String))];
+    if (!(p.grant.scope.channels as unknown[]).every((c) => typeof c === 'string')) {
+      reject('INVALID_PARAMS', 'scope.channels must be channel-id strings');
+    }
+    const channels = [...new Set(p.grant.scope.channels)];
     if (channels.length === 0 || channels.length > 32) {
       reject('INVALID_PARAMS', 'scope.channels must name 1–32 channels');
     }
-    const caps = [...new Set(p.grant?.caps ?? [])];
+    if (!Array.isArray(p.grant?.caps)) reject('INVALID_PARAMS', 'grant.caps must be an array');
+    const caps = [...new Set(p.grant.caps)];
     if (caps.length === 0) reject('INVALID_PARAMS', 'grant.caps must be non-empty');
     const unknown = caps.filter((c) => !ALL_CAPS.includes(c));
     if (unknown.length) reject('INVALID_PARAMS', `unknown caps: ${unknown.join(', ')}`);
     if (p.maxUses !== undefined && p.maxUses !== 1) {
       reject('INVALID_PARAMS', 'machine-minted invites are single-use (maxUses must be 1 or omitted)');
     }
+    if (p.expiresInMinutes !== undefined && !Number.isFinite(p.expiresInMinutes)) {
+      reject('INVALID_PARAMS', 'expiresInMinutes must be a finite number');
+    }
     const minutes = Math.min(60, Math.max(1, Math.round(p.expiresInMinutes ?? 15)));
+    if (p.label !== undefined && (typeof p.label !== 'string' || p.label.length > 120)) {
+      reject('INVALID_PARAMS', 'label must be a string of at most 120 characters');
+    }
     // Guild containment.
-    if (!p.guildId || !this.bot.isGuildAllowed(p.guildId)) {
+    if (typeof p.guildId !== 'string' || !p.guildId || !this.bot.isGuildAllowed(p.guildId)) {
       reject('FORBIDDEN', 'guild is not on the relay allow-list');
     }
     for (const cid of channels) {
@@ -575,10 +586,24 @@ export class Relay implements GatewayHooks {
         reject('FORBIDDEN', `cannot delegate ${excess.join(', ')} on channel ${cid} — minter does not hold them`);
       }
     }
+    // Outstanding-mint cap: a minter may hold at most 20 live unclaimed codes.
+    const now = Date.now();
+    const outstanding = this.invites.all().filter((inv) => {
+      if (inv.mintedBy !== personaId) return false;
+      if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return false;
+      if (inv.expiresAt) {
+        const at = Date.parse(inv.expiresAt);
+        if (!Number.isFinite(at) || at <= now) return false;
+      }
+      return true;
+    }).length;
+    if (outstanding >= 20) {
+      reject('FORBIDDEN', 'too many outstanding unclaimed invites for this minter (max 20)');
+    }
 
     const code = `inv_${randomBytes(18).toString('base64url')}`;
-    const expiresAt = new Date(Date.now() + minutes * 60_000).toISOString();
-    this.invites!.mint({
+    const expiresAt = new Date(now + minutes * 60_000).toISOString();
+    this.invites.mint({
       code,
       label: p.label ?? `machine-minted by ${personaId}`,
       grant: { caps, scope: { channels } },
@@ -591,12 +616,33 @@ export class Relay implements GatewayHooks {
     this.audit?.append({
       actor: { id: personaId, name: this.displayName(personaId), kind: 'persona' },
       action: 'invite.mint',
-      target: code,
+      // Redacted: the code is a live bearer credential claimable by an
+      // UNAUTHENTICATED register — the audit stream (panel, shippers,
+      // backups) must not enable front-running the claim. A 12-char prefix
+      // correlates with invites.json for forensics.
+      target: `${code.slice(0, 12)}…`,
       guildId: p.guildId,
       ok: true,
       detail: { via: 'rpc', channels, caps, expiresAt, label: p.label },
     });
     return { code, expiresAt };
+  }
+
+  /** Token bucket per minter: burst 5, refill 10/min. In-memory (resets on
+   *  restart) — this throttles machine loops, it is not billing-grade. */
+  private mintBuckets = new Map<string, { tokens: number; last: number }>();
+  private takeMintToken(personaId: string): boolean {
+    const now = Date.now();
+    const bucket = this.mintBuckets.get(personaId) ?? { tokens: 5, last: now };
+    bucket.tokens = Math.min(5, bucket.tokens + ((now - bucket.last) / 60_000) * 10);
+    bucket.last = now;
+    if (bucket.tokens < 1) {
+      this.mintBuckets.set(personaId, bucket);
+      return false;
+    }
+    bucket.tokens -= 1;
+    this.mintBuckets.set(personaId, bucket);
+    return true;
   }
 
   /**
@@ -609,28 +655,52 @@ export class Relay implements GatewayHooks {
    */
   private recheckMachineMint(inv: InviteTemplate): string | null {
     if (!inv.mintedBy) return null;
+    // Re-validate what will actually be APPLIED, not what we expect to be
+    // there: applyInviteGrant short-circuits on roles (and legacy caps) BEFORE
+    // it looks at grant, so a hand-edited invite carrying mintedBy + roles
+    // would pass a grant-only recheck and then receive roles the subset rule
+    // never examined (roles can carry scope:{all}/mirror shapes — exactly
+    // what machine mints forbid).
+    if (inv.roles?.length || inv.caps?.length) {
+      return 'malformed machine mint (roles/blanket caps are not permitted in machine-minted invites)';
+    }
     if (!inv.grant || !('channels' in inv.grant.scope)) return 'malformed machine mint';
     if (!this.identity.get(inv.mintedBy)) return 'invite minter no longer exists';
     if (!(this.config.inviteMinters ?? []).includes(inv.mintedBy)) return 'invite minter no longer authorized';
     for (const cid of inv.grant.scope.channels) {
       const own = new Set(this.capsFor(inv.mintedBy, cid, inv.guildId ?? null));
       if (inv.grant.caps.some((c) => !own.has(c))) {
-        return 'invite minter no longer holds the delegated rights';
+        // Fail-closed covers both real demotion AND an unresolvable channel
+        // (evicted cache / archived thread zeroes Discord-gated caps) — name
+        // both so the operator checks the right thing.
+        return `invite minter's delegated rights could not be re-verified on channel ${cid} (rights changed, or channel not currently resolvable)`;
       }
     }
     return null;
   }
 
+  /**
+   * Augment an EXISTING persona with an invite's grant (RFC-005 §5.6). Shared by
+   * the `claim_invite` op (actor = the persona) and admin-initiated claim (actor =
+   * an admin). Validates the invite + its `mode`, unions roles / merges inline
+   * grant, consumes a use, and returns the resulting role set. Throws rpcError on
+   * any rejection. Auditing is the caller's responsibility (actor differs).
+   */
   private applyInviteAugment(personaId: string, code: string): { roles: string[] } {
     if (!this.invites) throw rpcError('NOT_FOUND', 'invites not enabled');
     if (!this.identity.get(personaId)) throw rpcError('NOT_FOUND', 'no such persona');
     const checked = this.invites.check(code, Date.now());
     if (typeof checked === 'string') throw rpcError('INVALID_PARAMS', `invite ${checked}`);
-    const staleMint = this.recheckMachineMint(checked);
-    if (staleMint) throw rpcError('FORBIDDEN', staleMint);
+    // Mode gate FIRST: machine mints are mode:'mint', so a holder of someone
+    // else's code gets a flat "not claimable" here instead of learning (via
+    // the recheck's distinct messages) whether the minter still exists / is
+    // still allowlisted / still holds rights. The recheck below is NOT dead
+    // code — it is load-bearing for hand-edited mintedBy + mode:'both' invites.
     if (checked.mode !== 'augment' && checked.mode !== 'both') {
       throw rpcError('FORBIDDEN', 'invite is not claimable (mint-only)');
     }
+    const staleMint = this.recheckMachineMint(checked);
+    if (staleMint) throw rpcError('FORBIDDEN', staleMint);
     if (checked.roles?.length) {
       this.permissions.addPersonaRoles(personaId, checked.roles);
     } else {
