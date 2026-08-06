@@ -1,4 +1,4 @@
-import type { PortalChannel, PortalGuild } from './channel.js';
+import type { Capability, PortalChannel, PortalGuild } from './channel.js';
 import type { PortalEmoji } from './emoji.js';
 import type { ChannelId, GuildId, PersonaId, RelayMessageId, RpcId, ThreadId, UserId } from './ids.js';
 import type { PortalMessage } from './message.js';
@@ -207,6 +207,33 @@ export interface ClaimInviteResult {
   roles: string[];
 }
 
+/**
+ * Machine-mint a single-use, short-lived, channel-scoped enrollment invite
+ * (the daemon/spawner door — the admin API is OAuth-session-only). Gated on
+ * the PORTAL_INVITE_MINTERS allowlist, and the delegated caps must be a
+ * subset of the minting persona's own effective caps on each scoped channel
+ * — verified again when the code is claimed, so revoking the minter revokes
+ * its outstanding codes. Channels-only scope by design: no `all`, no
+ * mirror shapes in a machine-minted grant.
+ */
+export interface MintInviteParams {
+  grant: {
+    caps: Capability[];
+    scope: { channels: ChannelId[] };
+  };
+  guildId: GuildId;
+  /** Machine mints are single-use; any value other than 1 is rejected. */
+  maxUses?: number;
+  /** Default 15; clamped to [1, 60]. */
+  expiresInMinutes?: number;
+  label?: string;
+}
+export interface MintInviteResult {
+  code: string;
+  /** ISO timestamp the code stops being claimable. */
+  expiresAt: string;
+}
+
 /** Rotate the calling persona's own token. The new token is returned in-band
  *  over the live session; the old token is invalidated immediately. */
 export type RotateTokenParams = Record<string, never>;
@@ -244,6 +271,7 @@ export interface RpcMethods {
   list_emojis: { params: ListEmojisParams; result: ListEmojisResult };
   list_pins: { params: ListPinsParams; result: ListPinsResult };
   claim_invite: { params: ClaimInviteParams; result: ClaimInviteResult };
+  mint_invite: { params: MintInviteParams; result: MintInviteResult };
   rotate_token: { params: RotateTokenParams; result: RotateTokenResult };
   // ── Server-authoritative read-state (catch-up / unread) ──
   get_pending_pings: { params: Empty; result: GetPendingPingsResult };

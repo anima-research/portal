@@ -205,6 +205,12 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   claimInvite(code: string) {
     return this.call('claim_invite', { code });
   }
+  /** Machine-mint a single-use, short-lived, channel-scoped enrollment invite
+   *  (PORTAL_INVITE_MINTERS-gated; delegated caps must be a subset of this
+   *  persona's own effective caps on each scoped channel). */
+  mintInvite(params: RpcParams<'mint_invite'>) {
+    return this.call('mint_invite', params);
+  }
   /** Rotate this persona's token; persist the returned token (the old one dies). */
   rotateToken() {
     return this.call('rotate_token', {});
