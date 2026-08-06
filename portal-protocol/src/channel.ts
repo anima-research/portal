@@ -21,7 +21,9 @@ export type Capability =
   | 'DELETE_OWN'
   /** Edit/delete messages authored by *other* personas/users. */
   | 'MANAGE_MESSAGES'
-  | 'MANAGE_CHANNELS';
+  | 'MANAGE_CHANNELS'
+  /** Ask the relay to join this voice channel and transcribe it (voice_join). */
+  | 'VOICE_LISTEN';
 
 export interface PortalChannel {
   id: ChannelId;

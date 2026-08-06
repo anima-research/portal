@@ -290,6 +290,28 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'voice_join',
+    description:
+      'Ask the relay to join a voice channel and transcribe speech there ' +
+      '(ElevenLabs Scribe). Final transcripts appear in your context as ' +
+      '[voice] lines for channels you have open; they never wake you. ' +
+      'Requires the VOICE_LISTEN capability in that channel.',
+    inputSchema: {
+      type: 'object',
+      properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },
+      required: ['channelId'],
+    },
+  },
+  {
+    name: 'voice_leave',
+    description: 'Ask the relay to stop listening in a voice channel.',
+    inputSchema: {
+      type: 'object',
+      properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },
+      required: ['channelId'],
+    },
+  },
+  {
     name: 'get_pending_pings',
     description:
       'List messages addressed to you (role mention or reply) that you have not ' +

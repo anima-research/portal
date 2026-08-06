@@ -110,6 +110,14 @@ export const featureSets: Readonly<Record<string, PortalFeatureSet>> = {
     uses: ['tools'],
     rollback: false,
   },
+  'portal.voice': {
+    description:
+      'Join/leave voice-channel transcription (relay-side Scribe STT). Final ' +
+      'transcripts arrive as non-waking pushEvents on open channels; partials ' +
+      'are display-plane only and never reach agents',
+    uses: ['tools', 'pushEvents'],
+    rollback: false,
+  },
 };
 
 /**
@@ -139,6 +147,9 @@ export const TOOL_FEATURE_SETS: Readonly<Record<string, string>> = {
   fetch_history: 'portal.history',
   fetch_around: 'portal.history',
   list_pins: 'portal.history',
+
+  voice_join: 'portal.voice',
+  voice_leave: 'portal.voice',
 
   subscribe_channel: 'portal.subscriptions',
   unsubscribe_channel: 'portal.subscriptions',
