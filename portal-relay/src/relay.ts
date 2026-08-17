@@ -893,14 +893,20 @@ export class Relay implements GatewayHooks {
       }
       case 'fetch_history': {
         const p = params as RpcParams<'fetch_history'>;
-        this.requireCap(personaId, p.channelId, 'READ_HISTORY');
+        const target = await this.resolveContainer(p.channelId, p.threadId);
+        if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+        this.requireCap(personaId, target.parentChannelId, 'READ_HISTORY');
         const before = this.cursorToSnowflake(p.before);
         const after = this.cursorToSnowflake(p.after);
         const limit = p.limit ?? 50;
-        let raw = this.history.get(p.channelId, limit, before, after);
+        // The cache key is the actual container being read — a thread and its
+        // parent are distinct pages (live invalidation already keys this way:
+        // convert() reports a thread message's channelId as the thread id).
+        const container = target.threadId ?? target.parentChannelId;
+        let raw = this.history.get(container, limit, before, after);
         if (!raw) {
-          raw = await this.bot.fetchHistory(p.channelId, limit, before, after);
-          this.history.set(p.channelId, limit, before, after, raw);
+          raw = await this.bot.fetchHistory(container, limit, before, after);
+          this.history.set(container, limit, before, after, raw);
         }
         const messages = raw.map((m) => this.buildPortalMessage(m).message);
         return { messages };
@@ -1030,14 +1036,38 @@ export class Relay implements GatewayHooks {
     }
   }
 
+  /** Resolve the protocol's two thread address forms into one container:
+   *  `{channelId}` alone (a channel or a bare thread id), or
+   *  `{channelId, threadId}` with the thread under that channel. A threadId
+   *  that is not actually a thread under channelId resolves to null rather
+   *  than falling through to the parent — that silent fall-through is how
+   *  thread targeting broke unnoticed: sends landed in the parent channel
+   *  and deliveries honestly carried no threadId (portal#17). */
+  private async resolveContainer(
+    channelId: string,
+    threadId?: string,
+  ): Promise<{ parentChannelId: string; threadId?: string } | null> {
+    if (!threadId) return this.bot.resolveTarget(channelId);
+    const meta = await this.bot.getChannelMeta(threadId);
+    if (!meta?.isThread || meta.parentId !== channelId) return null;
+    return { parentChannelId: channelId, threadId };
+  }
+
   private async sendMessage(
     personaId: string,
     p: RpcParams<'send_message'>,
   ): Promise<{ messageId: string }> {
     const cfg = this.identity.get(personaId)!;
-    const target = await this.bot.resolveTarget(p.channelId);
+    const target = await this.resolveContainer(p.channelId, p.threadId);
     if (!target) throw rpcError('NOT_FOUND', 'channel not found');
-    this.requireCap(personaId, p.channelId, target.threadId ? 'SEND_IN_THREADS' : 'SEND_MESSAGES');
+    // Capabilities live on the parent channel; a thread never carries its own
+    // grant rows, so checking the raw passed id (which may BE a thread id)
+    // refuses personas whose parent-channel rights are complete.
+    this.requireCap(
+      personaId,
+      target.parentChannelId,
+      target.threadId ? 'SEND_IN_THREADS' : 'SEND_MESSAGES',
+    );
 
     const meta = await this.bot.getChannelMeta(target.parentChannelId);
     const guildId = meta?.guildId ?? null;
@@ -1337,12 +1367,35 @@ export class Relay implements GatewayHooks {
     // Resolve author. Our own webhook posts map back to a persona via the store.
     let authorPersonaId: string | undefined;
     let author: PortalMessage['author'];
-    if (inc.webhookId && this.bot.ownsWebhook(inc.webhookId) && ref.personaId) {
-      authorPersonaId = ref.personaId;
-      const cfg = this.identity.get(ref.personaId);
+    let echoPersonaId = ref.personaId;
+    if (inc.webhookId && this.bot.ownsWebhook(inc.webhookId) && !echoPersonaId) {
+      // The gateway echo of our own webhook post can arrive before the send
+      // RPC's REST response records attribution — the ref exists but carries
+      // no personaId yet, and the delivery would go out as the per-channel
+      // webhook pseudo-user (portal#18). The username on an owned-webhook
+      // post is the persona's displayName stamped at send time; when exactly
+      // one persona matches it, that recovers the author. Ambiguity (two
+      // personas sharing a displayName) falls through to the honest
+      // webhook-user shape rather than guessing.
+      const named = this.identity.all().filter((c) => c.displayName === inc.authorName);
+      if (named.length === 1) {
+        echoPersonaId = named[0].id;
+        this.store.record({
+          channelId: inc.parentChannelId,
+          threadId: inc.threadId,
+          guildId: inc.guildId,
+          discordMsgId: inc.id,
+          personaId: echoPersonaId,
+          webhookId: inc.webhookId,
+        });
+      }
+    }
+    if (inc.webhookId && this.bot.ownsWebhook(inc.webhookId) && echoPersonaId) {
+      authorPersonaId = echoPersonaId;
+      const cfg = this.identity.get(echoPersonaId);
       author = {
         kind: 'persona',
-        personaId: ref.personaId,
+        personaId: echoPersonaId,
         displayName: cfg?.displayName ?? inc.authorName,
         avatarUrl: cfg ? this.identity.avatarUrl(cfg) : '',
       };
