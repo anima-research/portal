@@ -37,6 +37,12 @@ import { AdminServer, type AdminDeps } from './admin/server.js';
 import { AuditLog } from './admin/audit.js';
 import { SlashHandler } from './slash.js';
 
+/** How young an unattributed owned-webhook post must be for displayName echo
+ *  recovery to apply. The gateway-beats-REST race it repairs is seconds-wide;
+ *  anything older is history, where the current roster is not evidence about
+ *  who wrote it. Generous multiple of observed race width. */
+const ECHO_RECOVERY_MAX_AGE_MS = 5 * 60_000;
+
 export class Relay implements GatewayHooks {
   private bot: DiscordBot;
   readonly identity: IdentityStore;
@@ -1377,7 +1383,19 @@ export class Relay implements GatewayHooks {
       // one persona matches it, that recovers the author. Ambiguity (two
       // personas sharing a displayName) falls through to the honest
       // webhook-user shape rather than guessing.
-      const named = this.identity.all().filter((c) => c.displayName === inc.authorName);
+      //
+      // Age gate (#19 review note 2): the race this recovers from is
+      // seconds-wide, but this path also runs for OLD posts surfaced via
+      // fetch_history with no store row — where matching against the
+      // CURRENT roster can durably mis-attribute a message written before a
+      // rename or a name reassignment. Recovery therefore applies only to
+      // messages young enough to be the race; older unattributed webhook
+      // posts keep the honest webhook-user shape.
+      const ageMs = Date.now() - inc.timestamp.getTime();
+      const named =
+        ageMs <= ECHO_RECOVERY_MAX_AGE_MS
+          ? this.identity.all().filter((c) => c.displayName === inc.authorName)
+          : [];
       if (named.length === 1) {
         echoPersonaId = named[0].id;
         this.store.record({

@@ -245,3 +245,18 @@ test('a foreign-webhook message is never attributed to a persona, whatever its n
     cleanup();
   }
 });
+
+test('echo recovery is age-gated: an OLD unattributed owned-webhook post stays webhook-shaped', async () => {
+  const { relay, incoming, cleanup } = makeRelay();
+  try {
+    const old = incoming({
+      id: 'dm-ancient', webhookId: WEBHOOK, authorName: 'Alice', isBot: true,
+      timestamp: new Date(Date.now() - 60 * 60_000), // an hour old — history, not the race
+    });
+    const { message } = relay.buildPortalMessage(old);
+    assert.equal(message.author.kind, 'user');
+    assert.equal(relay.store.getByDiscordId('dm-ancient')?.personaId, undefined);
+  } finally {
+    cleanup();
+  }
+});
