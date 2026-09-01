@@ -4,7 +4,7 @@
  *   - inbound Discord events → addressed PortalEvents fanned out per persona
  *   - client RPC → capability-checked Discord actions via the pools
  */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type {
   AddressReason,
   Capability,
@@ -487,26 +487,65 @@ export class Relay implements GatewayHooks {
       this.permissions.setPersonaPolicy(personaId, { default: [] }); // nothing granted → deny
       return;
     }
+    if (isMirrorScope(grant.scope)) {
+      const role = this.materializeMirrorGrant(inv.guildId, grant.scope, grant.caps);
+      if (!role) {
+        this.permissions.setPersonaPolicy(personaId, { default: [] }); // malformed mirror grant → deny
+        return;
+      }
+      this.permissions.addPersonaRoles(personaId, [role]);
+      return;
+    }
     this.permissions.setPersonaPolicy(personaId, this.scopeToPolicy(inv.guildId, grant.scope, grant.caps));
   }
 
-  /** Turn a (guild, scope, caps) grant into a default-deny PersonaPolicy. A
-   *  `mirrorRole` scope is snapshotted to its currently-visible channels (use an
-   *  access role for live mirroring). */
+  /**
+   * An inline mirror grant becomes a shared access role so it resolves LIVE —
+   * the point of a mirror is tracking Discord visibility over time, and the
+   * old enroll-time snapshot quietly broke that: channels created after
+   * enrollment stayed invisible to the persona until someone hand-edited its
+   * policy. The role name is derived from the grant's content, so identical
+   * grants (every use of one invite, or two invites minted alike) share one
+   * catalog entry instead of accreting duplicates. Returns the role name, or
+   * null for a malformed grant (no guild — mirrors are guild-scoped).
+   */
+  private materializeMirrorGrant(
+    guildId: string | undefined,
+    scope: { mirrorRole: string } | { mirrorRoles: string[] },
+    caps: Capability[],
+  ): string | null {
+    if (!guildId) {
+      console.error('[portal-relay] mirror grant without guildId — denying (no channels in scope)');
+      return null;
+    }
+    const roleIds = [...new Set('mirrorRoles' in scope ? scope.mirrorRoles : [scope.mirrorRole])].sort();
+    const sortedCaps = [...new Set(caps)].sort();
+    const hash = createHash('sha256')
+      .update(JSON.stringify({ guildId, roleIds, caps: sortedCaps }))
+      .digest('hex')
+      .slice(0, 8);
+    const name = `mirror-${hash}`;
+    if (!this.permissions.getRole(name)) {
+      this.permissions.setRole(name, {
+        caps: sortedCaps,
+        scope: roleIds.length === 1 ? { mirrorRole: roleIds[0] } : { mirrorRoles: roleIds },
+        guildId,
+      });
+    }
+    return name;
+  }
+
+  /** Turn a (guild, scope, caps) grant into a default-deny PersonaPolicy.
+   *  Static scopes only — mirror shapes go through materializeMirrorGrant so
+   *  they resolve live; reaching here with one is a caller bug (deny). */
   private scopeToPolicy(guildId: string | undefined, scope: Scope, caps: Capability[]): PersonaPolicy {
     if ('all' in scope) return { default: caps };
-    if (!guildId) {
-      console.error('[portal-relay] scoped grant without guildId — denying (no channels in scope)');
+    if (!guildId || !('channels' in scope)) {
+      console.error('[portal-relay] scoped grant without guildId or with a mirror shape — denying');
       return { default: [] };
     }
-    const channelIds =
-      'channels' in scope
-        ? scope.channels
-        : 'mirrorRoles' in scope
-          ? [...new Set(scope.mirrorRoles.flatMap((r) => [...this.bot.channelsVisibleToRole(guildId, r)]))]
-          : [...this.bot.channelsVisibleToRole(guildId, scope.mirrorRole)];
     const channels: Record<string, Capability[]> = {};
-    for (const id of channelIds) channels[id] = caps;
+    for (const id of scope.channels) channels[id] = caps;
     return { default: [], guilds: { [guildId]: { default: [], channels } } };
   }
 
@@ -711,7 +750,15 @@ export class Relay implements GatewayHooks {
       this.permissions.addPersonaRoles(personaId, checked.roles);
     } else {
       const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
-      if (grant) {
+      if (grant && isMirrorScope(grant.scope)) {
+        // Same live-role materialization as enroll; a silent snapshot here is
+        // strictly worse because an augmented persona has no reason to suspect
+        // its shiny new scope is already fossilizing. Missing guildId is a
+        // hard reject (augment already throws on malformed invites).
+        const role = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
+        if (!role) throw rpcError('INVALID_PARAMS', 'invite mirror grant is missing guildId');
+        this.permissions.addPersonaRoles(personaId, [role]);
+      } else if (grant) {
         const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
         const base = this.permissions.getPolicy(personaId) ?? { default: [] };
         this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
@@ -1527,6 +1574,10 @@ export class Relay implements GatewayHooks {
   private displayName(personaId: string): string {
     return this.identity.get(personaId)?.displayName ?? personaId;
   }
+}
+
+function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirrorRoles: string[] } {
+  return 'mirrorRole' in scope || 'mirrorRoles' in scope;
 }
 
 function rpcError(code: string, message: string): Error & { code: string } {
