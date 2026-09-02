@@ -242,6 +242,26 @@ export interface RotateTokenResult {
   token: string;
 }
 
+/** Ask the relay to join a voice channel and start transcribing. Requires
+ *  VOICE_LISTEN. Transcripts flow to sessions subscribed to the channel
+ *  (subscribe_channel). Idempotent: joining an already-joined channel is ok.
+ *  The relay holds ONE voice connection per guild: joining a different channel
+ *  of a guild it is already listening in fails with CONFLICT (message names the
+ *  channel) — voice_leave it first. Listening can end on its own (channel
+ *  deleted, bot moved, voice server unreachable); a `voice_status` event with
+ *  `joined: false` reports it and a fresh voice_join is required. */
+export interface VoiceJoinParams {
+  channelId: ChannelId;
+}
+export interface VoiceJoinResult {
+  /** Whether the relay is now (or already was) listening in the channel. */
+  listening: boolean;
+}
+
+export interface VoiceLeaveParams {
+  channelId: ChannelId;
+}
+
 type Empty = Record<string, never>;
 
 /**
@@ -273,6 +293,9 @@ export interface RpcMethods {
   claim_invite: { params: ClaimInviteParams; result: ClaimInviteResult };
   mint_invite: { params: MintInviteParams; result: MintInviteResult };
   rotate_token: { params: RotateTokenParams; result: RotateTokenResult };
+  // ── Voice (relay joins, transcribes, fans out) ──
+  voice_join: { params: VoiceJoinParams; result: VoiceJoinResult };
+  voice_leave: { params: VoiceLeaveParams; result: Empty };
   // ── Server-authoritative read-state (catch-up / unread) ──
   get_pending_pings: { params: Empty; result: GetPendingPingsResult };
   list_unread: { params: Empty; result: ListUnreadResult };
@@ -296,7 +319,12 @@ export type RpcErrorCode =
   | 'INVALID_PARAMS'
   | 'RATE_LIMITED'
   | 'DISCORD_ERROR'
-  | 'INTERNAL';
+  | 'INTERNAL'
+  /** The relay is not configured for this feature (e.g. voice without ELEVENLABS_KEY). */
+  | 'UNAVAILABLE'
+  /** The request collides with live state the caller must clear first
+   *  (e.g. voice_join while this guild's listener is in another channel). */
+  | 'CONFLICT';
 
 export interface RpcError {
   code: RpcErrorCode;

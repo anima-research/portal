@@ -36,6 +36,7 @@ import { WebhookPool } from './webhook-pool.js';
 import { AdminServer, type AdminDeps } from './admin/server.js';
 import { AuditLog } from './admin/audit.js';
 import { SlashHandler } from './slash.js';
+import { VoiceBot, VoiceJoinError, type VoiceTranscript } from './voice-bot.js';
 
 /** How young an unattributed owned-webhook post must be for displayName echo
  *  recovery to apply. The gateway-beats-REST race it repairs is seconds-wide;
@@ -68,6 +69,9 @@ export class Relay implements GatewayHooks {
   private deliveredCaps = new Map<string, Map<string, string>>();
   private admin?: AdminServer;
   private slash: SlashHandler;
+  /** Voice listener (Scribe transcription). Null when ELEVENLABS_KEY is unset —
+   *  voice RPCs then fail with UNAVAILABLE and everything else is unaffected. */
+  private voice: VoiceBot | null = null;
   /** Shared audit log (RFC-005). Present only when the admin panel is enabled;
    *  self-service ops (claim_invite / rotate_token) audit here too. */
   private audit?: AuditLog;
@@ -169,6 +173,11 @@ export class Relay implements GatewayHooks {
     this.bot.on('slashCommand', (inv) => this.slash.handle(inv));
     this.bot.on('slashAutocomplete', (req) => this.slash.autocomplete(req));
     this.bot.on('ready', () => this.mirror.clear());
+    if (this.config.elevenLabsKey) {
+      this.attachVoice(new VoiceBot(this.bot.rawClient, this.config.elevenLabsKey,
+        (m) => console.error(`[portal-relay] ${m}`)));
+      console.error('[portal-relay] voice transcription enabled (Scribe v2 realtime)');
+    }
     // A pre-authorized guild (allow-listed before the bot joined) lights up the
     // moment the bot joins it; discord-bot only fires this for allowed guilds.
     this.bot.on('guildCreate', (guildId) => this.onGuildAllowChange({ added: [guildId], removed: [] }));
@@ -189,7 +198,28 @@ export class Relay implements GatewayHooks {
     await this.admin?.listen();
   }
 
+  /** Wire the voice listener's events into delivery. Separate from the
+   *  constructor so tests can attach a fake listener. */
+  attachVoice(voice: VoiceBot): void {
+    this.voice = voice;
+    voice.on('transcript', (t) => this.deliverTranscript(t));
+    voice.on('status', (channelId, guildId, joined) => {
+      // Sequenced like any durable event: a resuming session should learn the
+      // listener came or went even if it was offline at the time. Same
+      // subscription + VIEW_CHANNEL gate as transcripts — the fact that a
+      // channel is being listened to is channel information too.
+      for (const personaId of this.gateway.activePersonas()) {
+        if (!this.gateway.personaSubscribed(personaId, channelId)) continue;
+        if (!this.personaCanViewChannel(personaId, channelId, guildId)) continue;
+        this.gateway.dispatch(personaId, { type: 'voice_status', channelId, guildId, joined });
+      }
+    });
+  }
+
   async stop(): Promise<void> {
+    // Leave voice channels first: a relay that exits while connected leaves
+    // the bot visibly "listening" in Discord until the gateway session lapses.
+    this.voice?.destroy();
     this.identity.stopWatching();
     this.permissions.stopWatching();
     this.invites?.stopWatching();
@@ -957,6 +987,33 @@ export class Relay implements GatewayHooks {
         session.subscriptions.delete(p.channelId);
         return {};
       }
+      case 'voice_join': {
+        const p = params as RpcParams<'voice_join'>;
+        if (!this.voice) throw rpcError('UNAVAILABLE', 'voice transcription not configured (ELEVENLABS_KEY unset)');
+        this.requireCap(personaId, p.channelId, 'VOICE_LISTEN');
+        // Joining implies wanting the transcripts: auto-subscribe this session,
+        // same as it could do explicitly (capability already checked above —
+        // VOICE_LISTEN requires Connect, which subsumes the viewing intent;
+        // VIEW_CHANNEL is still re-checked per-delivery). Subscribe BEFORE the
+        // join so the joiner receives the `voice_status` the join emits.
+        const wasSubscribed = session.subscriptions.has(p.channelId);
+        session.subscriptions.add(p.channelId);
+        try {
+          await this.voice.join(p.channelId);
+        } catch (e) {
+          if (!wasSubscribed) session.subscriptions.delete(p.channelId);
+          if (e instanceof VoiceJoinError) throw rpcError(e.code, e.message);
+          throw rpcError('DISCORD_ERROR', `voice join failed: ${(e as Error).message}`);
+        }
+        return { listening: true };
+      }
+      case 'voice_leave': {
+        const p = params as RpcParams<'voice_leave'>;
+        if (!this.voice) throw rpcError('UNAVAILABLE', 'voice transcription not configured (ELEVENLABS_KEY unset)');
+        this.requireCap(personaId, p.channelId, 'VOICE_LISTEN');
+        this.voice.leave(p.channelId);
+        return {};
+      }
       case 'list_subscriptions':
         return { channelIds: [...session.subscriptions] };
       case 'list_members': {
@@ -1229,6 +1286,39 @@ export class Relay implements GatewayHooks {
       }
       if (subscribed && !addressedToMe) reasons.push('subscription');
       this.gateway.dispatch(personaId, { type, message, addressedToMe, reasons });
+    }
+  }
+
+  /**
+   * Voice transcript delivery. Same subscription + VIEW_CHANNEL gate as
+   * deliverMessage's ambient branch, but no addressing (speech mentions nobody
+   * structurally) and no read-state accumulation — voice is live perception,
+   * not unread inventory. Partials ride the ephemeral path (unsequenced,
+   * unreplayed); finals are sequenced.
+   */
+  private deliverTranscript(t: VoiceTranscript): void {
+    const event = {
+      type: 'voice_transcript' as const,
+      channelId: t.channelId,
+      guildId: t.guildId,
+      utteranceId: t.utteranceId,
+      speaker: {
+        kind: 'user' as const,
+        userId: t.userId,
+        username: t.username,
+        displayName: t.displayName,
+        bot: t.bot,
+      },
+      text: t.text,
+      partial: t.partial,
+      startedAt: t.startedAt,
+      at: Date.now(),
+    };
+    for (const personaId of this.gateway.activePersonas()) {
+      if (!this.gateway.personaSubscribed(personaId, t.channelId)) continue;
+      if (!this.personaCanViewChannel(personaId, t.channelId, t.guildId)) continue;
+      if (t.partial) this.gateway.dispatchEphemeral(personaId, event);
+      else this.gateway.dispatch(personaId, event);
     }
   }
 

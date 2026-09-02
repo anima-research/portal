@@ -200,3 +200,48 @@ test('resume past the buffer window is rejected → client falls back to fresh i
     await gw.close();
   }
 });
+
+
+test('ephemeral dispatch: fans out live, never sequenced, never replayed', async () => {
+  const gw = new Gateway(hooks(), 30_000);
+  gw.listen(PORT);
+  try {
+    const { ws: ws1, frames: f1 } = await open();
+    await f1.next((f) => f.op === 'hello');
+    ws1.send(JSON.stringify({ op: 'identify', d: { protocolVersion: 4, token: 'secret', personaId: 'p1' } }));
+    const ready = (await f1.next((f) => f.op === 'ready')) as Extract<ServerFrame, { op: 'ready' }>;
+    const sessionId = ready.d.sessionId;
+
+    // A partial fans out on the ephemeral op with no seq…
+    const partial = {
+      type: 'voice_transcript' as const,
+      channelId: 'c1', guildId: 'g1', utteranceId: 'u1',
+      speaker: { kind: 'user' as const, userId: 'u', username: 'antra', displayName: 'antra', bot: false },
+      text: 'hel', partial: true, startedAt: 1, at: 2,
+    };
+    gw.dispatchEphemeral('p1', partial);
+    const eph = (await f1.next((f) => f.op === 'dispatch_ephemeral')) as Extract<ServerFrame, { op: 'dispatch_ephemeral' }>;
+    assert.equal((eph.d as typeof partial).text, 'hel');
+    assert.ok(!('seq' in eph), 'ephemeral frames carry no seq');
+
+    // …and the durable final is seq 1: the partial consumed nothing.
+    gw.dispatch('p1', { ...partial, text: 'hello there', partial: false });
+    const fin = (await f1.next((f) => f.op === 'dispatch')) as Extract<ServerFrame, { op: 'dispatch' }>;
+    assert.equal(fin.seq, 1);
+
+    // Resume from 0 replays exactly the final — partials are gone by design.
+    ws1.close();
+    await new Promise((r) => setTimeout(r, 50));
+    const { ws: ws2, frames: f2 } = await open();
+    await f2.next((f) => f.op === 'hello');
+    ws2.send(JSON.stringify({ op: 'resume', d: { sessionId, seq: 0 } }));
+    const replayed = (await f2.next((f) => f.op === 'dispatch')) as Extract<ServerFrame, { op: 'dispatch' }>;
+    assert.equal(replayed.seq, 1);
+    assert.equal((replayed.d as typeof partial).partial, false);
+    const resumed = (await f2.next((f) => f.op === 'resumed')) as Extract<ServerFrame, { op: 'resumed' }>;
+    assert.equal(resumed.d.replayedEvents, 1);
+    ws2.close();
+  } finally {
+    await gw.close();
+  }
+});
