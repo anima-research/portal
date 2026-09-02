@@ -119,8 +119,9 @@ export interface InviteTemplate {
   roles?: string[];
   /**
    * Inline scoped grant (RFC-004). Mutually exclusive with `roles`. A
-   * `mirrorRole` scope here is snapshotted at enroll time into a channel list;
-   * use `roles` for live mirroring.
+   * mirror scope here is materialized at enroll/claim time into a shared
+   * content-addressed access role (`mirror-<hash>`), so it resolves live and
+   * tracks Discord visibility over time — including channels created later.
    */
   grant?: { caps: Capability[]; scope: Scope };
   /** Guild the inline `grant`/scope applies to (required for non-`all` scopes). */
