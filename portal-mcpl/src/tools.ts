@@ -295,7 +295,12 @@ export const toolDefinitions: ToolDefinition[] = [
       'Ask the relay to join a voice channel and transcribe speech there ' +
       '(ElevenLabs Scribe). Final transcripts appear in your context as ' +
       '[voice] lines for channels you have open; they never wake you. ' +
-      'Requires the VOICE_LISTEN capability in that channel.',
+      'Requires the VOICE_LISTEN capability in that channel. The relay listens ' +
+      'in at most ONE voice channel per guild, shared by everyone: joining a ' +
+      'second channel fails with CONFLICT until someone calls voice_leave on ' +
+      'the first. Listening can also end on its own (channel deleted, bot moved, ' +
+      'voice server lost) — a "[voice] transcription stopped" line reports it; ' +
+      'call voice_join again to resume.',
     inputSchema: {
       type: 'object',
       properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },
@@ -304,7 +309,9 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'voice_leave',
-    description: 'Ask the relay to stop listening in a voice channel.',
+    description:
+      'Ask the relay to stop listening in a voice channel. The listener is ' +
+      'shared: this stops transcription for every agent following that channel.',
     inputSchema: {
       type: 'object',
       properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },

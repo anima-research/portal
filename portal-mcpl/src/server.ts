@@ -55,6 +55,7 @@ const ERR_INVALID_PARAMS = -32602;
 /** The feature set every server-initiated message on the message path is
  *  tagged with (§6.5). */
 const MESSAGING = 'portal.messaging';
+const VOICE = 'portal.voice';
 
 /**
  * SPEC §14.1's table, plus MCP's tool methods, expressed as the capability each
@@ -500,6 +501,12 @@ export class PortalMcplServer {
     return this.mcplEnabled && this.policy.allows('pushEvents') && this.policy.featureEnabled(MESSAGING);
   }
 
+  /** Voice pushes ride the `portal.voice` set: the host must have selected it
+   *  (it is opt-in, not part of messaging) AND granted pushEvents. */
+  private canPushVoice(): boolean {
+    return this.mcplEnabled && this.policy.allows('pushEvents') && this.policy.featureEnabled(VOICE);
+  }
+
   /** `channels/incoming` carries no `featureSet`; §14.1 authorizes it on the
    *  grant alone. It is server→host content injection plus wake authority. */
   private canSendIncoming(): boolean {
@@ -623,11 +630,15 @@ export class PortalMcplServer {
     // not 5 Hz interim churn. Wake-on-name-in-speech is a deliberate follow-up,
     // not a v1 behavior — speech has no structural addressing to gate on.
     this.client.on('voiceTranscript', (e) => {
-      if (e.partial || !this.conn || !this.mcplEnabled) return;
+      if (e.partial || !this.conn || !this.canPushVoice()) return;
       if (!this.openChannels.has(e.channelId)) return;
+      const who = e.speaker.kind === 'user' ? e.speaker.displayName : 'someone';
       this.conn
         .sendRequest(method.PUSH_EVENT, {
-          featureSet: 'portal.voice',
+          featureSet: VOICE,
+          // utteranceId carries a per-relay-process epoch (one final per
+          // utterance by contract), so this key is unique across relay restarts
+          // — the host dedups by eventId and would otherwise drop fresh speech.
           eventId: `portal_voice_${e.utteranceId}`,
           timestamp: new Date(e.at).toISOString(),
           origin: {
@@ -636,16 +647,19 @@ export class PortalMcplServer {
             mcplChannelId: portalChannelId(e.channelId),
           },
           tags: ['voice:transcript'],
-          payload: { content: [textContent(`[voice] ${e.speaker.kind === 'user' ? e.speaker.displayName : 'someone'}: ${e.text}`)] },
+          payload: { content: [textContent(`[voice] ${who} in ${this.channelLabel(e.channelId)}: ${e.text}`)] },
         } satisfies PushEventParams)
-        .catch(() => {});
+        .catch((err) => this.notePushRejection('voice transcript', err));
     });
     this.client.on('voiceStatus', (e) => {
-      if (!this.conn || !this.mcplEnabled || !this.openChannels.has(e.channelId)) return;
+      if (!this.conn || !this.canPushVoice() || !this.openChannels.has(e.channelId)) return;
+      const line = e.joined
+        ? `[voice] transcription started in ${this.channelLabel(e.channelId)}`
+        : `[voice] transcription stopped in ${this.channelLabel(e.channelId)} (voice_join again to resume)`;
       this.conn
         .sendRequest(method.PUSH_EVENT, {
-          featureSet: 'portal.voice',
-          eventId: `portal_voice_status_${e.channelId}_${Date.now()}`,
+          featureSet: VOICE,
+          eventId: `portal_voice_status_${e.channelId}_${Date.now()}_${this.eventSeq++}`,
           timestamp: new Date().toISOString(),
           origin: {
             source: 'portal',
@@ -653,9 +667,9 @@ export class PortalMcplServer {
             mcplChannelId: portalChannelId(e.channelId),
           },
           tags: ['voice:status'],
-          payload: { content: [textContent(e.joined ? '[voice] transcription started in this channel' : '[voice] transcription stopped')] },
+          payload: { content: [textContent(line)] },
         } satisfies PushEventParams)
-        .catch(() => {});
+        .catch((err) => this.notePushRejection('voice status', err));
     });
   }
 

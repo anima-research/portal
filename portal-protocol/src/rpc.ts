@@ -244,7 +244,12 @@ export interface RotateTokenResult {
 
 /** Ask the relay to join a voice channel and start transcribing. Requires
  *  VOICE_LISTEN. Transcripts flow to sessions subscribed to the channel
- *  (subscribe_channel). Idempotent: joining an already-joined channel is ok. */
+ *  (subscribe_channel). Idempotent: joining an already-joined channel is ok.
+ *  The relay holds ONE voice connection per guild: joining a different channel
+ *  of a guild it is already listening in fails with CONFLICT (message names the
+ *  channel) — voice_leave it first. Listening can end on its own (channel
+ *  deleted, bot moved, voice server unreachable); a `voice_status` event with
+ *  `joined: false` reports it and a fresh voice_join is required. */
 export interface VoiceJoinParams {
   channelId: ChannelId;
 }
@@ -314,7 +319,12 @@ export type RpcErrorCode =
   | 'INVALID_PARAMS'
   | 'RATE_LIMITED'
   | 'DISCORD_ERROR'
-  | 'INTERNAL';
+  | 'INTERNAL'
+  /** The relay is not configured for this feature (e.g. voice without ELEVENLABS_KEY). */
+  | 'UNAVAILABLE'
+  /** The request collides with live state the caller must clear first
+   *  (e.g. voice_join while this guild's listener is in another channel). */
+  | 'CONFLICT';
 
 export interface RpcError {
   code: RpcErrorCode;
