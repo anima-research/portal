@@ -85,6 +85,38 @@ export type PortalEvent =
       at: number;
     }
   /** The relay joined or left a voice channel (voice_join/voice_leave RPC). */
-  | { type: 'voice_status'; channelId: ChannelId; guildId: GuildId | null; joined: boolean };
+  | { type: 'voice_status'; channelId: ChannelId; guildId: GuildId | null; joined: boolean }
+  /**
+   * Terminal outcome of a voice_speak request, delivered (sequenced) to the
+   * requesting persona only — it is that speaker's accounting, not room
+   * traffic. Exactly one receipt per accepted request. `voicedText` /
+   * `unvoicedText` is the RFC-006 §1.5 boundary: what the room actually heard
+   * versus what was cut off — the raw material for the host's
+   * inference-abort / re-say decision on interruption. `billedChars` is the
+   * zero-cost-loser proof: 0 for anything refused or dropped before the
+   * carrier cleared.
+   */
+  | {
+      type: 'voice_receipt';
+      channelId: ChannelId;
+      guildId: GuildId | null;
+      /** The voice_speak requestId this receipt settles. */
+      requestId: string;
+      status: 'spoken' | 'interrupted' | 'refused' | 'error';
+      /** For refusals/errors: the authority's or provider's reason, verbatim. */
+      reason?: string;
+      grantId?: string;
+      voicedText: string;
+      unvoicedText: string;
+      /** True when the boundary was estimated from audio duration rather than
+       *  provider character alignment. */
+      estimated: boolean;
+      playedMs: number;
+      queuedMs: number;
+      billedChars: number;
+      interruptedBy?: { userId: string; username?: string; bot: boolean };
+      /** ms epoch when the receipt was issued. */
+      at: number;
+    };
 
 export type PortalEventType = PortalEvent['type'];

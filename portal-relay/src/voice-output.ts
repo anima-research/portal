@@ -40,6 +40,18 @@
 import { PassThrough, type Readable } from 'node:stream';
 import type { TtsAlignment, TtsProvider, TtsStream, TtsVoice } from '@animalabs/voice-kit';
 
+/** speak() failures the relay maps onto RPC error codes. Defined HERE (not in
+ *  the wiring module) so the relay's instanceof check needs no runtime import
+ *  of the voice-kit-dependent wiring. */
+export class VoiceSpeakError extends Error {
+  constructor(
+    public readonly code: 'NOT_JOINED' | 'NO_VOICE',
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 // ── Grants ─────────────────────────────────────────────────────────────────
 
 export interface GrantRef {
