@@ -319,6 +319,41 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'voice_speak',
+    description:
+      'Speak text aloud in a voice channel, in your registered voice, through ' +
+      'the relay\'s grant-checked TTS output path. The relay must already be ' +
+      'joined there (voice_join) and you need the VOICE_SPEAK capability. The ' +
+      'call returns once your utterance is QUEUED; synthesis waits until the ' +
+      'room\'s audio is clear (words wait patiently — nothing plays over live ' +
+      'speech), and the outcome arrives later as a [voice] receipt line: ' +
+      'spoken, interrupted (with exactly which words were heard and which were ' +
+      'cut off — yours to re-say or let go), refused (no valid floor grant; on ' +
+      'an ungoverned relay grants are not required), or error. Anything ' +
+      'refused or dropped before it started playing cost nothing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC },
+        text: {
+          type: 'string',
+          description: 'What to say — one conversational turn (≤2000 chars).',
+        },
+        requestId: {
+          type: 'string',
+          description: 'Optional tracking key echoed on the receipt (unique per request).',
+        },
+        grant: {
+          type: 'object',
+          description:
+            'Floor grant authorizing this utterance (grantId, roomBinding, ' +
+            'logicEpoch, processEpoch, expiresAt). Omit on ungoverned relays.',
+        },
+      },
+      required: ['channelId', 'text'],
+    },
+  },
+  {
     name: 'get_pending_pings',
     description:
       'List messages addressed to you (role mention or reply) that you have not ' +

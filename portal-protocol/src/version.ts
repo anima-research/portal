@@ -15,6 +15,9 @@
 // `dispatch_ephemeral` server op for unsequenced display-only partials (pre-v4
 // clients drop the unknown op in parseServerFrame; finals ride normal
 // `dispatch`). Older clients remain fully functional.
-export const PORTAL_PROTOCOL_VERSION = 4 as const;
+// v5: additive voice output (RFC-006 §1.4) — `voice_speak` RPC, `voice_receipt`
+// event, `VOICE_SPEAK` capability. Same contract: older clients never call it
+// and ignore the unknown event type; the relay accepts lower client versions.
+export const PORTAL_PROTOCOL_VERSION = 5 as const;
 
 export type ProtocolVersion = typeof PORTAL_PROTOCOL_VERSION;

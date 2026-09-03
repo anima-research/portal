@@ -37,6 +37,23 @@ import { AdminServer, type AdminDeps } from './admin/server.js';
 import { AuditLog } from './admin/audit.js';
 import { SlashHandler } from './slash.js';
 import { VoiceBot, VoiceJoinError, type VoiceTranscript } from './voice-bot.js';
+import { VoiceSpeakError, type SpeakReceipt } from './voice-output.js';
+import type { SpeakArgs } from './voice-speaker.js';
+
+/** The voice-output wiring, seen from the relay. The real implementation
+ *  (voice-speaker.ts) is loaded via dynamic import behind config — voice-kit
+ *  must never be a relay boot requirement — so the relay codes against this
+ *  shape and tests attach fakes. */
+export interface SpeakerLike {
+  speak(args: SpeakArgs): void;
+  onReceipt(fn: (channelId: string, guildId: string | null, r: SpeakReceipt) => void): void;
+  channelClosed(channelId: string): void;
+  stop(): void;
+}
+
+/** Ceiling on one voice_speak's text. Utterances are conversational turns,
+ *  not documents; this also bounds worst-case per-call synthesis spend. */
+const MAX_SPEAK_CHARS = 2000;
 
 /** How young an unattributed owned-webhook post must be for displayName echo
  *  recovery to apply. The gateway-beats-REST race it repairs is seconds-wide;
@@ -72,6 +89,12 @@ export class Relay implements GatewayHooks {
   /** Voice listener (Scribe transcription). Null when ELEVENLABS_KEY is unset —
    *  voice RPCs then fail with UNAVAILABLE and everything else is unaffected. */
   private voice: VoiceBot | null = null;
+  /** Voice output path (RFC-006 §1.4). Null unless ELEVENLABS_KEY AND
+   *  PORTAL_VOICE_REGISTRY are set and the wiring module loaded —
+   *  voice_speak then fails with UNAVAILABLE and nothing else changes. */
+  private speaker: SpeakerLike | null = null;
+  /** Server-side voice_speak requestId fallback sequence. */
+  private speakSeq = 1;
   /** Shared audit log (RFC-005). Present only when the admin panel is enabled;
    *  self-service ops (claim_invite / rotate_token) audit here too. */
   private audit?: AuditLog;
@@ -174,9 +197,34 @@ export class Relay implements GatewayHooks {
     this.bot.on('slashAutocomplete', (req) => this.slash.autocomplete(req));
     this.bot.on('ready', () => this.mirror.clear());
     if (this.config.elevenLabsKey) {
+      const wantSpeak = !!this.config.voiceRegistryPath;
       this.attachVoice(new VoiceBot(this.bot.rawClient, this.config.elevenLabsKey,
-        (m) => console.error(`[portal-relay] ${m}`)));
+        (m) => console.error(`[portal-relay] ${m}`), { speak: wantSpeak }));
       console.error('[portal-relay] voice transcription enabled (Scribe v2 realtime)');
+      if (wantSpeak) {
+        // Dynamic import inside try: the wiring module is the one place
+        // voice-kit is a runtime dependency, and a missing/broken optional
+        // dependency must cost the feature, never the relay (discord-mcpl
+        // #28's fleet lesson). Failure leaves voice_speak → UNAVAILABLE.
+        try {
+          const { createVoiceSpeaker } = await import('./voice-speaker.js');
+          this.attachSpeaker(createVoiceSpeaker({
+            voice: this.voice!,
+            client: this.bot.rawClient,
+            elevenKey: this.config.elevenLabsKey,
+            registryPath: this.config.voiceRegistryPath!,
+            ungoverned: this.config.voiceOutputStance === 'ungoverned',
+            log: (m) => console.error(`[portal-relay] ${m}`),
+          }));
+          console.error(`[portal-relay] voice output enabled (${
+            this.config.voiceOutputStance === 'ungoverned'
+              ? 'UNGOVERNED — operator opt-in, carrier gate only'
+              : 'refuse-all: no grant authority deployed'})`);
+        } catch (e) {
+          console.error(`[portal-relay] voice output NOT enabled — wiring failed to load: ${
+            (e as Error).message}. Transcription continues; voice_speak returns UNAVAILABLE.`);
+        }
+      }
     }
     // A pre-authorized guild (allow-listed before the bot joined) lights up the
     // moment the bot joins it; discord-bot only fires this for allowed guilds.
@@ -204,6 +252,9 @@ export class Relay implements GatewayHooks {
     this.voice = voice;
     voice.on('transcript', (t) => this.deliverTranscript(t));
     voice.on('status', (channelId, guildId, joined) => {
+      // A listener that leaves takes the output path with it: everything
+      // queued for that channel refuses out (receipts, not silence).
+      if (!joined) this.speaker?.channelClosed(channelId);
       // Sequenced like any durable event: a resuming session should learn the
       // listener came or went even if it was offline at the time. Same
       // subscription + VIEW_CHANNEL gate as transcripts — the fact that a
@@ -216,9 +267,46 @@ export class Relay implements GatewayHooks {
     });
   }
 
+  /** Wire the voice-output path's receipts into delivery. Separate from the
+   *  constructor for the same reason as attachVoice: the real speaker arrives
+   *  via dynamic import, and tests attach fakes. */
+  attachSpeaker(speaker: SpeakerLike): void {
+    this.speaker = speaker;
+    speaker.onReceipt((channelId, guildId, r) => {
+      // The engine's requestId is relay-namespaced `<personaId>/<clientId>`;
+      // unpack to route the receipt and to echo the caller's own id back.
+      const slash = r.requestId.indexOf('/');
+      if (slash === -1) return; // not ours — engine-internal id, nothing to route to
+      const personaId = r.requestId.slice(0, slash);
+      // Delivered (sequenced) to the requester only, regardless of channel
+      // subscription: it is the speaker's accounting, not room traffic, and a
+      // host must not lose an interruption boundary to an unsubscribe race.
+      this.gateway.dispatch(personaId, {
+        type: 'voice_receipt',
+        channelId,
+        guildId,
+        requestId: r.requestId.slice(slash + 1),
+        status: r.status,
+        reason: r.reason,
+        grantId: r.grantId,
+        voicedText: r.voicedText,
+        unvoicedText: r.unvoicedText,
+        estimated: r.estimated,
+        playedMs: r.playedMs,
+        queuedMs: r.queuedMs,
+        billedChars: r.billedChars,
+        interruptedBy: r.interruptedBy,
+        at: Date.now(),
+      });
+    });
+  }
+
   async stop(): Promise<void> {
-    // Leave voice channels first: a relay that exits while connected leaves
-    // the bot visibly "listening" in Discord until the gateway session lapses.
+    // Retire the output path first (queued utterances refuse out through the
+    // still-open gateway), then leave voice channels: a relay that exits while
+    // connected leaves the bot visibly "listening" in Discord until the
+    // gateway session lapses.
+    this.speaker?.stop();
     this.voice?.destroy();
     this.identity.stopWatching();
     this.permissions.stopWatching();
@@ -1060,6 +1148,40 @@ export class Relay implements GatewayHooks {
         this.requireCap(personaId, p.channelId, 'VOICE_LISTEN');
         this.voice.leave(p.channelId);
         return {};
+      }
+      case 'voice_speak': {
+        const p = params as RpcParams<'voice_speak'>;
+        if (!this.speaker) {
+          throw rpcError('UNAVAILABLE',
+            'voice output not configured (needs ELEVENLABS_KEY + PORTAL_VOICE_REGISTRY)');
+        }
+        this.requireCap(personaId, p.channelId, 'VOICE_SPEAK');
+        const text = (p.text ?? '').trim();
+        if (!text) throw rpcError('INVALID_PARAMS', 'text is empty');
+        if (text.length > MAX_SPEAK_CHARS) {
+          throw rpcError('INVALID_PARAMS', `text exceeds ${MAX_SPEAK_CHARS} characters (one conversational turn per call)`);
+        }
+        const clientId = p.requestId ?? `spk${Date.now().toString(36)}-${this.speakSeq++}`;
+        const persona = this.identity.get(personaId);
+        try {
+          this.speaker.speak({
+            personaId,
+            speakerName: persona?.displayName ?? personaId,
+            channelId: p.channelId,
+            text,
+            requestId: `${personaId}/${clientId}`,
+            // The participant a grant is validated for is ALWAYS the calling
+            // persona — identity comes from the session, never from the wire.
+            grant: p.grant ? { ...p.grant, participantId: personaId } : null,
+            at: Date.now(),
+          });
+        } catch (e) {
+          if (e instanceof VoiceSpeakError) {
+            throw rpcError(e.code === 'NOT_JOINED' ? 'CONFLICT' : 'NOT_FOUND', e.message);
+          }
+          throw rpcError('INTERNAL', `voice output failed: ${(e as Error).message}`);
+        }
+        return { requestId: clientId };
       }
       case 'list_subscriptions':
         return { channelIds: [...session.subscriptions] };

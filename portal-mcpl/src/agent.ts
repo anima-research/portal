@@ -234,6 +234,13 @@ export class PortalAgent {
         return this.client.call('voice_join', { channelId: str(args.channelId) });
       case 'voice_leave':
         return this.client.call('voice_leave', { channelId: str(args.channelId) });
+      case 'voice_speak':
+        return this.client.call('voice_speak', {
+          channelId: str(args.channelId),
+          text: str(args.text),
+          ...(args.requestId !== undefined ? { requestId: str(args.requestId) } : {}),
+          ...(args.grant !== undefined ? { grant: args.grant as never } : {}),
+        });
       case 'get_pending_pings':
         // Server-authoritative: includes pings accrued while this session was
         // offline (the relay accumulates for every persona, online or not).

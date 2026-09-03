@@ -150,6 +150,7 @@ export const TOOL_FEATURE_SETS: Readonly<Record<string, string>> = {
 
   voice_join: 'portal.voice',
   voice_leave: 'portal.voice',
+  voice_speak: 'portal.voice',
 
   subscribe_channel: 'portal.subscriptions',
   unsubscribe_channel: 'portal.subscriptions',
