@@ -43,6 +43,9 @@ import { VoiceBot, VoiceJoinError, type VoiceTranscript } from './voice-bot.js';
  *  anything older is history, where the current roster is not evidence about
  *  who wrote it. Generous multiple of observed race width. */
 const ECHO_RECOVERY_MAX_AGE_MS = 5 * 60_000;
+/** list_members page cap — the limit used to be unbounded, so one call could
+ *  dump a guild's whole roster (issue #27). */
+const MAX_MEMBERS_PAGE = 1000;
 
 export class Relay implements GatewayHooks {
   private bot: DiscordBot;
@@ -67,6 +70,14 @@ export class Relay implements GatewayHooks {
    * dispatch. Not authoritative — capsFor() remains the source of truth.
    */
   private deliveredCaps = new Map<string, Map<string, string>>();
+  /**
+   * Guilds each persona's stream has been told about (ready / guild_create).
+   * The directory is capability-filtered (issue #27): a persona's ready omits
+   * guilds it holds no rights in, so when a later grant makes a channel there
+   * visible, the guild must be materialized first — a client cannot invent a
+   * guild from a channel event any more than a channel from a caps array.
+   */
+  private deliveredGuilds = new Map<string, Set<string>>();
   private admin?: AdminServer;
   private slash: SlashHandler;
   /** Voice listener (Scribe transcription). Null when ELEVENLABS_KEY is unset —
@@ -250,6 +261,7 @@ export class Relay implements GatewayHooks {
       this.gateway.dropStream(c.id);
       this.readState.forget(c.id);
       this.deliveredCaps.delete(c.id);
+      this.deliveredGuilds.delete(c.id);
       void this.roles.unbindAll(c.id).catch((e) => console.error('[portal-relay] unbind on remove:', (e as Error).message));
       return;
     }
@@ -269,12 +281,19 @@ export class Relay implements GatewayHooks {
     if (c.scope === 'channel' && c.channelId) {
       const meta = this.bot.channelMetaFromCache(c.channelId);
       channels = meta ? [meta] : [];
+      // A thread's caps are its parent's (see permChannelId), so a grant on the
+      // parent moves its threads too.
+      if (meta?.guildId) {
+        for (const t of this.bot.listChannelMetas(meta.guildId)) {
+          if (t.isThread && t.parentId === meta.id) channels.push(t);
+        }
+      }
     } else if (c.scope === 'guild' && c.guildId) {
       channels = this.bot.listChannelMetas(c.guildId);
     } else {
       channels = this.bot.listGuilds().flatMap((g) => this.bot.listChannelMetas(g.id));
     }
-    for (const meta of channels) this.pushCaps(c.personaId, meta.id, meta.guildId);
+    for (const meta of channels) this.pushChannel(c.personaId, meta);
 
     for (const g of this.bot.listGuilds())
       void this.reconcilePersonaGuild(c.personaId, g.id).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
@@ -294,8 +313,17 @@ export class Relay implements GatewayHooks {
       void this.reconcileGuild(gid).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
       const metas = this.bot.listChannelMetas(gid);
       for (const personaId of this.gateway.streamPersonas()) {
-        const channels = metas.map((m) => this.toPortalChannel(m, personaId));
-        for (const c of channels) this.rememberCaps(personaId, c.id, c.capabilities);
+        // Capability-filtered like ready (issue #27): baseline every channel
+        // for the dedup filter, but serve the guild only to personas with
+        // rights in it, and only the channels they hold a capability in.
+        const channels: PortalChannel[] = [];
+        for (const m of metas) {
+          const channel = this.toPortalChannel(m, personaId);
+          this.rememberCaps(personaId, channel.id, channel.capabilities);
+          if (channel.capabilities.length) channels.push(channel);
+        }
+        if (!this.guildVisible(personaId, g.id)) continue;
+        this.markGuildDelivered(personaId, g.id);
         this.gateway.dispatch(personaId, {
           type: 'guild_create',
           guild: { id: g.id, native: g.id, name: g.name, memberCount: g.memberCount },
@@ -304,6 +332,7 @@ export class Relay implements GatewayHooks {
       }
     }
     for (const gid of c.removed) {
+      for (const set of this.deliveredGuilds.values()) set.delete(gid);
       this.mirror.invalidateGuild(gid);
       this.repushGuildCaps(gid); // capsFor's allow-gate zeroes them out
       // Explicit (not only via repushGuildCaps): still runs when the bot was
@@ -332,14 +361,7 @@ export class Relay implements GatewayHooks {
     // must find this event in its resume replay, or the channel stays
     // invisible until a full re-identify (and the dedup baseline would
     // suppress the correcting caps push forever).
-    const create = kind === 'create';
-    for (const personaId of this.gateway.streamPersonas()) {
-      const channel = this.toPortalChannel(meta, personaId);
-      this.rememberCaps(personaId, meta.id, channel.capabilities);
-      this.gateway.dispatch(personaId, meta.isThread
-        ? { type: create ? 'thread_create' : 'thread_update', channel }
-        : { type: create ? 'channel_create' : 'channel_update', channel });
-    }
+    for (const personaId of this.gateway.streamPersonas()) this.pushChannel(personaId, meta, kind);
     // A permission-overwrite change on one channel can shift mirror-derived
     // caps on siblings; re-derive the rest of the guild (dedup'd, so
     // untouched channels cost nothing on the wire).
@@ -364,18 +386,68 @@ export class Relay implements GatewayHooks {
     const metas = this.bot.listChannelMetas(guildId);
     if (!metas.length) return;
     for (const personaId of this.gateway.streamPersonas()) {
-      for (const meta of metas) this.pushCaps(personaId, meta.id, guildId);
+      for (const meta of metas) this.pushChannel(personaId, meta);
     }
 
     void this.reconcileGuild(guildId).catch((e) => console.error('[portal-relay] reconcile:', (e as Error).message));
   }
 
-  /** Dispatch a capabilities_update iff the caps differ from what this persona
-   *  last received for the channel (any channel-bearing dispatch counts). */
-  private pushCaps(personaId: string, channelId: string, guildId: string | null): void {
-    const caps = this.capsFor(personaId, channelId, guildId);
-    if (!this.rememberCaps(personaId, channelId, caps)) return;
-    this.gateway.dispatch(personaId, { type: 'capabilities_update', channelId, capabilities: caps });
+  /**
+   * Deliver one channel's current state to a persona's stream under the
+   * capability-filtered directory rule (issue #27): a channel the persona
+   * holds no capability in is never served. Emits
+   *  - the full channel object when the channel becomes visible to this
+   *    persona (or when `kind` reports a Discord-side create/update of a
+   *    visible one), materializing the guild first if the stream has never
+   *    been told about it;
+   *  - a bare `capabilities_update` when a visible channel's caps change, or
+   *    `[]` when a channel the persona knew goes dark — so the client's copy
+   *    loses its rights instead of lingering as a stale grant;
+   *  - nothing for a channel that was hidden and stays hidden.
+   * Dedup'd against deliveredCaps: unchanged caps cost nothing on the wire.
+   * Returns whether anything was dispatched.
+   */
+  private pushChannel(personaId: string, meta: ChannelMeta, kind?: 'create' | 'update'): boolean {
+    const caps = this.capsFor(personaId, this.permChannelId(meta), meta.guildId);
+    const wasVisible = !!this.deliveredCaps.get(personaId)?.get(meta.id);
+    const changed = this.rememberCaps(personaId, meta.id, caps);
+    if (caps.length === 0) {
+      if (!wasVisible) return false;
+      this.gateway.dispatch(personaId, { type: 'capabilities_update', channelId: meta.id, capabilities: caps });
+      return true;
+    }
+    if (wasVisible && !kind) {
+      if (!changed) return false;
+      this.gateway.dispatch(personaId, { type: 'capabilities_update', channelId: meta.id, capabilities: caps });
+      return true;
+    }
+    if (meta.guildId) this.ensureGuildDelivered(personaId, meta.guildId);
+    const channel = this.toPortalChannel(meta, personaId, caps);
+    const create = kind === 'create';
+    this.gateway.dispatch(personaId, meta.isThread
+      ? { type: create ? 'thread_create' : 'thread_update', channel }
+      : { type: create ? 'channel_create' : 'channel_update', channel });
+    return true;
+  }
+
+  /** Materialize a guild in a persona's stream the first time one of its
+   *  channels becomes visible (the persona's ready omitted it — no rights then). */
+  private ensureGuildDelivered(personaId: string, guildId: string): void {
+    if (this.deliveredGuilds.get(personaId)?.has(guildId)) return;
+    const g = this.bot.listGuilds().find((x) => x.id === guildId);
+    if (!g) return;
+    this.markGuildDelivered(personaId, guildId);
+    this.gateway.dispatch(personaId, {
+      type: 'guild_create',
+      guild: { id: g.id, native: g.id, name: g.name, memberCount: g.memberCount },
+      channels: [],
+    });
+  }
+
+  private markGuildDelivered(personaId: string, guildId: string): void {
+    let set = this.deliveredGuilds.get(personaId);
+    if (!set) this.deliveredGuilds.set(personaId, (set = new Set()));
+    set.add(guildId);
   }
 
   /** Record caps as delivered; returns true when they changed since last delivery. */
@@ -405,13 +477,10 @@ export class Relay implements GatewayHooks {
     let pushed = 0;
     for (const g of this.bot.listGuilds()) {
       for (const meta of this.bot.listChannelMetas(g.id)) {
-        const channel = this.toPortalChannel(meta, personaId);
-        this.rememberCaps(personaId, channel.id, channel.capabilities);
-        this.gateway.dispatch(
-          personaId,
-          meta.isThread ? { type: 'thread_update', channel } : { type: 'channel_update', channel },
-        );
-        pushed++;
+        // Directory rule applies to a resync too: visible channels are
+        // force-materialized, a channel that went dark gets its caps zeroed,
+        // hidden channels are not served (issue #27).
+        if (this.pushChannel(personaId, meta, 'update')) pushed++;
       }
     }
     return pushed;
@@ -872,14 +941,22 @@ export class Relay implements GatewayHooks {
     }
     // ── Synchronous from here to return: snapshot, baseline, seq. ──
     const current = this.identity.get(session.personaId) ?? cfg; // may have changed mid-await
-    const guilds = this.bot.listGuilds();
+    // The directory is capability-filtered (issue #27): nothing is served that
+    // was not granted. Guilds the persona holds no rights in are omitted, and
+    // so is every channel it has no capability in — a scoped invite must not
+    // hand out the names of a guild's private channels. The dedup baseline
+    // still covers every channel (a hidden one is "delivered as hidden"), so
+    // a later grant materializes it via pushChannel rather than a bare
+    // capabilities_update the client could not apply.
+    const guilds = this.bot.listGuilds().filter((g) => this.guildVisible(session.personaId, g.id));
+    this.deliveredGuilds.set(session.personaId, new Set(guilds.map((g) => g.id)));
     const channels: PortalChannel[] = [];
-    for (const g of guilds) {
+    for (const g of this.bot.listGuilds()) {
       for (const meta of this.bot.listChannelMetas(g.id)) {
         const channel = this.toPortalChannel(meta, session.personaId);
         // Baseline for the caps-dedup filter: ready IS a delivery.
         this.rememberCaps(session.personaId, channel.id, channel.capabilities);
-        channels.push(channel);
+        if (channel.capabilities.length) channels.push(channel);
       }
     }
     return {
@@ -954,6 +1031,10 @@ export class Relay implements GatewayHooks {
         const p = params as RpcParams<'unreact'>;
         const ref = await this.resolveRef(p.messageId);
         if (ref) {
+          // Same gate as react (issue #27): with native=true this strips the
+          // shared bot's reaction — i.e. another persona's visible reaction —
+          // from any message the caller can name, viewable or not.
+          this.requireCap(personaId, ref.channelId, 'ADD_REACTIONS');
           this.gateway.dispatch(personaId, {
             type: 'reaction_remove',
             channelId: ref.channelId,
@@ -994,13 +1075,23 @@ export class Relay implements GatewayHooks {
         const messages = raw.map((m) => this.buildPortalMessage(m).message);
         return { messages };
       }
+      // Directory reads are capability-filtered like ready (issue #27): guilds
+      // the persona has rights in, channels it holds a capability in. Guild-
+      // level reads (members, roles, mentions, emoji) FORBID like any other
+      // ungranted RPC rather than answering for any persona that can log in.
       case 'list_guilds':
-        return { guilds: this.bot.listGuilds().map((g) => ({ ...g, native: g.id })) };
+        return {
+          guilds: this.bot.listGuilds()
+            .filter((g) => this.guildVisible(personaId, g.id))
+            .map((g) => ({ ...g, native: g.id })),
+        };
       case 'list_channels': {
         const p = params as RpcParams<'list_channels'>;
+        this.requireGuild(personaId, p.guildId);
         const channels = this.bot
           .listChannelMetas(p.guildId)
-          .map((meta) => this.toPortalChannel(meta, personaId));
+          .map((meta) => this.toPortalChannel(meta, personaId))
+          .filter((c) => c.capabilities.length > 0);
         return { channels };
       }
       case 'create_thread': {
@@ -1065,22 +1156,32 @@ export class Relay implements GatewayHooks {
         return { channelIds: [...session.subscriptions] };
       case 'list_members': {
         const p = params as RpcParams<'list_members'>;
+        this.requireGuild(personaId, p.guildId);
+        // Bounded: an unbounded limit returned the whole roster in one call.
+        const limit = Math.min(Math.max(1, Math.floor(Number(p.limit) || 100)), MAX_MEMBERS_PAGE);
         return {
-          members: this.bot.listMembers(p.guildId, p.query, p.limit ?? 100),
+          members: this.bot.listMembers(p.guildId, p.query, limit),
           membersAvailable: this.bot.hasMembersIntent,
         };
       }
       case 'resolve_mentions': {
         const p = params as RpcParams<'resolve_mentions'>;
+        this.requireGuild(personaId, p.guildId);
         return { resolved: this.bot.resolveHandles(p.guildId, p.handles) };
       }
       case 'list_roles': {
         const p = params as RpcParams<'list_roles'>;
+        this.requireGuild(personaId, p.guildId);
         return { roles: this.bot.listRoles(p.guildId, this.config.rolePool.prefix) };
       }
       case 'list_emojis': {
         const p = params as RpcParams<'list_emojis'>;
-        const emojis = (await this.bot.listEmojis(p.guildId)).map((e) => ({
+        if (p.guildId) this.requireGuild(personaId, p.guildId);
+        // Omitted guildId spans every allowed guild — keep only the ones the
+        // persona has rights in.
+        const raw = (await this.bot.listEmojis(p.guildId))
+          .filter((e) => this.guildVisible(personaId, e.guildId));
+        const emojis = raw.map((e) => ({
           id: e.id,
           name: e.name,
           animated: e.animated,
@@ -1099,13 +1200,31 @@ export class Relay implements GatewayHooks {
       }
       case 'set_typing': {
         const p = params as RpcParams<'set_typing'>;
-        await this.bot.sendTyping(p.threadId ?? p.channelId);
+        // Typing is the shared bot's indicator, fired wherever the caller can
+        // name — gate it exactly like send_message (issue #27).
+        const target = await this.resolveContainer(p.channelId, p.threadId);
+        if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+        this.requireCap(
+          personaId,
+          target.parentChannelId,
+          target.threadId ? 'SEND_IN_THREADS' : 'SEND_MESSAGES',
+        );
+        await this.bot.sendTyping(target.threadId ?? target.parentChannelId);
         return {};
       }
+      // Read-state reads re-check VIEW_CHANNEL at read time: the store is
+      // durable, so a ping/tally recorded while the persona could view a channel
+      // must not keep being served after that right was revoked (issue #27).
       case 'get_pending_pings':
-        return { pings: this.readState.pendingPings(personaId) };
+        return {
+          pings: this.readState.pendingPings(personaId)
+            .filter((ping) => this.personaCanViewChannel(personaId, ping.message.channelId, ping.message.guildId)),
+        };
       case 'list_unread':
-        return { channels: this.readState.unread(personaId) };
+        return {
+          channels: this.readState.unread(personaId)
+            .filter((c) => this.personaCanViewChannelId(personaId, c.channelId)),
+        };
       case 'mark_read': {
         const p = params as RpcParams<'mark_read'>;
         this.readState.markRead(personaId, p.channelId, p.uptoCreatedAt);
@@ -1113,6 +1232,7 @@ export class Relay implements GatewayHooks {
       }
       case 'channel_missed': {
         const p = params as RpcParams<'channel_missed'>;
+        this.requireCap(personaId, p.channelId, 'VIEW_CHANNEL');
         return this.readState.missed(personaId, p.channelId);
       }
       case 'mint_invite': {
@@ -1319,18 +1439,20 @@ export class Relay implements GatewayHooks {
     // Live dispatch: connected sessions only, addressed OR live-subscribed.
     for (const personaId of this.gateway.activePersonas()) {
       if (authorPersonaId && personaId === authorPersonaId) continue; // not your own message
+      // VIEW_CHANNEL gates EVERY delivery, addressed or ambient (issue #27).
+      // Addressed used to bypass it — but pooled addressing roles are
+      // mentionable guild-wide, so anyone who can post in ANY channel could
+      // push a full message (live, and as an agent-waking ping) into a persona
+      // deliberately scoped to a walled-garden channel it cannot see, read the
+      // context of, or reply in. A mention from a channel the persona cannot
+      // view is dropped, not delivered. Also covers a subscription that
+      // outlived the persona's access (role revoked after subscribe), and a
+      // `reply` reason after a rights revocation.
+      if (!this.personaCanViewChannel(personaId, message.channelId, message.guildId)) continue;
       const reasons = this.reasonsFor(message, personaId);
       const addressedToMe = reasons.length > 0;
       const subscribed = this.gateway.personaSubscribed(personaId, message.channelId);
       if (!addressedToMe && !subscribed) continue;
-      // Defense-in-depth: a subscription can outlive the persona's access (e.g.
-      // a role revoked after subscribe). Re-check VIEW_CHANNEL on the ambient
-      // branch so live dispatch never leaks a channel the persona can no longer
-      // view — mirroring the durable read-state gate in accumulateReadState.
-      if (subscribed && !addressedToMe &&
-          !this.personaCanViewChannel(personaId, message.channelId, message.guildId)) {
-        continue;
-      }
       if (subscribed && !addressedToMe) reasons.push('subscription');
       this.gateway.dispatch(personaId, { type, message, addressedToMe, reasons });
     }
@@ -1381,22 +1503,21 @@ export class Relay implements GatewayHooks {
   }
 
   /**
-   * Fold a new message into every persona's durable read-state. Addressed
-   * messages are recorded for any persona regardless of subscription; ambient
-   * messages only for personas that can actually view the channel (so an
+   * Fold a new message into every persona's durable read-state — only for
+   * personas that can actually view the channel, addressed or not (so an
    * offline persona's unread reflects all channels it can read — the "all
    * personas, all channels" policy — without leaking channels it can't see).
+   * Addressed messages are recorded regardless of subscription, but never
+   * across the view gate: a pending ping from a channel the persona cannot
+   * view would be the same injection path deliverMessage closes (issue #27).
    */
   private accumulateReadState(message: PortalMessage, authorPersonaId?: string): void {
     for (const cfg of this.identity.all()) {
       const personaId = cfg.id;
       if (authorPersonaId && personaId === authorPersonaId) continue;
+      if (!this.personaCanViewChannel(personaId, message.channelId, message.guildId)) continue;
       const reasons = this.reasonsFor(message, personaId);
-      const addressedToMe = reasons.length > 0;
-      if (!addressedToMe && !this.personaCanViewChannel(personaId, message.channelId, message.guildId)) {
-        continue;
-      }
-      this.readState.record(personaId, message, addressedToMe, reasons);
+      this.readState.record(personaId, message, reasons.length > 0, reasons);
     }
   }
 
@@ -1620,7 +1741,11 @@ export class Relay implements GatewayHooks {
     return /^\d+$/.test(c) ? c : undefined;
   }
 
-  private toPortalChannel(meta: ChannelMeta, personaId: string): PortalChannel {
+  private toPortalChannel(
+    meta: ChannelMeta,
+    personaId: string,
+    capabilities = this.capsFor(personaId, this.permChannelId(meta), meta.guildId),
+  ): PortalChannel {
     return {
       id: meta.id,
       native: meta.id,
@@ -1629,8 +1754,37 @@ export class Relay implements GatewayHooks {
       type: meta.type,
       parentId: meta.parentId,
       archived: meta.archived,
-      capabilities: this.capsFor(personaId, meta.id, meta.guildId),
+      capabilities,
     };
+  }
+
+  /** The channel whose grant rows govern a meta. Threads carry none of their
+   *  own — send/read/deliver all resolve to the parent (portal#17) — so a
+   *  thread's directory caps are its parent's, and it is visible iff the
+   *  parent is. Before this, a channel-scoped persona saw its threads with
+   *  `[]` caps it could in fact exercise. */
+  private permChannelId(meta: ChannelMeta): string {
+    return meta.isThread && meta.parentId ? meta.parentId : meta.id;
+  }
+
+  /** Guild-level directory predicate (issue #27): served iff the relay serves
+   *  the guild AND the persona holds some capability in it — the same
+   *  predicate that decides whether it gets an addressing role there. */
+  private guildVisible(personaId: string, guildId: string): boolean {
+    return this.bot.isGuildAllowed(guildId) && this.personaCanAccessGuild(personaId, guildId);
+  }
+
+  private requireGuild(personaId: string, guildId: string): void {
+    if (!this.guildVisible(personaId, guildId)) {
+      throw rpcError('FORBIDDEN', 'no capabilities in guild');
+    }
+  }
+
+  /** GatewayHooks.canSubscribe — the identify/register-time twin of the
+   *  subscribe_channel VIEW_CHANNEL gate. */
+  canSubscribe(personaId: string, channelId: string): boolean {
+    const guildId = this.bot.channelForPerms(channelId)?.guildId ?? null;
+    return this.capsFor(personaId, channelId, guildId).includes('VIEW_CHANNEL');
   }
 
   /** Whether a persona has any rights in a guild — gates addressing-role minting

@@ -76,6 +76,7 @@ export interface ReactParams {
   native?: boolean;
 }
 
+/** Gated like react (ADD_REACTIONS on the message's channel). */
 export interface UnreactParams {
   messageId: RelayMessageId;
   emoji: string;
@@ -101,6 +102,10 @@ export interface FetchHistoryResult {
   messages: PortalMessage[];
 }
 
+/** Directory reads are capability-filtered like `ready` (portal#27): guilds
+ *  with rights, channels with ≥1 capability. Guild-level reads (channels,
+ *  members, mentions, roles, emoji) are FORBIDDEN in a guild the persona holds
+ *  no capability in. */
 export interface ListGuildsResult {
   guilds: PortalGuild[];
 }
@@ -129,6 +134,8 @@ export interface DeleteChannelParams {
   channelId: ChannelId;
 }
 
+/** Gated like send_message: SEND_MESSAGES on the channel, SEND_IN_THREADS in a
+ *  thread (the indicator is the shared bot's). */
 export interface SetTypingParams {
   channelId: ChannelId;
   threadId?: ThreadId;
@@ -147,6 +154,7 @@ export interface ListMembersParams {
   guildId: GuildId;
   /** Case-insensitive substring filter over username/displayName/nickname. */
   query?: string;
+  /** Default 100, clamped to [1, 1000]. */
   limit?: number;
 }
 export interface ListMembersResult {

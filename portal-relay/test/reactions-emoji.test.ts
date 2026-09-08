@@ -18,7 +18,7 @@ function makeRelay() {
   const identityPath = join(dir, 'identity.json');
   const permissionsPath = join(dir, 'permissions.json');
   writeFileSync(identityPath, JSON.stringify({ personas: [{ id: PERSONA, displayName: 'Alice', avatar: '', token: 'tok' }] }));
-  writeFileSync(permissionsPath, JSON.stringify({ personas: { [PERSONA]: { default: [], guilds: {} } } }));
+  writeFileSync(permissionsPath, JSON.stringify({ personas: { [PERSONA]: { default: [], guilds: { [GUILD]: { default: ['VIEW_CHANNEL', 'ADD_REACTIONS'], channels: {} } } } } }));
 
   const config: RelayConfig = {
     discordToken: 'x', wsPort: 0, avatarBaseUrl: '', guildIds: [GUILD],
