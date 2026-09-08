@@ -288,8 +288,9 @@ P1 is independently shippable and is the security fix.
   multiple roles; default-deny outside scope; `mirrorRole` scope from a fake
   channel/role/overwrite fixture.
 - **Live (mirrors `scripts/p1-live.mjs`):** mint a `#test`-scoped invite; enroll;
-  assert `list_channels` shows the in-scope channel with caps **and** a private
-  channel with **empty** capabilities (and `fetch_history` on it → `FORBIDDEN`).
+  assert `list_channels` shows the in-scope channel with caps **and omits** the
+  private channel entirely (portal#27 — it used to appear with empty
+  capabilities, which leaked its name; `fetch_history` on it → `FORBIDDEN`).
   Then a `mirrorRole` role and assert scope matches the Discord role's visibility.
 - **Regression:** a legacy blanket-`caps` invite still works (as `scope:{all}`)
   but logs a deprecation warning.

@@ -34,6 +34,13 @@ export interface GatewayHooks {
    * has no invites configured and registration is disabled.
    */
   enroll?(data: RegisterData): Promise<RegisteredData | { error: string }>;
+  /**
+   * Whether a persona may hold an ambient subscription to a channel. Applied
+   * to the `subscriptions` restored at identify/register, with the same gate
+   * `subscribe_channel` enforces — a restore must not be a way around it
+   * (issue #27). Absent → every requested subscription is accepted.
+   */
+  canSubscribe?(personaId: string, channelId: string): boolean;
   onOpen?(session: Session): void;
   onClose?(session: Session): void;
 }
@@ -178,7 +185,7 @@ export class Gateway {
     }
     session.personaId = ok;
     session.identified = true;
-    if (subscriptions) for (const c of subscriptions) session.subscriptions.add(c);
+    this.restoreSubscriptions(session, subscriptions);
     this.register(session);
     this.streams.set(ok, this.streams.get(ok) ?? { seq: 0, buffer: [] });
 
@@ -205,7 +212,7 @@ export class Gateway {
     // `registered` and reconnects with the saved token).
     session.personaId = res.personaId;
     session.identified = true;
-    if (d.subscriptions) for (const c of d.subscriptions) session.subscriptions.add(c);
+    this.restoreSubscriptions(session, d.subscriptions);
     this.register(session);
     this.streams.set(res.personaId, this.streams.get(res.personaId) ?? { seq: 0, buffer: [] });
 
@@ -213,6 +220,16 @@ export class Gateway {
     const ready = await this.hooks.buildReady(session);
     session.send({ op: 'ready', d: ready });
     this.hooks.onOpen?.(session);
+  }
+
+  /** Restore the client's requested ambient subscriptions, dropping (silently —
+   *  identify has no per-channel error channel) any the hook refuses. */
+  private restoreSubscriptions(session: Session, requested?: string[]): void {
+    if (!requested) return;
+    for (const c of requested) {
+      if (this.hooks.canSubscribe && !this.hooks.canSubscribe(session.personaId, c)) continue;
+      session.subscriptions.add(c);
+    }
   }
 
   private onResume(session: Session, sessionId: string, fromSeq: number): void {

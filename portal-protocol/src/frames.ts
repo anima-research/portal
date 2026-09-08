@@ -59,6 +59,10 @@ export interface HelloData {
 export interface ReadyData {
   sessionId: SessionId;
   persona: Persona;
+  /** Capability-filtered directory (portal#27): only guilds the persona holds
+   *  some capability in, and only channels it has at least one capability in
+   *  (threads follow their parent). A grant that later makes a channel visible
+   *  arrives as `guild_create` (if the guild was unknown) + `channel_update`. */
   guilds: PortalGuild[];
   channels: PortalChannel[];
   /** Highest event seq at ready — the resume baseline. */
