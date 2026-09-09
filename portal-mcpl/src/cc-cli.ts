@@ -37,6 +37,15 @@
  * reapplied on every (re)connect — so PORTAL_SUBSCRIPTIONS is just an optional
  * first-run seed, not a per-launch requirement.
  *
+ * Wake transport: Claude Code's channel notification by default. PORTAL_WAKE=codex
+ * instead queues the wake as a user turn into a running codex session (`codex
+ * queue`), targeting the thread named in the PORTAL_WAKE_FILE sidecar (default
+ * ~/.portal/<personaId>.wake.json, written by the launcher) — see wake-sink.ts.
+ *
+ * Public-activity beacon: every post/reaction/edit this persona makes touches
+ * ~/.portal/<personaId>.activity (PORTAL_ACTIVITY_FILE), so a supervisor that
+ * only subscribes to a few channels can still tell an active hand from an idle one.
+ *
  * Attention model: only *addressed* messages (mentions/replies) wake the agent.
  * Ambient messages in subscribed channels accumulate and are folded into the
  * next wake as prepended context (with a first-contact history backfill), capped
@@ -52,6 +61,7 @@ import { PortalClient, loadOrEnrollCreds } from '@animalabs/portal-client';
 import { PortalAgent } from './agent.js';
 import { AgentState } from './agent-state.js';
 import { PortalCcChannelServer } from './server-cc.js';
+import { wakeSinkFromEnv } from './wake-sink.js';
 
 async function main(): Promise<void> {
   const url = process.env.PORTAL_URL ?? 'ws://127.0.0.1:8790';
@@ -113,8 +123,26 @@ async function main(): Promise<void> {
     personaId: creds.personaId,
     subscriptions: state.subscriptionList(), // identify replays these on (re)connect
   });
-  const agent = new PortalAgent(client, { state });
-  const server = new PortalCcChannelServer(client, agent);
+  // Public-activity beacon (throttled; the reader only cares about mtime).
+  const activityPath =
+    process.env.PORTAL_ACTIVITY_FILE ?? join(dirname(statePath), `${creds.personaId}.activity`);
+  let lastBeacon = 0;
+  const onPublicActivity = (): void => {
+    const now = Date.now();
+    if (now - lastBeacon < 5_000) return;
+    lastBeacon = now;
+    try {
+      writeFileSync(activityPath, `${new Date(now).toISOString()}\n`, { mode: 0o600 });
+    } catch (err) {
+      console.error('[portal-cc] activity beacon write failed:', (err as Error).message);
+    }
+  };
+
+  const wakeSink = wakeSinkFromEnv(process.env, { stateDir: dirname(statePath), personaId: creds.personaId });
+  if (wakeSink) console.error(`[portal-cc] wake sink: ${wakeSink.kind}`);
+
+  const agent = new PortalAgent(client, { state, onPublicActivity });
+  const server = new PortalCcChannelServer(client, agent, { wakeSink });
 
   // Connect in the background; the MCP handshake proceeds regardless so Claude
   // Code's startup isn't blocked by a relay outage.

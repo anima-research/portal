@@ -26,6 +26,7 @@ import {
 import type { PortalClient } from '@animalabs/portal-client';
 import type { PortalMessage } from '@animalabs/portal-protocol';
 import type { PortalAgent } from './agent.js';
+import type { WakeSink } from './wake-sink.js';
 
 /** Claude Code's channel push notification method. */
 const CHANNEL_NOTIFY = 'notifications/claude/channel';
@@ -44,6 +45,10 @@ export class PortalCcChannelServer {
   constructor(
     private client: PortalClient,
     private agent: PortalAgent,
+    /** Where wakes go. Default: Claude Code's channel notification. A sink
+     *  (see wake-sink.ts) lets a host without channel push — codex — be woken
+     *  from here, where the relay already delivers this persona's mentions. */
+    private readonly opts: { wakeSink?: WakeSink } = {},
   ) {}
 
   async serve(conn: McplConnection): Promise<void> {
@@ -186,7 +191,28 @@ export class PortalCcChannelServer {
     if (process.env.PORTAL_DEBUG) {
       console.error(`[portal-cc] CATCH-UP wake: ${fresh.length} missed ping(s)`);
     }
-    this.conn.sendNotification(CHANNEL_NOTIFY, { content: lines.join('\n'), meta });
+    this.deliverWake(lines.join('\n'), meta, fresh.map((p) => p.message.id));
+  }
+
+  /** Hand a wake to the host. Claude Code: channel notification. A configured
+   *  sink: its own transport, asynchronously — on failure the pings are
+   *  un-marked so a later catch-up (next reconnect) can surface them again; the
+   *  relay holds them as pending regardless. */
+  private deliverWake(content: string, meta: Record<string, string>, pingIds: string[]): void {
+    const sink = this.opts.wakeSink;
+    if (!sink) {
+      this.conn?.sendNotification(CHANNEL_NOTIFY, { content, meta });
+      return;
+    }
+    sink.deliver({ content, meta }).then(
+      () => {
+        if (process.env.PORTAL_DEBUG) console.error(`[portal-cc] wake delivered via ${sink.kind} (${meta.channelId})`);
+      },
+      (err: Error) => {
+        for (const id of pingIds) this.wokenPings.delete(id);
+        console.error(`[portal-cc] wake via ${sink.kind} failed: ${err.message}`);
+      },
+    );
   }
 
   /**
@@ -202,7 +228,6 @@ export class PortalCcChannelServer {
   private async pushMessage(message: PortalMessage, addressedToMe: boolean, reasons: string[]): Promise<void> {
     if (!this.conn) return;
     if (!addressedToMe) return; // ambient: surfaced as context on the next wake
-    const conn = this.conn;
     const channelId = message.channelId;
 
     // Flush everything unseen (includes this message), oldest first.
@@ -247,7 +272,7 @@ export class PortalCcChannelServer {
         `[portal-cc] WAKE ch=${channelId} contextMsgs=${all.length} omitted=${omitted} (folded backlog + trigger)`,
       );
     }
-    conn.sendNotification(CHANNEL_NOTIFY, { content: this.buildContent(all, message, omitted), meta });
+    this.deliverWake(this.buildContent(all, message, omitted), meta, [message.id]);
   }
 
   /** Render the wake payload: optional truncation note, channel-labeled lines,
