@@ -14,6 +14,14 @@
 import type { PortalClient } from '@animalabs/portal-client';
 import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
 import { AgentState, type PendingPing } from './agent-state.js';
+import {
+  buildCandidates,
+  channelLabel,
+  formatChannelLabel,
+  parseChannelRef,
+  resolveChannelRef,
+  type ResolveResult,
+} from './channel-names.js';
 import { chunkText } from './chunk.js';
 import { toolDefinitions } from './tools.js';
 
@@ -119,8 +127,40 @@ export class PortalAgent {
     return { messages };
   }
 
+  /**
+   * Resolve a channel reference — raw snowflake, `portal:<id>`, or the
+   * `#name (Guild)` label the listings print — to a relay channel id. Reads the
+   * live cache every call (never a startup snapshot: a renamed or re-granted
+   * channel must resolve to what it is NOW). See channel-names.ts.
+   */
+  resolveChannelRef(ref: string): ResolveResult {
+    return resolveChannelRef(ref, () =>
+      buildCandidates(this.client.cache.allChannels(), this.client.cache.allGuilds()));
+  }
+
+  /** `#name (Guild)` for a cached channel; the raw id when unknown. */
+  labelFor(channelId: string): string {
+    const c = this.client.cache.getChannel(channelId);
+    if (!c) return channelId;
+    return formatChannelLabel(c.name ?? c.id, c.guildId ? this.client.cache.getGuild(c.guildId)?.name : undefined);
+  }
+
   /** Dispatch a tool call. Returns a plain JSON-able result. */
   async handleToolCall(name: string, args: Record<string, unknown>): Promise<unknown> {
+    // THE chokepoint for channel addressing: every tool that takes a channelId
+    // goes through here, so a name is resolved exactly once, before any side
+    // effect, or the call fails audibly — never a silent pick, never a name
+    // passed downstream hoping the relay rejects it. Ids pass through untouched.
+    if (typeof args.channelId === 'string' && args.channelId.trim()) {
+      const parsed = parseChannelRef(args.channelId);
+      if (parsed?.kind !== 'id') {
+        const resolved = this.resolveChannelRef(args.channelId);
+        if (!resolved.ok) throw new Error(resolved.message);
+        args = { ...args, channelId: resolved.id };
+      } else if (parsed.id !== args.channelId) {
+        args = { ...args, channelId: parsed.id }; // `portal:<id>` → bare id
+      }
+    }
     switch (name) {
       case 'send_message': {
         // Discord caps content at 2000 chars — split long messages into
@@ -181,8 +221,22 @@ export class PortalAgent {
         );
       case 'list_guilds':
         return this.client.call('list_guilds', {});
-      case 'list_channels':
-        return this.client.call('list_channels', { guildId: str(args.guildId) });
+      case 'list_channels': {
+        // Each channel carries its `label` — the exact string every channelId
+        // argument accepts (display form == address form). Threads/categories
+        // are labelled too but remain id-only addresses.
+        const guildId = str(args.guildId);
+        const guildName = this.client.cache.getGuild(guildId)?.name;
+        const res = (await this.client.call('list_channels', { guildId })) as {
+          channels: Array<{ id: string; name: string | null; type: string }>;
+        };
+        return {
+          channels: res.channels.map((c) => ({
+            ...c,
+            label: formatChannelLabel(c.name ?? c.id, guildName),
+          })),
+        };
+      }
       case 'create_thread':
         return this.client.call('create_thread', {
           channelId: str(args.channelId),
