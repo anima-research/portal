@@ -26,12 +26,16 @@ export interface PortalAgentOptions {
    *  disables the legacy subscription tools and mention auto-subscribe while
    *  leaving the standalone Claude Code channel behavior unchanged. */
   hostOwnsChannelLifecycle?: boolean;
+  /** Called after this persona does something PUBLIC (posts, reacts, edits) —
+   *  a beacon for supervisors that can't see every channel it acts in. */
+  onPublicActivity?: (kind: 'message' | 'reaction' | 'edit') => void;
 }
 
 export class PortalAgent {
   readonly state: AgentState;
   private onPing?: (ping: PendingPing) => void;
   private hostOwnsChannelLifecycle: boolean;
+  private onPublicActivity?: (kind: 'message' | 'reaction' | 'edit') => void;
 
   constructor(
     private client: PortalClient,
@@ -40,6 +44,7 @@ export class PortalAgent {
     this.state = opts.state ?? new AgentState();
     this.onPing = opts.onPing;
     this.hostOwnsChannelLifecycle = opts.hostOwnsChannelLifecycle === true;
+    this.onPublicActivity = opts.onPublicActivity;
     this.client.on('message', (e) => this.ingest(e.message, e.addressedToMe, e.reasons));
     this.client.on('messageUpdate', (e) => {
       // An edit to a message we track refreshes its preview but isn't a new ping.
@@ -137,19 +142,26 @@ export class PortalAgent {
           });
           first ??= result;
         }
+        this.onPublicActivity?.('message');
         return first;
       }
-      case 'edit_message':
-        return this.client.editMessage(str(args.messageId), str(args.content));
+      case 'edit_message': {
+        const edited = await this.client.editMessage(str(args.messageId), str(args.content));
+        this.onPublicActivity?.('edit');
+        return edited;
+      }
       case 'delete_message':
         return this.client.deleteMessage(str(args.messageId));
-      case 'react':
-        return this.client.react(
+      case 'react': {
+        const reacted = await this.client.react(
           str(args.messageId),
           str(args.emoji),
           Boolean(args.visible),
           Boolean(args.native),
         );
+        this.onPublicActivity?.('reaction');
+        return reacted;
+      }
       case 'unreact':
         return this.client.unreact(str(args.messageId), str(args.emoji), Boolean(args.native));
       case 'fetch_history':
