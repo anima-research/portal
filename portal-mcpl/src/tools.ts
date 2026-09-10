@@ -42,10 +42,11 @@ const RELAY_MESSAGE_ID_DESC =
   'tools need channelId+messageId together.)';
 
 const PORTAL_CHANNEL_ID_DESC =
-  'Portal channel (or thread) id. Surface marker: portal namespaces its MCPL ' +
-  'channels as `portal:<channelId>` (no guild segment; the snowflake is globally ' +
-  'unique) — a different id space from the discord-mcpl surface ' +
-  '(`discord:<guildId>:<channelId>`).';
+  'Channel reference. Accepts the label exactly as list_channels prints it — ' +
+  '`#name (Guild)` — or a bare `#name` when unique across your guilds, or a raw ' +
+  'channel/thread id (Discord snowflake or `portal:<channelId>`). Exact match, ' +
+  'case-insensitive, no fuzzy matching; an ambiguous name is an error listing ' +
+  'the qualified labels. Threads and categories are addressable by id only.';
 
 export const toolDefinitions: ToolDefinition[] = [
   {
