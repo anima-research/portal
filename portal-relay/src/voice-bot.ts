@@ -199,6 +199,10 @@ export class VoiceBot {
     private client: Client,
     private elevenKey: string,
     private log: (msg: string) => void = () => {},
+    /** speak: join unmuted so the voice-output path can play through this
+     *  connection (Discord permits one voice connection per guild per bot —
+     *  the listener's connection IS the speaker's connection). */
+    private opts: { speak?: boolean } = {},
   ) {}
 
   on<K extends keyof Handlers>(event: K, fn: Handlers[K]): void {
@@ -214,6 +218,12 @@ export class VoiceBot {
   listeningIn(guildId: string): string | null {
     for (const [cid, e] of this.connections) if (e.guildId === guildId) return cid;
     return null;
+  }
+
+  /** The live connection for a joined channel — the voice-output path plays
+   *  through it. Null when not joined (speaking requires a prior voice_join). */
+  connectionFor(channelId: string): { conn: VoiceConnection; guildId: string } | null {
+    return this.connections.get(channelId) ?? null;
   }
 
   async join(channelId: string): Promise<void> {
@@ -238,7 +248,10 @@ export class VoiceBot {
       guildId: voice.guild.id,
       adapterCreator: voice.guild.voiceAdapterCreator,
       selfDeaf: false,
-      selfMute: true, // we listen; per-agent TTS speaks under its own bot, not this one
+      // Muted unless the relay's voice-output path is configured: the mute
+      // state is honest consent signaling — an unmuted bot says "I may be
+      // audible here" to everyone in the room.
+      selfMute: !this.opts.speak,
     });
     try {
       await entersState(conn, VoiceConnectionStatus.Ready, 15_000);

@@ -81,6 +81,9 @@ export interface PortalClientEvents extends Record<string, (...args: never[]) =>
    *  utteranceId, never replayed on resume. Finals are durable events. */
   voiceTranscript: (e: Extract<PortalEvent, { type: 'voice_transcript' }>) => void;
   voiceStatus: (e: Extract<PortalEvent, { type: 'voice_status' }>) => void;
+  /** Terminal outcome of a voice_speak request this persona made (spoken /
+   *  interrupted / refused / error, with the voiced/unvoiced boundary). */
+  voiceReceipt: (e: Extract<PortalEvent, { type: 'voice_receipt' }>) => void;
   close: (info: { code: number; willReconnect: boolean }) => void;
   error: (err: Error) => void;
 }
@@ -213,6 +216,13 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   }
   voiceLeave(channelId: string) {
     return this.call('voice_leave', { channelId });
+  }
+  /** Speak into a joined voice channel via the relay's grant-checked TTS
+   *  output path. Resolves when queued; the outcome arrives as a
+   *  `voiceReceipt` event carrying the returned requestId. Requires
+   *  VOICE_SPEAK, and the relay must already be joined (voice_join). */
+  voiceSpeak(params: RpcParams<'voice_speak'>) {
+    return this.call('voice_speak', params);
   }
   /** Claim an invite to expand this persona's rights (RFC-005 §5.6). */
   claimInvite(code: string) {
@@ -371,6 +381,9 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         break;
       case 'voice_status':
         this.emit('voiceStatus', event);
+        break;
+      case 'voice_receipt':
+        this.emit('voiceReceipt', event);
         break;
     }
   }
