@@ -371,3 +371,50 @@ test('augment path: machine mints get a flat "not claimable" (mode gate before r
     t.cleanup();
   }
 });
+
+test('an invite carrying roles AND a channel grant enrolls with the union (/invite pins its channel)', async () => {
+  const t = makeRelay();
+  try {
+    // A role that covers CHAN_B only; the grant covers CHAN_A — the channel
+    // /invite was run in — which the role does not.
+    t.relay.permissions.setRole('b-reader', {
+      caps: ['VIEW_CHANNEL', 'READ_HISTORY'],
+      scope: { channels: [CHAN_B] },
+      guildId: GUILD,
+    });
+    t.relay.invites.mint({
+      code: 'inv_slash',
+      roles: ['b-reader'],
+      grant: { caps: [...RW], scope: { channels: [CHAN_A] } },
+      guildId: GUILD,
+      maxUses: 1,
+    });
+    const enrolled = await t.relay.enroll({ invite: 'inv_slash', desiredName: 'newcomer' });
+    assert.ok(!('error' in enrolled), JSON.stringify(enrolled));
+    const pid = enrolled.personaId;
+    assert.deepEqual(t.relay.permissions.getRoleNames(pid), ['b-reader']);
+    assert.deepEqual([...t.relay.permissions.resolve(pid, GUILD, CHAN_A)].sort(), [...RW].sort(), 'channel grant applies');
+    assert.deepEqual(
+      [...t.relay.permissions.resolve(pid, GUILD, CHAN_B)].sort(),
+      ['READ_HISTORY', 'VIEW_CHANNEL'],
+      'role still applies',
+    );
+    assert.equal(t.relay.permissions.resolve(pid, GUILD, FOREIGN_CHAN).size, 0);
+
+    // Augment path unions both too.
+    t.relay.invites.mint({
+      code: 'inv_more',
+      roles: ['b-reader'],
+      grant: { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_B] } },
+      guildId: GUILD,
+      mode: 'augment',
+      maxUses: 1,
+    });
+    t.relay.applyInviteAugment(RANDO, 'inv_more');
+    assert.deepEqual(t.relay.permissions.getRoleNames(RANDO), ['b-reader']);
+    assert.deepEqual([...t.relay.permissions.resolve(RANDO, GUILD, CHAN_A)].sort(), [...RW].sort(), 'existing grant kept');
+    assert.ok(t.relay.permissions.resolve(RANDO, GUILD, CHAN_B).has('VIEW_CHANNEL'));
+  } finally {
+    t.cleanup();
+  }
+});

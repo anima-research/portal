@@ -458,16 +458,16 @@ export class Relay implements GatewayHooks {
   }
 
   /**
-   * Translate an invite into the new persona's permissions (RFC-004). Prefers
-   * access roles (live resolution); else an inline scoped grant; else the
-   * deprecated blanket `caps` (honoured as scope:{all} with a warning). A grant
-   * with no scope-able guild, or an invite granting nothing, yields a
-   * default-deny entry.
+   * Translate an invite into the new persona's permissions (RFC-004): access
+   * roles (live resolution) AND/OR an inline scoped grant — both apply when
+   * both are present, and the persona holds the union (resolve() unions roles
+   * with inline policy). The deprecated blanket `caps` is honoured as
+   * scope:{all} with a warning. A grant with no scope-able guild, or an invite
+   * granting nothing, yields a default-deny entry.
    */
   private applyInviteGrant(personaId: string, inv: InviteTemplate): void {
     if (inv.roles?.length) {
       this.permissions.setPersonaRoles(personaId, inv.roles);
-      return;
     }
     let grant = inv.grant;
     if (!grant && inv.caps?.length) {
@@ -703,13 +703,12 @@ export class Relay implements GatewayHooks {
     if (staleMint) throw rpcError('FORBIDDEN', staleMint);
     if (checked.roles?.length) {
       this.permissions.addPersonaRoles(personaId, checked.roles);
-    } else {
-      const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
-      if (grant) {
-        const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
-        const base = this.permissions.getPolicy(personaId) ?? { default: [] };
-        this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
-      }
+    }
+    const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
+    if (grant) {
+      const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
+      const base = this.permissions.getPolicy(personaId) ?? { default: [] };
+      this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
     }
     this.invites.consume(code);
     return { roles: this.permissions.getRoleNames(personaId) };
