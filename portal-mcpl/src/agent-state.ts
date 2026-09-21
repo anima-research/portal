@@ -150,6 +150,11 @@ export class AgentState {
     this.emitChange();
   }
 
+  /** Highest createdAt marked read in a channel, if any. */
+  watermark(channelId: string): string | undefined {
+    return this.watermarks.get(channelId);
+  }
+
   pendingPings(): PendingPing[] {
     return [...this.pings];
   }
