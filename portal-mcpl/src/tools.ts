@@ -12,20 +12,28 @@ export interface ToolDefinition {
 const FILES_PROP = {
   type: 'array',
   description:
-    'Optional file attachments (up to 10; ~8 MiB total). This (portal) surface ' +
-    'takes inline base64 BYTES: provide each file as `bytes` (preferred — works ' +
-    'from anywhere) with a `name`. A host `path` works only if the relay is ' +
-    'configured to read path files. (The discord-mcpl surface is the opposite — ' +
-    'it uploads by host file PATH and does NOT accept base64 bytes.)',
+    'Optional file attachments (up to 10; ~8 MiB total). Each item is EITHER a ' +
+    'plain string (a local file path like "~/out/plot.png" or an http(s) URL) OR ' +
+    'an object with exactly one of `path` / `url` / `bytes`. Paths are read and ' +
+    'URLs fetched HERE on your host and uploaded for you — you never need to ' +
+    'base64 anything yourself. `name` defaults to the file/URL basename; ' +
+    '`contentType` is inferred from the extension. (The discord-mcpl surface ' +
+    'takes host paths only.)',
   items: {
-    type: 'object',
-    properties: {
-      bytes: { type: 'string', description: 'Base64-encoded file content (preferred)' },
-      name: { type: 'string', description: 'Display filename (required with bytes)' },
-      contentType: { type: 'string', description: 'Optional MIME type' },
-      path: { type: 'string', description: 'Path the relay can read (only if the relay allows path files)' },
-      description: { type: 'string', description: 'Optional alt-text' },
-    },
+    anyOf: [
+      { type: 'string', description: 'A local file path or an http(s) URL' },
+      {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Local file path (absolute, ~-relative, or relative to the working dir)' },
+          url: { type: 'string', description: 'http(s) URL to fetch and attach' },
+          bytes: { type: 'string', description: 'Base64-encoded content (only if you already hold bytes)' },
+          name: { type: 'string', description: 'Display filename (required with bytes; inferred otherwise)' },
+          contentType: { type: 'string', description: 'Optional MIME type (inferred from name/response if omitted)' },
+          description: { type: 'string', description: 'Optional alt-text' },
+        },
+      },
+    ],
   },
 };
 

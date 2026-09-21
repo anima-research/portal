@@ -188,3 +188,17 @@ ChapterX then maps its in-memory image/file Buffers directly:
 
 ~half a day: ~8 lines of protocol, the `buildAttachments` branch + two config
 knobs + validation, the client helper, and the live PNG assertion.
+
+---
+
+### Addendum 2026-08-28 — `portal-mcpl` resolves `path`/`url` locally
+
+The wire contract above (bytes-only, relay disk closed) stays. But asking an
+LLM tool call for base64 was a non-starter in practice, so `portal-mcpl`
+(`src/files.ts`) now does the conversion **on the resident's host** before the
+send: `send_message.files` items may be a bare string (local path or http(s)
+URL) or `{path|url|bytes, name?, contentType?, description?}`. Paths are read
+locally (`~` and cwd-relative OK), URLs fetched, name/MIME inferred, the
+per-message budget checked with a legible error, and only `bytes` ever reach
+the relay. Knobs: `PORTAL_FILE_ROOTS` (fence paths), `PORTAL_MAX_FILE_BYTES`,
+`PORTAL_ALLOW_URL_FILES=false`. Tests: `portal-mcpl/test/files.test.ts`.

@@ -16,6 +16,7 @@ import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
 import { AgentState, type PendingPing } from './agent-state.js';
 import { chunkText } from './chunk.js';
 import { toolDefinitions } from './tools.js';
+import { resolveOutgoingFiles, type ResolveFilesOptions } from './files.js';
 
 export interface PortalAgentOptions {
   /** Restore persisted read-state (watermarks + pings). */
@@ -26,12 +27,19 @@ export interface PortalAgentOptions {
    *  disables the legacy subscription tools and mention auto-subscribe while
    *  leaving the standalone Claude Code channel behavior unchanged. */
   hostOwnsChannelLifecycle?: boolean;
+  /** How `send_message.files` paths/URLs are resolved to bytes (see files.ts). */
+  files?: ResolveFilesOptions;
+  /** Called after this persona does something PUBLIC (posts, reacts, edits) —
+   *  a beacon for supervisors that can't see every channel it acts in. */
+  onPublicActivity?: (kind: 'message' | 'reaction' | 'edit') => void;
 }
 
 export class PortalAgent {
   readonly state: AgentState;
   private onPing?: (ping: PendingPing) => void;
   private hostOwnsChannelLifecycle: boolean;
+  private fileOpts: ResolveFilesOptions;
+  private onPublicActivity?: (kind: 'message' | 'reaction' | 'edit') => void;
 
   constructor(
     private client: PortalClient,
@@ -40,6 +48,8 @@ export class PortalAgent {
     this.state = opts.state ?? new AgentState();
     this.onPing = opts.onPing;
     this.hostOwnsChannelLifecycle = opts.hostOwnsChannelLifecycle === true;
+    this.fileOpts = opts.files ?? {};
+    this.onPublicActivity = opts.onPublicActivity;
     this.client.on('message', (e) => this.ingest(e.message, e.addressedToMe, e.reasons));
     this.client.on('messageUpdate', (e) => {
       // An edit to a message we track refreshes its preview but isn't a new ping.
@@ -122,6 +132,10 @@ export class PortalAgent {
         // sequential sends (files/reply/mentions ride on the first chunk).
         const content = optStr(args.content);
         const chunks = content !== undefined ? chunkText(content) : [content];
+        // Paths/URLs become inline bytes here, on the resident's host — the
+        // relay only ever sees `bytes` (RFC-003 keeps its own disk closed).
+        const files = await resolveOutgoingFiles(args.files, this.fileOpts);
+        if (!files && content === undefined) throw new Error('send_message needs content or files');
         let first: unknown;
         for (let i = 0; i < chunks.length; i++) {
           const result = await this.client.sendMessage({
@@ -129,7 +143,7 @@ export class PortalAgent {
             content: chunks[i],
             ...(i === 0
               ? {
-                  files: args.files as never,
+                  files,
                   replyToId: optStr(args.replyToId),
                   mentionPersonaIds: args.mentionPersonaIds as string[] | undefined,
                 }
@@ -137,19 +151,26 @@ export class PortalAgent {
           });
           first ??= result;
         }
+        this.onPublicActivity?.('message');
         return first;
       }
-      case 'edit_message':
-        return this.client.editMessage(str(args.messageId), str(args.content));
+      case 'edit_message': {
+        const edited = await this.client.editMessage(str(args.messageId), str(args.content));
+        this.onPublicActivity?.('edit');
+        return edited;
+      }
       case 'delete_message':
         return this.client.deleteMessage(str(args.messageId));
-      case 'react':
-        return this.client.react(
+      case 'react': {
+        const reacted = await this.client.react(
           str(args.messageId),
           str(args.emoji),
           Boolean(args.visible),
           Boolean(args.native),
         );
+        this.onPublicActivity?.('reaction');
+        return reacted;
+      }
       case 'unreact':
         return this.client.unreact(str(args.messageId), str(args.emoji), Boolean(args.native));
       case 'fetch_history':
