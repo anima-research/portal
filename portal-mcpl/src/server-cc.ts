@@ -26,6 +26,8 @@ import {
 import type { PortalClient } from '@animalabs/portal-client';
 import type { PortalMessage } from '@animalabs/portal-protocol';
 import type { PortalAgent } from './agent.js';
+import type { WakeSink } from './wake-sink.js';
+import { IDENTITY_TOOL_FEATURE_SETS, identityToolDefinitions, type IdentityToolHandler } from './identity.js';
 
 /** Claude Code's channel push notification method. */
 const CHANNEL_NOTIFY = 'notifications/claude/channel';
@@ -44,7 +46,18 @@ export class PortalCcChannelServer {
   constructor(
     private client: PortalClient,
     private agent: PortalAgent,
+    /** Where wakes go. Default: Claude Code's channel notification. A sink
+     *  (see wake-sink.ts) lets a host without channel push — codex — be woken
+     *  from here, where the relay already delivers this persona's mentions. */
+    private readonly opts: {
+      wakeSink?: WakeSink;
+      /** Attach to expose list/mint/switch_identity (see identity.ts). */
+      identity?: IdentityToolHandler;
+    } = {},
   ) {}
+
+  /** Unsubscribers for the listeners on the CURRENT client (see swapSession). */
+  private unwire: Array<() => void> = [];
 
   async serve(conn: McplConnection): Promise<void> {
     this.conn = conn;
@@ -99,13 +112,18 @@ export class PortalCcChannelServer {
     try {
       switch (req.method) {
         case 'tools/list':
-          conn.sendResponse(req.id, { tools: this.agent.tools });
+          conn.sendResponse(req.id, {
+            tools: this.opts.identity ? [...this.agent.tools, ...identityToolDefinitions] : this.agent.tools,
+          });
           break;
         case 'tools/call': {
-          const out = await this.agent.handleToolCall(
-            params.name as string,
-            (params.arguments ?? {}) as Record<string, unknown>,
-          );
+          const toolName = params.name as string;
+          const toolArgs = (params.arguments ?? {}) as Record<string, unknown>;
+          // Identity tools act on the session itself, above the swappable agent.
+          const out =
+            this.opts.identity && toolName in IDENTITY_TOOL_FEATURE_SETS
+              ? await this.opts.identity.handleToolCall(toolName, toolArgs)
+              : await this.agent.handleToolCall(toolName, toolArgs);
           conn.sendResponse(req.id, { content: [textContent(stringify(out))] });
           break;
         }
@@ -129,7 +147,9 @@ export class PortalCcChannelServer {
   // ── Portal inbound → Claude Code channel notification ──
 
   private wireClient(): void {
-    this.client.on('message', (e) => {
+    for (const off of this.unwire) off();
+    this.unwire = [];
+    this.unwire.push(this.client.on('message', (e) => {
       if (e.addressedToMe) this.wokenPings.add(e.message.id); // live wake covers it
       if (process.env.PORTAL_DEBUG) {
         console.error(
@@ -141,15 +161,52 @@ export class PortalCcChannelServer {
       void this.pushMessage(e.message, e.addressedToMe, e.reasons).catch((err) =>
         console.error('[portal-cc] push failed:', (err as Error).message),
       );
-    });
+    }));
     // On a fresh identify (reconnect after a gap, or first connect), the relay
     // holds any pings that arrived while we were away. Surface them as a single
     // catch-up wake — O(missed) from the relay, no Discord history scan.
-    this.client.on('ready', () => {
+    this.unwire.push(this.client.on('ready', () => {
       void this.catchUp().catch((err) =>
         console.error('[portal-cc] catch-up failed:', (err as Error).message),
       );
-    });
+    }));
+  }
+
+  /**
+   * Replace the live (client, agent) pair with another identity's.
+   *
+   * Contract: `client` is already connected and `ready` (the identity manager
+   * only swaps after `connect()` resolves); the caller closes the old client.
+   *
+   * This binding has no host-side channel registry, so there is nothing to
+   * retract. What does carry over is the set of channels being FOLLOWED: a
+   * Claude Code session that switches persona is still the same session, and
+   * silently going deaf to the rooms it was in would be a surprise. They are
+   * added to the new identity's durable subscriptions wherever it can see the
+   * channel. `seeded` is kept for the same reason — it records what is already
+   * in this session's context, which the switch did not change. `wokenPings`
+   * is per-persona and resets, so pings the new identity accrued while inactive
+   * arrive as one catch-up.
+   */
+  async swapSession(client: PortalClient, agent: PortalAgent): Promise<void> {
+    const following = this.agent.state.subscriptionList();
+    this.client = client;
+    this.agent = agent;
+    this.wokenPings.clear();
+    this.wireClient(); // detaches the outgoing client's listeners first
+
+    const visible = new Set(client.cache.allChannels().map((channel) => channel.id));
+    for (const channelId of following) {
+      // subscribe() is false when already followed — identify replayed those.
+      if (!visible.has(channelId) || !agent.state.subscribe(channelId)) continue;
+      void client.subscribe(channelId).catch((err) =>
+        console.error(`[portal-cc] failed to follow ${channelId} under the new identity:`, (err as Error).message),
+      );
+    }
+    // The new client's `ready` fired before we were listening.
+    void this.catchUp().catch((err) =>
+      console.error('[portal-cc] catch-up failed:', (err as Error).message),
+    );
   }
 
   /** Wake once for pings accrued while offline (server-authoritative). */
@@ -186,7 +243,28 @@ export class PortalCcChannelServer {
     if (process.env.PORTAL_DEBUG) {
       console.error(`[portal-cc] CATCH-UP wake: ${fresh.length} missed ping(s)`);
     }
-    this.conn.sendNotification(CHANNEL_NOTIFY, { content: lines.join('\n'), meta });
+    this.deliverWake(lines.join('\n'), meta, fresh.map((p) => p.message.id));
+  }
+
+  /** Hand a wake to the host. Claude Code: channel notification. A configured
+   *  sink: its own transport, asynchronously — on failure the pings are
+   *  un-marked so a later catch-up (next reconnect) can surface them again; the
+   *  relay holds them as pending regardless. */
+  private deliverWake(content: string, meta: Record<string, string>, pingIds: string[]): void {
+    const sink = this.opts.wakeSink;
+    if (!sink) {
+      this.conn?.sendNotification(CHANNEL_NOTIFY, { content, meta });
+      return;
+    }
+    sink.deliver({ content, meta }).then(
+      () => {
+        if (process.env.PORTAL_DEBUG) console.error(`[portal-cc] wake delivered via ${sink.kind} (${meta.channelId})`);
+      },
+      (err: Error) => {
+        for (const id of pingIds) this.wokenPings.delete(id);
+        console.error(`[portal-cc] wake via ${sink.kind} failed: ${err.message}`);
+      },
+    );
   }
 
   /**
@@ -202,7 +280,6 @@ export class PortalCcChannelServer {
   private async pushMessage(message: PortalMessage, addressedToMe: boolean, reasons: string[]): Promise<void> {
     if (!this.conn) return;
     if (!addressedToMe) return; // ambient: surfaced as context on the next wake
-    const conn = this.conn;
     const channelId = message.channelId;
 
     // Flush everything unseen (includes this message), oldest first.
@@ -247,7 +324,7 @@ export class PortalCcChannelServer {
         `[portal-cc] WAKE ch=${channelId} contextMsgs=${all.length} omitted=${omitted} (folded backlog + trigger)`,
       );
     }
-    conn.sendNotification(CHANNEL_NOTIFY, { content: this.buildContent(all, message, omitted), meta });
+    this.deliverWake(this.buildContent(all, message, omitted), meta, [message.id]);
   }
 
   /** Render the wake payload: optional truncation note, channel-labeled lines,
