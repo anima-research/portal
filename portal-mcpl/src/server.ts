@@ -437,7 +437,7 @@ export class PortalMcplServer {
     if (!channelId || !channel) throw new Error('unknown channel');
 
     const result: ChannelsOpenResult = {
-      channel: toDescriptor(channel, false),
+      channel: toDescriptor(channel, false, undefined, this.guildName(channel.guildId)),
     };
     const requested = open.history?.limit ?? 0;
     if (requested > 0) {
@@ -874,9 +874,14 @@ export class PortalMcplServer {
       .catch((err) => this.notePushRejection('catch-up push', err));
   }
 
+  /** `#name (Guild)` — the same label the descriptors carry and every
+   *  channelId tool argument accepts (channel-names.ts). */
   private channelLabel(channelId: string): string {
-    const name = this.client.cache.getChannel(channelId)?.name;
-    return name ? `#${name}` : channelId;
+    return this.agent.labelFor(channelId);
+  }
+
+  private guildName(guildId: string | null): string | undefined {
+    return guildId ? this.client.cache.getGuild(guildId)?.name : undefined;
   }
 
   // ── Channels ──
@@ -884,7 +889,8 @@ export class PortalMcplServer {
   private allDescriptors(): ChannelDescriptor[] {
     return this.client.cache
       .allChannels()
-      .map((channel) => toDescriptor(channel, this.agent.state.isSubscribed(channel.id)));
+      .map((channel) =>
+        toDescriptor(channel, this.agent.state.isSubscribed(channel.id), undefined, this.guildName(channel.guildId)));
   }
 
   /** Drop the legacy file-backed subscription for each channel that has now
