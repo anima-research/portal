@@ -30,25 +30,37 @@
  *   }
  *
  * The relay must be reachable at PORTAL_URL.
+ *
+ * Runtime identities (on by default; PORTAL_IDENTITY_SWITCHING=0 disables): the
+ * `portal.identity` feature set — list_identities / mint_identity /
+ * switch_identity — lets the resident mint personas (with PORTAL_INVITE or an
+ * invite passed to the tool) and switch between them WITHOUT a restart. The
+ * roster lives at PORTAL_IDENTITIES (default <creds-dir>/<name>.identities.json)
+ * and remembers the active identity across restarts; PORTAL_IDENTITY_MAX caps
+ * its size (default 12). See identity.ts for the authority model.
  */
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { McplConnection } from '@animalabs/mcpl-core';
-import { PortalClient, loadOrEnrollCreds } from '@animalabs/portal-client';
-import { PortalAgent } from './agent.js';
-import { AgentState } from './agent-state.js';
+import { loadOrEnrollCreds, type PortalCredentials } from '@animalabs/portal-client';
+import { fileOptionsFromEnv } from './files.js';
 import { PortalMcplServer } from './server.js';
+import { IdentityManager, identitySwitchingEnabled, slugName, type PortalSession } from './identity.js';
+import { buildSession } from './session.js';
 
-/** Slug a persona name into a safe filename stem. */
-function slugName(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'agent';
+interface RootIdentity {
+  name: string;
+  creds: PortalCredentials;
+  /** null when the identity came from PORTAL_TOKEN/PORTAL_PERSONA. */
+  credsPath: string | null;
 }
 
-async function resolveCreds(url: string): Promise<{ personaId: string; token: string }> {
+async function resolveRoot(url: string): Promise<RootIdentity> {
   const token = process.env.PORTAL_TOKEN;
   const persona = process.env.PORTAL_PERSONA;
-  if (token && persona) return { personaId: persona, token };
+  if (token && persona) {
+    return { name: process.env.PORTAL_PERSONA_NAME ?? persona, creds: { personaId: persona, token }, credsPath: null };
+  }
 
   // Self-enroll path (cached → reused; idempotent).
   const desiredName = process.env.PORTAL_PERSONA_NAME;
@@ -60,63 +72,69 @@ async function resolveCreds(url: string): Promise<{ personaId: string; token: st
     console.error('[portal-mcpl] need PORTAL_TOKEN+PORTAL_PERSONA, or PORTAL_PERSONA_NAME(+PORTAL_INVITE)');
     process.exit(1);
   }
-  return loadOrEnrollCreds({ url, credsPath, invite, desiredName });
+  const creds = await loadOrEnrollCreds({ url, credsPath, invite, desiredName });
+  return { name: desiredName ?? creds.personaId, creds, credsPath };
 }
 
 async function main(): Promise<void> {
   const url = process.env.PORTAL_URL ?? 'ws://127.0.0.1:8790';
-  const { personaId, token } = await resolveCreds(url);
+  const root = await resolveRoot(url);
+  const credsDir =
+    process.env.PORTAL_CREDENTIALS ? dirname(process.env.PORTAL_CREDENTIALS) : join(homedir(), '.portal');
 
-  // Durable agent state (watermarks + pending pings plus legacy subscriptions).
+  // PORTAL_SUBSCRIPTIONS is a bootstrap seed for the CONFIGURED identity. Once
+  // the host acknowledges the registration, Chronicle becomes the source of
+  // truth for channel lifecycle. PORTAL_STATE likewise names the root's file.
+  const seedSubscriptions = (process.env.PORTAL_SUBSCRIPTIONS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   // The MCPL host owns channel lifecycle in Chronicle. Existing file-backed
   // subscriptions are advertised once as `initiallyOpen`, then removed after
   // the host acknowledges channels/register; the remaining state stays local.
-  const credsDir =
-    process.env.PORTAL_CREDENTIALS ? dirname(process.env.PORTAL_CREDENTIALS) : join(homedir(), '.portal');
-  const statePath = process.env.PORTAL_STATE ?? join(credsDir, `${personaId}.state.json`);
-  let state: AgentState;
-  try {
-    state = existsSync(statePath)
-      ? AgentState.fromJSON(JSON.parse(readFileSync(statePath, 'utf8')))
-      : new AgentState();
-  } catch (err) {
-    console.error('[portal-mcpl] state load failed, starting fresh:', (err as Error).message);
-    state = new AgentState();
+  const sessionFor = (creds: PortalCredentials): PortalSession =>
+    buildSession(creds, {
+      url,
+      stateDir: credsDir,
+      agent: { hostOwnsChannelLifecycle: true, files: fileOptionsFromEnv() },
+      ...(creds.personaId === root.creds.personaId
+        ? { statePath: process.env.PORTAL_STATE, seedSubscriptions }
+        : {}),
+    });
+
+  // Runtime identity minting/switching (default on; PORTAL_IDENTITY_SWITCHING=0
+  // disables) lets the resident create Discord-visible personas on its own.
+  const identity = identitySwitchingEnabled()
+    ? new IdentityManager({
+        url,
+        credsDir,
+        rosterPath:
+          process.env.PORTAL_IDENTITIES ?? join(credsDir, `${slugName(root.name)}.identities.json`),
+        invite: process.env.PORTAL_INVITE,
+        root,
+        createSession: sessionFor,
+        maxIdentities: Number(process.env.PORTAL_IDENTITY_MAX) || undefined,
+      })
+    : undefined;
+
+  const session = sessionFor(identity ? identity.startupCreds() : root.creds);
+  const server = new PortalMcplServer(session.client, session.agent, { identity });
+  identity?.bind(session, (next) => server.swapSession(next.client, next.agent));
+
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(sig, () => {
+      (identity?.session ?? session).close();
+      process.exit(0);
+    });
   }
-
-  // PORTAL_SUBSCRIPTIONS is a bootstrap seed. Once the host acknowledges the
-  // registration, Chronicle becomes the source of truth for channel lifecycle.
-  for (const ch of (process.env.PORTAL_SUBSCRIPTIONS ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
-    state.subscribe(ch);
-  }
-
-  let writeTimer: ReturnType<typeof setTimeout> | undefined;
-  const flush = (): void => {
-    clearTimeout(writeTimer);
-    try {
-      mkdirSync(dirname(statePath), { recursive: true });
-      writeFileSync(statePath, JSON.stringify(state.toJSON(), null, 2), { mode: 0o600 });
-    } catch (err) {
-      console.error('[portal-mcpl] state write failed:', (err as Error).message);
-    }
-  };
-  state.onChange(() => {
-    clearTimeout(writeTimer);
-    writeTimer = setTimeout(flush, 500);
-  });
-  for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { flush(); process.exit(0); });
-
-  const client = new PortalClient({ url, token, personaId, subscriptions: state.subscriptionList() });
-  const agent = new PortalAgent(client, { state, hostOwnsChannelLifecycle: true });
-  const server = new PortalMcplServer(client, agent);
 
   // Connect to the relay in the background; the MCPL handshake can proceed and
   // channels register once `ready` fires. A relay outage degrades to empty
   // channels + failing tool calls rather than blocking the host handshake.
-  client.connect().catch((err) => console.error('[portal-mcpl] relay connect failed:', err.message));
+  session.client.connect().catch((err) => console.error('[portal-mcpl] relay connect failed:', err.message));
 
   // stdout is the MCPL protocol channel; logs go to stderr.
-  console.error(`[portal-mcpl] serving persona "${personaId}" via ${url}`);
+  console.error(
+    `[portal-mcpl] serving persona "${session.creds.personaId}" via ${url}` +
+      (identity ? ' (identity switching enabled)' : ''),
+  );
   const conn = McplConnection.fromStreams(process.stdin, process.stdout);
   await server.serve(conn);
 }

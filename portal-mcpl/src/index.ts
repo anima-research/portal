@@ -12,3 +12,7 @@ export { AgentState } from './agent-state.js';
 export type { PendingPing, ChannelUnread } from './agent-state.js';
 export { toolDefinitions } from './tools.js';
 export type { ToolDefinition } from './tools.js';
+export { buildSession } from './session.js';
+export type { BuildSessionOptions } from './session.js';
+export { IdentityManager, identityToolDefinitions, identityFeatureSets } from './identity.js';
+export type { IdentityManagerOptions, IdentityRecord, IdentityToolHandler, PortalSession } from './identity.js';

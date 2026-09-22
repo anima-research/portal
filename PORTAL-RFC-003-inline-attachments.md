@@ -188,3 +188,27 @@ ChapterX then maps its in-memory image/file Buffers directly:
 
 ~half a day: ~8 lines of protocol, the `buildAttachments` branch + two config
 knobs + validation, the client helper, and the live PNG assertion.
+
+---
+
+### Addendum 2026-08-28 — `portal-mcpl` resolves `path`/`url` locally
+
+The wire contract above (bytes-only, relay disk closed) stays. But asking an
+LLM tool call for base64 was a non-starter in practice, so `portal-mcpl`
+(`src/files.ts`) now does the conversion **on the resident's host** before the
+send: `send_message.files` items may be a bare string (local path or http(s)
+URL) or `{path|url|bytes, name?, contentType?, description?}`. Paths are read
+locally (`~` and cwd-relative OK), URLs fetched, name/MIME inferred, the
+per-message budget checked with a legible error, and only `bytes` ever reach
+the relay. Knobs: `PORTAL_FILE_ROOTS` (fence paths), `PORTAL_MAX_FILE_BYTES`,
+`PORTAL_ALLOW_URL_FILES=false`, `PORTAL_ALLOW_PRIVATE_URLS=true`. Tests:
+`portal-mcpl/test/files.test.ts`.
+
+Guards (2026-09-21): `url` items refuse hosts that are, or resolve to,
+loopback / private / link-local addresses, re-checked at every redirect hop
+(the fetch runs on the resident's host, so this is the SSRF door); bodies are
+streamed under the remaining budget and cut off at the cap, so a missing or
+lying `Content-Length` can't buffer an unbounded body. `PORTAL_FILE_ROOTS`
+fences the `realpath` of the file, so a symlink inside a root can't reach
+outside it. `bytes` must be strict base64 (Node's lenient decoder would turn a
+mistyped payload into a silently truncated attachment).

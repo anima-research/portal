@@ -177,6 +177,15 @@ test('/invite mints a single-use invite carrying the given roles', () => {
     assert.deepEqual(minted.roles, ['chan-role', 'guild-role']);
     assert.equal(minted.maxUses, 1);
     assert.equal(minted.label, 'for tavy');
+    // The channel it was run in rides along as a direct grant (default: write).
+    assert.match(reply, /plus write access to #general/);
+    assert.deepEqual(minted.grant, { caps: LEVEL_CAPS.write, scope: { channels: [CHAN] } });
+    assert.equal(minted.guildId, GUILD);
+
+    t.invites.revoke('inv_TESTCODE');
+    const ro = t.handler.handle(t.inv('invite', { role: 'guild-role', level: 'read' }));
+    assert.match(ro, /plus read access/);
+    assert.deepEqual(t.invites.get('inv_TESTCODE')!.grant!.caps, LEVEL_CAPS.read);
 
     assert.match(t.handler.handle(t.inv('invite', { role: 'nope' })), /No such access role/);
   } finally {
