@@ -50,10 +50,11 @@ const RELAY_MESSAGE_ID_DESC =
   'tools need channelId+messageId together.)';
 
 const PORTAL_CHANNEL_ID_DESC =
-  'Portal channel (or thread) id. Surface marker: portal namespaces its MCPL ' +
-  'channels as `portal:<channelId>` (no guild segment; the snowflake is globally ' +
-  'unique) — a different id space from the discord-mcpl surface ' +
-  '(`discord:<guildId>:<channelId>`).';
+  'Channel reference. Accepts the label exactly as list_channels prints it — ' +
+  '`#name (Guild)` — or a bare `#name` when unique across your guilds, or a raw ' +
+  'channel/thread id (Discord snowflake or `portal:<channelId>`). Exact match, ' +
+  'case-insensitive, no fuzzy matching; an ambiguous name is an error listing ' +
+  'the qualified labels. Threads and categories are addressable by id only.';
 
 export const toolDefinitions: ToolDefinition[] = [
   {
@@ -295,6 +296,70 @@ export const toolDefinitions: ToolDefinition[] = [
       type: 'object',
       properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },
       required: ['channelId'],
+    },
+  },
+  {
+    name: 'voice_join',
+    description:
+      'Ask the relay to join a voice channel and transcribe speech there ' +
+      '(ElevenLabs Scribe). Final transcripts appear in your context as ' +
+      '[voice] lines for channels you have open; they never wake you. ' +
+      'Requires the VOICE_LISTEN capability in that channel. The relay listens ' +
+      'in at most ONE voice channel per guild, shared by everyone: joining a ' +
+      'second channel fails with CONFLICT until someone calls voice_leave on ' +
+      'the first. Listening can also end on its own (channel deleted, bot moved, ' +
+      'voice server lost) — a "[voice] transcription stopped" line reports it; ' +
+      'call voice_join again to resume.',
+    inputSchema: {
+      type: 'object',
+      properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },
+      required: ['channelId'],
+    },
+  },
+  {
+    name: 'voice_leave',
+    description:
+      'Ask the relay to stop listening in a voice channel. The listener is ' +
+      'shared: this stops transcription for every agent following that channel.',
+    inputSchema: {
+      type: 'object',
+      properties: { channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC } },
+      required: ['channelId'],
+    },
+  },
+  {
+    name: 'voice_speak',
+    description:
+      'Speak text aloud in a voice channel, in your registered voice, through ' +
+      'the relay\'s grant-checked TTS output path. The relay must already be ' +
+      'joined there (voice_join) and you need the VOICE_SPEAK capability. The ' +
+      'call returns once your utterance is QUEUED; synthesis waits until the ' +
+      'room\'s audio is clear (words wait patiently — nothing plays over live ' +
+      'speech), and the outcome arrives later as a [voice] receipt line: ' +
+      'spoken, interrupted (with exactly which words were heard and which were ' +
+      'cut off — yours to re-say or let go), refused (no valid floor grant; on ' +
+      'an ungoverned relay grants are not required), or error. Anything ' +
+      'refused or dropped before it started playing cost nothing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC },
+        text: {
+          type: 'string',
+          description: 'What to say — one conversational turn (≤2000 chars).',
+        },
+        requestId: {
+          type: 'string',
+          description: 'Optional tracking key echoed on the receipt (unique per request).',
+        },
+        grant: {
+          type: 'object',
+          description:
+            'Floor grant authorizing this utterance (grantId, roomBinding, ' +
+            'logicEpoch, processEpoch, expiresAt). Omit on ungoverned relays.',
+        },
+      },
+      required: ['channelId', 'text'],
     },
   },
   {

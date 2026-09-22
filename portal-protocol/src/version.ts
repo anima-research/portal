@@ -10,6 +10,14 @@
 // v3: additive server-authoritative read-state RPC — `get_pending_pings`,
 // `list_unread`, `mark_read`, `channel_missed`. Same compatibility contract:
 // older clients never call them; the relay still accepts lower client versions.
-export const PORTAL_PROTOCOL_VERSION = 3 as const;
+// v4: additive voice transcription — `voice_join`/`voice_leave` RPC,
+// `voice_transcript`/`voice_status` events, `VOICE_LISTEN` capability, and the
+// `dispatch_ephemeral` server op for unsequenced display-only partials (pre-v4
+// clients drop the unknown op in parseServerFrame; finals ride normal
+// `dispatch`). Older clients remain fully functional.
+// v5: additive voice output (RFC-006 §1.4) — `voice_speak` RPC, `voice_receipt`
+// event, `VOICE_SPEAK` capability. Same contract: older clients never call it
+// and ignore the unknown event type; the relay accepts lower client versions.
+export const PORTAL_PROTOCOL_VERSION = 5 as const;
 
 export type ProtocolVersion = typeof PORTAL_PROTOCOL_VERSION;

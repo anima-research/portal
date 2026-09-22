@@ -41,6 +41,18 @@
  *   PORTAL_ADMIN_SESSION_TTL_MS  Session TTL in ms (default 1800000 = 30 min).
  *   PORTAL_ADMIN_AUDIT           Append-only audit log path, JSONL (required).
  *   PORTAL_ADMIN_COOKIE_INSECURE Set "true" to drop the cookie Secure flag (local dev only).
+ *
+ *   Voice (RFC-006):
+ *   ELEVENLABS_KEY          Optional. Enables voice transcription (voice_join,
+ *                           Scribe v2 realtime). Unset ⇒ voice RPCs return UNAVAILABLE.
+ *   PORTAL_VOICE_REGISTRY   Optional. Path to the voice-registry JSON (speaker → voice).
+ *                           With ELEVENLABS_KEY, enables the grant-checked TTS output
+ *                           path (voice_speak); the relay then joins voice channels
+ *                           unmuted. Unset ⇒ voice_speak returns UNAVAILABLE.
+ *   PORTAL_VOICE_OUTPUT     Optional. "ungoverned" is the explicit operator opt-in for
+ *                           floor-less rooms (carrier gate is the only physics). Any
+ *                           other value (or unset) = refuse-all: with no floor service
+ *                           deployed every voice_speak refuses, fail closed.
  */
 import { loadConfig } from './config.js';
 import { Relay } from './relay.js';

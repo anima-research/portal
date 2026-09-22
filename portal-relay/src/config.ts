@@ -120,8 +120,10 @@ export interface InviteTemplate {
   /**
    * Inline scoped grant (RFC-004), applied IN ADDITION to `roles` when both
    * are present (`/invite` uses this to pin access to the channel it was run
-   * in, whatever the roles say). A `mirrorRole` scope here is snapshotted at
-   * enroll time into a channel list; use `roles` for live mirroring.
+   * in, whatever the roles say). A mirror scope here is materialized at
+   * enroll/claim time into a shared content-addressed access role
+   * (`mirror-<hash>`), so it resolves live and tracks Discord visibility over
+   * time — including channels created later.
    */
   grant?: { caps: Capability[]; scope: Scope };
   /** Guild the inline `grant`/scope applies to (required for non-`all` scopes). */
@@ -258,6 +260,21 @@ export interface RelayConfig {
   /** Prepend a quoted jump-link when a persona replies (webhooks can't carry a
    *  native Discord reply). Default true; set false to suppress the header. */
   replyLink: boolean;
+  /** ElevenLabs API key for voice transcription (Scribe v2 realtime).
+   *  Undefined ⇒ voice_join RPC returns UNAVAILABLE; no other effect. */
+  elevenLabsKey?: string;
+  /** Path to the voice-registry JSON (speaker → voice; see the voice-registry
+   *  repo). Together with elevenLabsKey this enables the voice OUTPUT path
+   *  (voice_speak, RFC-006 §1.4): the relay joins voice channels unmuted and
+   *  loads the wiring module. Undefined ⇒ voice_speak returns UNAVAILABLE;
+   *  transcription is unaffected. */
+  voiceRegistryPath?: string;
+  /** Grant authority stance for voice output. 'refuse-all' (default): no
+   *  floor service is deployed, so every voice_speak is refused with a
+   *  receipt — fail closed per RFC-006 §1.4. 'ungoverned': explicit operator
+   *  opt-in for floor-less rooms; the carrier gate becomes the only physics.
+   *  Never default to ungoverned. */
+  voiceOutputStance?: 'refuse-all' | 'ungoverned';
   /** Admin panel / HTTP API (RFC-005). Undefined ⇒ disabled. */
   admin?: AdminConfig;
 }
@@ -265,6 +282,9 @@ export interface RelayConfig {
 export function loadConfig(): RelayConfig {
   return {
     discordToken: requireEnv('DISCORD_TOKEN'),
+    elevenLabsKey: process.env.ELEVENLABS_KEY || undefined,
+    voiceRegistryPath: process.env.PORTAL_VOICE_REGISTRY || undefined,
+    voiceOutputStance: process.env.PORTAL_VOICE_OUTPUT === 'ungoverned' ? 'ungoverned' : 'refuse-all',
     wsPort: parseInt(process.env.PORTAL_WS_PORT ?? '8790', 10),
     avatarBaseUrl: (process.env.PORTAL_AVATAR_BASE_URL ?? '').replace(/\/$/, ''),
     guildIds: splitCsv(process.env.DISCORD_GUILD_ID),

@@ -76,6 +76,14 @@ export interface PortalClientEvents extends Record<string, (...args: never[]) =>
   channelChange: (channel: PortalChannel) => void;
   /** A channel or thread is gone (deleted, or its guild left the allow-list). */
   channelRemove: (e: { channelId: string; guildId: string | null }) => void;
+  /** Live speech from a joined voice channel. Partials (`partial: true`)
+   *  arrive on the ephemeral path — display-only, replace-in-place by
+   *  utteranceId, never replayed on resume. Finals are durable events. */
+  voiceTranscript: (e: Extract<PortalEvent, { type: 'voice_transcript' }>) => void;
+  voiceStatus: (e: Extract<PortalEvent, { type: 'voice_status' }>) => void;
+  /** Terminal outcome of a voice_speak request this persona made (spoken /
+   *  interrupted / refused / error, with the voiced/unvoiced boundary). */
+  voiceReceipt: (e: Extract<PortalEvent, { type: 'voice_receipt' }>) => void;
   close: (info: { code: number; willReconnect: boolean }) => void;
   error: (err: Error) => void;
 }
@@ -201,6 +209,21 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       throw error;
     }
   }
+  /** Ask the relay to join a voice channel and stream transcripts here
+   *  (auto-subscribes this session to the channel). Requires VOICE_LISTEN. */
+  voiceJoin(channelId: string) {
+    return this.call('voice_join', { channelId });
+  }
+  voiceLeave(channelId: string) {
+    return this.call('voice_leave', { channelId });
+  }
+  /** Speak into a joined voice channel via the relay's grant-checked TTS
+   *  output path. Resolves when queued; the outcome arrives as a
+   *  `voiceReceipt` event carrying the returned requestId. Requires
+   *  VOICE_SPEAK, and the relay must already be joined (voice_join). */
+  voiceSpeak(params: RpcParams<'voice_speak'>) {
+    return this.call('voice_speak', params);
+  }
   /** Claim an invite to expand this persona's rights (RFC-005 §5.6). */
   claimInvite(code: string) {
     return this.call('claim_invite', { code });
@@ -265,6 +288,11 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         return;
       case 'dispatch':
         this.lastSeq = frame.seq;
+        this.onEvent(frame.d);
+        return;
+      case 'dispatch_ephemeral':
+        // Unsequenced by design (transcript partials): must not advance
+        // lastSeq — resume replays only the durable stream.
         this.onEvent(frame.d);
         return;
       case 'rpc_result': {
@@ -347,6 +375,15 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         for (const channel of guildChannels) {
           this.emit('channelRemove', { channelId: channel.id, guildId: event.guildId });
         }
+        break;
+      case 'voice_transcript':
+        this.emit('voiceTranscript', event);
+        break;
+      case 'voice_status':
+        this.emit('voiceStatus', event);
+        break;
+      case 'voice_receipt':
+        this.emit('voiceReceipt', event);
         break;
     }
   }

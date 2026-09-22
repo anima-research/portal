@@ -233,6 +233,27 @@ See `PORTAL-RFC-00{1,2,3}-*.md`.
   `relay.permissions.setChannel/…`) and **file hot-reload** (`fs.watchFile`,
   `PORTAL_WATCH_CONFIG`). Changes emit `persona_update` (+ live role rename) /
   `capabilities_update` to the persona's live sessions.
+- **Channels are addressed by label as well as id.** Every `channelId` tool
+  argument on the portal-mcpl surface accepts the label exactly as
+  `list_channels` prints it — `#name (Guild)` — or a bare `#name` when unique
+  across the persona's guilds, or a raw id / `portal:<id>`. Exact match,
+  case-insensitive, no fuzzy matching; an ambiguous name is an error quoting the
+  qualified labels (and ids when labels collide). Threads and categories stay
+  id-only. Ids remain the key (stable across renames, unique by construction);
+  what this removes is the id *monoculture*. Same doctrine and resolver as
+  discord-mcpl's `channel-names.ts`.
+- **Nothing is served that was not granted** (portal#27). The directory
+  (`ready`, `list_guilds`, `list_channels`) is capability-filtered: guilds the
+  persona holds some capability in, channels it holds at least one in (threads
+  follow their parent). Guild-level reads (`list_members`, `resolve_mentions`,
+  `list_roles`, `list_emojis`) are `FORBIDDEN` elsewhere; `set_typing` gates
+  like `send_message`, `unreact` like `react`; identify-time subscriptions pass
+  the `subscribe_channel` gate. And **every** delivery — addressed or ambient —
+  requires `VIEW_CHANNEL` in the source channel: pooled addressing roles are
+  mentionable guild-wide, so a mention from a channel the persona cannot view is
+  dropped, not delivered (live and as a pending ping). A later grant
+  materializes a hidden channel with `guild_create` (if the guild was unknown)
+  + `channel_update`; a revocation zeroes it with `capabilities_update: []`.
 
 ## Verification
 

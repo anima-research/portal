@@ -62,6 +62,7 @@ const ERR_INVALID_PARAMS = -32602;
 /** The feature set every server-initiated message on the message path is
  *  tagged with (§6.5). */
 const MESSAGING = 'portal.messaging';
+const VOICE = 'portal.voice';
 
 /**
  * SPEC §14.1's table, plus MCP's tool methods, expressed as the capability each
@@ -462,7 +463,7 @@ export class PortalMcplServer {
     if (!channelId || !channel) throw new Error('unknown channel');
 
     const result: ChannelsOpenResult = {
-      channel: toDescriptor(channel, false),
+      channel: toDescriptor(channel, false, undefined, this.guildName(channel.guildId)),
     };
     const requested = open.history?.limit ?? 0;
     if (requested > 0) {
@@ -524,6 +525,12 @@ export class PortalMcplServer {
    *  `pushEvents` grant and that set to be enabled. */
   private canPush(): boolean {
     return this.mcplEnabled && this.policy.allows('pushEvents') && this.policy.featureEnabled(MESSAGING);
+  }
+
+  /** Voice pushes ride the `portal.voice` set: the host must have selected it
+   *  (it is opt-in, not part of messaging) AND granted pushEvents. */
+  private canPushVoice(): boolean {
+    return this.mcplEnabled && this.policy.allows('pushEvents') && this.policy.featureEnabled(VOICE);
   }
 
   /** `channels/incoming` carries no `featureSet`; §14.1 authorizes it on the
@@ -645,6 +652,87 @@ export class PortalMcplServer {
       void this.flushRemovals().catch((err) =>
         console.error('[portal-mcpl] channel retraction failed:', (err as Error).message),
       );
+    }));
+    // Voice transcripts → context, NEVER a wake (same policy boundary as
+    // reactions). Finals only: partials are a display-plane stream for caption
+    // clients; at conversational cadence an agent wants the settled utterance,
+    // not 5 Hz interim churn. Wake-on-name-in-speech is a deliberate follow-up,
+    // not a v1 behavior — speech has no structural addressing to gate on.
+    track(this.client.on('voiceTranscript', (e) => {
+      if (e.partial || !this.conn || !this.canPushVoice()) return;
+      if (!this.openChannels.has(e.channelId)) return;
+      const who = e.speaker.kind === 'user' ? e.speaker.displayName : 'someone';
+      this.conn
+        .sendRequest(method.PUSH_EVENT, {
+          featureSet: VOICE,
+          // utteranceId carries a per-relay-process epoch (one final per
+          // utterance by contract), so this key is unique across relay restarts
+          // — the host dedups by eventId and would otherwise drop fresh speech.
+          eventId: `portal_voice_${e.utteranceId}`,
+          timestamp: new Date(e.at).toISOString(),
+          origin: {
+            source: 'portal',
+            channelId: portalChannelId(e.channelId),
+            mcplChannelId: portalChannelId(e.channelId),
+          },
+          tags: ['voice:transcript'],
+          payload: { content: [textContent(`[voice] ${who} in ${this.channelLabel(e.channelId)}: ${e.text}`)] },
+        } satisfies PushEventParams)
+        .catch((err) => this.notePushRejection('voice transcript', err));
+    }));
+    // Speak receipts → context. These are THIS persona's own accounting
+    // (delivered only to the requester), so they push regardless of open
+    // channels: an interruption boundary is a decision the agent owns —
+    // which words landed, which were cut off, re-say or let go — and must
+    // not be lost to a closed channel. Tagged so a host gate can treat
+    // interruption as waking (ball-in-your-court) while spoken/refused stay
+    // ambient.
+    track(this.client.on('voiceReceipt', (e) => {
+      if (!this.conn || !this.canPushVoice()) return;
+      const where = this.channelLabel(e.channelId);
+      const line =
+        e.status === 'spoken'
+          ? `[voice] you spoke in ${where} (${(e.playedMs / 1000).toFixed(1)}s): ${e.voicedText}`
+          : e.status === 'interrupted'
+            ? `[voice] you were interrupted in ${where} by ${e.interruptedBy?.username ?? 'someone'} — ` +
+              `heard: "${e.voicedText}"${e.estimated ? ' (boundary estimated)' : ''} — unsaid: "${e.unvoicedText}"`
+            : `[voice] your utterance in ${where} was ${e.status === 'refused' ? 'refused' : 'dropped by an error'}: ${e.reason ?? 'no reason given'}`;
+      this.conn
+        .sendRequest(method.PUSH_EVENT, {
+          featureSet: VOICE,
+          // One receipt per request; `at` disambiguates a client-reused
+          // requestId across relay restarts.
+          eventId: `portal_voice_receipt_${e.requestId}_${e.at}`,
+          timestamp: new Date(e.at).toISOString(),
+          origin: {
+            source: 'portal',
+            channelId: portalChannelId(e.channelId),
+            mcplChannelId: portalChannelId(e.channelId),
+          },
+          tags: ['voice:receipt', `voice:${e.status}`],
+          payload: { content: [textContent(line)] },
+        } satisfies PushEventParams)
+        .catch((err) => this.notePushRejection('voice receipt', err));
+    }));
+    track(this.client.on('voiceStatus', (e) => {
+      if (!this.conn || !this.canPushVoice() || !this.openChannels.has(e.channelId)) return;
+      const line = e.joined
+        ? `[voice] transcription started in ${this.channelLabel(e.channelId)}`
+        : `[voice] transcription stopped in ${this.channelLabel(e.channelId)} (voice_join again to resume)`;
+      this.conn
+        .sendRequest(method.PUSH_EVENT, {
+          featureSet: VOICE,
+          eventId: `portal_voice_status_${e.channelId}_${Date.now()}_${this.eventSeq++}`,
+          timestamp: new Date().toISOString(),
+          origin: {
+            source: 'portal',
+            channelId: portalChannelId(e.channelId),
+            mcplChannelId: portalChannelId(e.channelId),
+          },
+          tags: ['voice:status'],
+          payload: { content: [textContent(line)] },
+        } satisfies PushEventParams)
+        .catch((err) => this.notePushRejection('voice status', err));
     }));
   }
 
@@ -908,9 +996,14 @@ export class PortalMcplServer {
       .catch((err) => this.notePushRejection('catch-up push', err));
   }
 
+  /** `#name (Guild)` — the same label the descriptors carry and every
+   *  channelId tool argument accepts (channel-names.ts). */
   private channelLabel(channelId: string): string {
-    const name = this.client.cache.getChannel(channelId)?.name;
-    return name ? `#${name}` : channelId;
+    return this.agent.labelFor(channelId);
+  }
+
+  private guildName(guildId: string | null): string | undefined {
+    return guildId ? this.client.cache.getGuild(guildId)?.name : undefined;
   }
 
   // ── Channels ──
@@ -918,7 +1011,8 @@ export class PortalMcplServer {
   private allDescriptors(): ChannelDescriptor[] {
     return this.client.cache
       .allChannels()
-      .map((channel) => toDescriptor(channel, this.agent.state.isSubscribed(channel.id)));
+      .map((channel) =>
+        toDescriptor(channel, this.agent.state.isSubscribed(channel.id), undefined, this.guildName(channel.guildId)));
   }
 
   /** Drop the legacy file-backed subscription for each channel that has now

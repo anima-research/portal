@@ -215,8 +215,8 @@ test('channel delete → channel_delete, and the dedup baseline forgets it', () 
     // The baseline was forgotten: a re-push for the same caps dispatches again
     // (a re-created channel must be announced, not swallowed by stale dedup).
     t.dispatched.length = 0;
-    t.relay.pushCaps(ALICE, CHAN_A, GUILD);
-    assert.equal(t.ofType('capabilities_update').length, 1);
+    t.relay.pushChannel(ALICE, meta(CHAN_A));
+    assert.equal(t.ofType('channel_update').length, 1, 're-announced as a full channel (issue #27: the client cannot invent one from a caps array)');
   } finally {
     t.cleanup();
   }
