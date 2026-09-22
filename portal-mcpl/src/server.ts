@@ -63,19 +63,6 @@ const ERR_INVALID_PARAMS = -32602;
  *  tagged with (§6.5). */
 const MESSAGING = 'portal.messaging';
 
-/** How long a push may wait for the relay's missed-backlog fold (per RPC). */
-const FOLD_BUDGET_MS = 5_000;
-
-function withBudget<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`fold exceeded ${ms}ms`)), ms);
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); },
-    );
-  });
-}
-
 /**
  * SPEC §14.1's table, plus MCP's tool methods, expressed as the capability each
  * INBOUND method requires. Channel methods carry no `featureSet` field and are
@@ -149,8 +136,6 @@ export class PortalMcplServer {
    *  reconnect doesn't re-wake for the same offline-accrued pings. */
   private wokenPings = new Set<string>();
   private eventSeq = 0;
-  /** Max backlog messages folded into one push (PORTAL_CONTEXT_CAP, default 80). */
-  private readonly contextCap = Math.max(1, Number(process.env.PORTAL_CONTEXT_CAP ?? '80') || 80);
   /**
    * The connection's effective capability grant and derived feature sets
    * (§5.4/§6.4). Nothing capability-dependent runs until the host's initial
@@ -798,87 +783,30 @@ export class PortalMcplServer {
           .catch((err) => this.notePushRejection('inbound message', err));
       } else {
         if (!this.canPush()) return;
-        // A closed channel gets no ambient traffic (the relay only sends it to
-        // subscribed sessions), so an addressed push is the agent's ONLY view
-        // of that channel — and on its own it is one message with no context.
-        // Fold in what the relay says was missed there since the watermark, so
-        // the conversation between pings is not lost (observed live: 33
-        // ambient messages between 11 pings, agent asked to "pull backscroll").
-        void (addressedToMe ? this.missedBefore(message) : Promise.resolve([] as PortalMessage[])).then((backlog) => {
-          if (this.conn !== conn || !this.canPush()) return;
-          const prefix = backlog.length
-            ? [textContent(
-                `[${backlog.length} message(s) in ${this.channelLabel(message.channelId)} since you last read it:]\n` +
-                  backlog.map(render).join('\n') +
-                  '\n[addressed to you:]',
-              )]
-            : [];
-          conn
-            .sendRequest(method.PUSH_EVENT, {
-              featureSet: MESSAGING,
-              eventId: `portal_msg_${message.id}_${this.eventSeq++}`,
-              timestamp: message.createdAt,
-              // Flat on origin (discord-mcpl parity) — the wake gate reads these.
-              origin: {
-                source: 'portal',
-                messageId: message.id,
-                channelId: channelMcplId,
-                mcplChannelId: channelMcplId,
-                channelName: this.channelLabel(message.channelId),
-                guildId: message.guildId,
-                threadId: message.threadId,
-                authorId: authorOf(message).id,
-                authorName: authorOf(message).name,
-                ...meta,
-              },
-              tags, // MCPL RFC-001 — the host routes/gates on these
-              payload: { content: [...prefix, ...content] },
-            } satisfies PushEventParams)
-            .catch((err) => this.notePushRejection('message push', err));
-        });
+        conn
+          .sendRequest(method.PUSH_EVENT, {
+            featureSet: MESSAGING,
+            eventId: `portal_msg_${message.id}_${this.eventSeq++}`,
+            timestamp: message.createdAt,
+            // Flat on origin (discord-mcpl parity) — the wake gate reads these.
+            origin: {
+              source: 'portal',
+              messageId: message.id,
+              channelId: channelMcplId,
+              mcplChannelId: channelMcplId,
+              channelName: this.channelLabel(message.channelId),
+              guildId: message.guildId,
+              threadId: message.threadId,
+              authorId: authorOf(message).id,
+              authorName: authorOf(message).name,
+              ...meta,
+            },
+            tags, // MCPL RFC-001 — the host routes/gates on these
+            payload: { content },
+          } satisfies PushEventParams)
+          .catch((err) => this.notePushRejection('message push', err));
       }
     });
-  }
-
-  /**
-   * Messages in `trigger`'s channel that this persona has not seen, older than
-   * the trigger: everything above the relay's watermark for the channel (its
-   * read-state is server-authoritative and tallies every viewable channel,
-   * subscribed or not), further cut at the local watermark so two pushes in a
-   * row do not fold the same backlog twice. The relay stores counts, not
-   * bodies, so the bodies come from fetch_history. Best-effort: no
-   * READ_HISTORY, or a relay hiccup, means an unadorned push — never a lost one.
-   *
-   * The local watermark is advanced to the last folded message. The relay's is
-   * NOT: mark_read there is the agent's, and a cutoff would also drop pending
-   * pings at or under it (relay markRead semantics), which are the agent's to
-   * clear once handled.
-   */
-  private async missedBefore(trigger: PortalMessage): Promise<PortalMessage[]> {
-    const channelId = trigger.channelId;
-    try {
-      // Bounded: a slow relay must not hold the wake hostage. Past the budget
-      // the push goes out bare, exactly as before.
-      const missed = await withBudget(this.client.call('channel_missed', { channelId }), FOLD_BUDGET_MS);
-      if (missed.messages <= 0) return [];
-      const local = this.agent.state.watermark(channelId);
-      const since = [missed.since, local].filter((w): w is string => !!w).sort().pop();
-      // The tally skips this persona's own posts; history does not — fetch a
-      // little past the count and cut at the watermark.
-      const limit = Math.min(this.contextCap, missed.messages + 10);
-      const { messages } = await withBudget(this.client.fetchHistory({ channelId, limit }), FOLD_BUDGET_MS);
-      const backlog = messages
-        .filter((m) => m.id !== trigger.id && m.createdAt < trigger.createdAt && (!since || m.createdAt > since))
-        .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0))
-        .slice(-this.contextCap);
-      if (backlog.length) this.agent.state.markRead(channelId, backlog[backlog.length - 1].createdAt);
-      return backlog;
-    } catch (err) {
-      if (process.env.PORTAL_DEBUG) {
-        console.error(`[portal-mcpl] could not fold missed traffic for ${channelId}:`, (err as Error).message);
-      }
-      return [];
-    }
   }
 
   /**
