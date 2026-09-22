@@ -201,4 +201,14 @@ URL) or `{path|url|bytes, name?, contentType?, description?}`. Paths are read
 locally (`~` and cwd-relative OK), URLs fetched, name/MIME inferred, the
 per-message budget checked with a legible error, and only `bytes` ever reach
 the relay. Knobs: `PORTAL_FILE_ROOTS` (fence paths), `PORTAL_MAX_FILE_BYTES`,
-`PORTAL_ALLOW_URL_FILES=false`. Tests: `portal-mcpl/test/files.test.ts`.
+`PORTAL_ALLOW_URL_FILES=false`, `PORTAL_ALLOW_PRIVATE_URLS=true`. Tests:
+`portal-mcpl/test/files.test.ts`.
+
+Guards (2026-09-21): `url` items refuse hosts that are, or resolve to,
+loopback / private / link-local addresses, re-checked at every redirect hop
+(the fetch runs on the resident's host, so this is the SSRF door); bodies are
+streamed under the remaining budget and cut off at the cap, so a missing or
+lying `Content-Length` can't buffer an unbounded body. `PORTAL_FILE_ROOTS`
+fences the `realpath` of the file, so a symlink inside a root can't reach
+outside it. `bytes` must be strict base64 (Node's lenient decoder would turn a
+mistyped payload into a silently truncated attachment).
