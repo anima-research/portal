@@ -238,9 +238,11 @@ test('a ping in a closed channel carries its exact MCPL channel id', async () =>
     },
   };
   grant(server);
+  // The closed-channel push first asks the relay what was missed (nothing here).
+  (client as unknown as { call: () => Promise<unknown> }).call = async () => ({ channelId: channel.id, messages: 0, characters: 0 });
 
   internal.pushMessage(message('m1', '2026-01-01T00:00:00Z'), true, ['role_mention']);
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setTimeout(resolve, 10));
 
   assert.equal(requests[0].method, 'push/event');
   const params = requests[0].params as {
