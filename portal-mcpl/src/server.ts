@@ -1159,6 +1159,15 @@ function authorOf(message: PortalMessage): { id: string; name: string } {
   return { id: 'system', name: 'system' };
 }
 
+/** The image formats the model API accepts, identified by magic bytes. */
+export function sniffImageMediaType(b: Buffer): string | undefined {
+  if (b.length >= 4 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  if (b.length >= 3 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return 'image/gif';
+  if (b.length >= 12 && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  return undefined;
+}
+
 /** Max image bytes to fetch + inline as a vision block. */
 const IMAGE_INLINE_CAP = 5 * 1024 * 1024;
 
@@ -1175,8 +1184,17 @@ async function buildContent(m: PortalMessage): Promise<ContentBlock[]> {
         const timer = setTimeout(() => ctrl.abort(), 15000);
         const res = await fetch(att.url, { signal: ctrl.signal }).finally(() => clearTimeout(timer));
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = Buffer.from(await res.arrayBuffer()).toString('base64');
-        blocks.push({ type: 'image', data, mimeType: ct });
+        const bytes = Buffer.from(await res.arrayBuffer());
+        // Label from the bytes, not the declared type: Discord passes along
+        // whatever the uploader claimed (a PNG named .webp arrives as
+        // image/webp), and the model API rejects the whole request when the
+        // label and bytes disagree, so one bad label poisons every later turn.
+        const actual = sniffImageMediaType(bytes);
+        if (!actual) {
+          blocks.push(textContent(`[image "${att.name}" is not PNG/JPEG/GIF/WebP data (declared ${ct}) — ${att.url}]`));
+          continue;
+        }
+        blocks.push({ type: 'image', data: bytes.toString('base64'), mimeType: actual });
       } catch (err) {
         blocks.push(textContent(`[image "${att.name}" unavailable: ${(err as Error).message} — ${att.url}]`));
       }
