@@ -279,12 +279,17 @@ type Handlers = {
 
 const MAX_ATTACH = 10;
 
+/** Minimum gap between member re-warms when a guild's cache is short. */
+const MEMBER_REWARM_INTERVAL_MS = 5 * 60_000;
+
 export class DiscordBot implements WebhookOps, RoleOps {
   private client: Client;
   private handlers: Handlers = {};
   private webhookCache = new Map<string, Webhook>(); // webhookId → Webhook
 
   private guildMembersIntent: boolean;
+  /** Last member-warm attempt per guild, to throttle re-warms of a short cache. */
+  private lastWarmAt = new Map<string, number>();
   private maxInlineTotalBytes: number;
   private allowPathFiles: boolean;
 
@@ -552,6 +557,22 @@ export class DiscordBot implements WebhookOps, RoleOps {
   /** Whether the relay holds the GuildMembers intent (full roster vs. partial). */
   get hasMembersIntent(): boolean {
     return this.guildMembersIntent;
+  }
+
+  /**
+   * Whether the member cache for a guild holds the whole roster: the intent is
+   * on AND the cache is as large as Discord's stated member count. Holding the
+   * intent is not enough — a failed or unfinished warm leaves the cache filled
+   * only by message authors, so a short cache also kicks a (throttled) re-warm.
+   */
+  membersComplete(guildId: string): boolean {
+    if (!this.guildMembersIntent) return false;
+    const guild = this.client.guilds.cache.get(guildId);
+    if (!guild) return false;
+    if (guild.members.cache.size >= guild.memberCount) return true;
+    const last = this.lastWarmAt.get(guild.id) ?? 0;
+    if (Date.now() - last >= MEMBER_REWARM_INTERVAL_MS) void this.warmMembers(guild);
+    return false;
   }
 
   /** Members from the cache (warmed when the GuildMembers intent is on). */
@@ -1080,6 +1101,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
   }
 
   private async warmMembers(guild: Guild): Promise<void> {
+    this.lastWarmAt.set(guild.id, Date.now());
     try {
       await guild.members.fetch();
     } catch (err) {

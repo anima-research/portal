@@ -1283,7 +1283,7 @@ export class Relay implements GatewayHooks {
         const limit = Math.min(Math.max(1, Math.floor(Number(p.limit) || 100)), MAX_MEMBERS_PAGE);
         return {
           members: this.bot.listMembers(p.guildId, p.query, limit),
-          membersAvailable: this.bot.hasMembersIntent,
+          membersAvailable: this.bot.membersComplete(p.guildId),
         };
       }
       case 'resolve_mentions': {

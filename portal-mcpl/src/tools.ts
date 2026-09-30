@@ -245,8 +245,9 @@ export const toolDefinitions: ToolDefinition[] = [
     name: 'list_members',
     description:
       'List guild members (for authorization gating / mention handling). Optional ' +
-      'case-insensitive query filter. Returns membersAvailable=false if the relay ' +
-      'bot lacks the GuildMembers intent (results then partial).',
+      'case-insensitive query filter. Returns membersAvailable=false when the ' +
+      'relay cannot see the full roster (no GuildMembers intent, or its member ' +
+      'cache is still short of the guild member count) — results are then partial.',
     inputSchema: {
       type: 'object',
       properties: {
