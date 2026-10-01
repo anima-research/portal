@@ -242,6 +242,8 @@ export interface RelayConfig {
   rolePool: RolePoolConfig;
   webhookPoolSize: number;
   heartbeatIntervalMs: number;
+  /** Log gateway session lifecycle (identify/resume/close…) to stderr. */
+  sessionLog?: boolean;
   guildMembersIntent: boolean;
   /** Watch the identity/permissions files for external edits (default true). */
   watchConfig: boolean;
@@ -306,6 +308,7 @@ export function loadConfig(): RelayConfig {
     },
     webhookPoolSize: parseInt(process.env.PORTAL_WEBHOOK_POOL ?? '1', 10),
     heartbeatIntervalMs: parseInt(process.env.PORTAL_HEARTBEAT_MS ?? '30000', 10),
+    sessionLog: process.env.PORTAL_SESSION_LOG !== 'false',
     guildMembersIntent: process.env.PORTAL_GUILD_MEMBERS_INTENT !== 'false',
     watchConfig: process.env.PORTAL_WATCH_CONFIG !== 'false',
     historyCacheTtlMs: parseInt(process.env.PORTAL_HISTORY_CACHE_MS ?? '5000', 10),

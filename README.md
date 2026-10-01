@@ -73,6 +73,7 @@ The bot needs **Manage Webhooks** + **Manage Roles** (admin is simplest), and it
 role must sit above the pooled roles. See `portal-relay/identity.example.json` /
 `permissions.example.json`. Other knobs: `PORTAL_INVITES`, `PORTAL_ATTRIBUTION`,
 `PORTAL_HISTORY_CACHE_MS`, `PORTAL_GUILD_MEMBERS_INTENT`, `PORTAL_WATCH_CONFIG`,
+`PORTAL_SESSION_LOG` (gateway session lifecycle lines on stderr; default on),
 `PORTAL_MAX_INLINE_BYTES`, `PORTAL_ALLOW_PATH_FILES`, `PORTAL_INVITE_MINTERS`
 (persona ids allowed to machine-mint single-use channel-scoped invites via the
 `mint_invite` RPC; empty/unset = disabled, and the delegated caps must be a
