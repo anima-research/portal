@@ -62,13 +62,19 @@ export interface GatewayOptions {
   log?: (line: string) => void;
 }
 
-/** Client-supplied strings go into log lines: bound them and strip anything
- *  that could forge or break a line. */
+/** Strings that end up in log lines — client-supplied or loaded from config —
+ *  are bounded, reduced to printable ASCII, and have `"` / `\` escaped so a
+ *  value can neither split a line nor pose as extra fields. */
 function logSafe(v: unknown, max = 80): string {
   return String(v ?? '')
     .replace(/[^\x20-\x7e]/g, '?')
+    .replace(/[\\"]/g, (c) => `\\${c}`)
     .slice(0, max);
 }
+
+/** Pre-auth rejections a single socket may log before the rest are only
+ *  counted (reported on its close line). Bounds log growth per connection. */
+const REJECT_LOG_CAP = 3;
 
 export class Session {
   readonly id: string;
@@ -77,8 +83,14 @@ export class Session {
   identified = false;
   lastSeen = Date.now();
   readonly connectedAt = Date.now();
-  /** Set once the disconnect has been handled (ws emits `error` then `close`). */
+  /** Set once the disconnect has been handled. */
   disconnected = false;
+  /** `error` precedes `close` on a ws socket; keep the message for the close line. */
+  lastError?: string;
+  /** Heartbeat reaper already closed this socket; don't log/close it again. */
+  reaped = false;
+  /** Pre-auth rejections (bad identify, unknown resume) on this socket. */
+  rejections = 0;
 
   constructor(
     private ws: WebSocket,
@@ -140,11 +152,27 @@ export class Gateway {
     return `live=${this.sessions.size}/${personas}`;
   }
 
+  /** A log sink must never take a session down with it. */
+  private emit(line: string): void {
+    try {
+      this.log(line);
+    } catch {
+      /* logging is best-effort */
+    }
+  }
+
   private sessionLog(event: string, session: Session, detail = ''): void {
-    const who = session.personaId ? `persona=${session.personaId}` : 'persona=-';
-    this.log(
+    const who = session.personaId ? `persona=${logSafe(session.personaId)}` : 'persona=-';
+    this.emit(
       `[portal-relay] session ${event} ${who} sess=${session.id.slice(5, 13)}${detail ? ' ' + detail : ''} ${this.live()}`,
     );
+  }
+
+  /** Pre-auth rejections are client-driven and the socket stays open, so a
+   *  socket gets REJECT_LOG_CAP lines; after that they are only counted. */
+  private rejectLog(event: string, session: Session, detail: string): void {
+    session.rejections++;
+    if (session.rejections <= REJECT_LOG_CAP) this.sessionLog(event, session, detail);
   }
 
   listen(port: number): void {
@@ -183,8 +211,13 @@ export class Gateway {
         console.error('[portal-relay] frame error:', (err as Error).message),
       );
     });
-    ws.on('close', (code, reason) => this.onDisconnect(session, `code=${code}${reason?.length ? ` reason="${logSafe(reason.toString())}"` : ''}`));
-    ws.on('error', (err) => this.onDisconnect(session, `error="${logSafe(err.message)}"`));
+    // ws emits `close` after `error`, so the error only annotates the close line.
+    ws.on('error', (err) => {
+      session.lastError = err.message;
+    });
+    ws.on('close', (code, reason) =>
+      this.onDisconnect(session, `code=${code}${reason?.length ? ` reason="${logSafe(reason.toString())}"` : ''}`),
+    );
   }
 
   private async onFrame(session: Session, frame: ClientFrame): Promise<void> {
@@ -220,7 +253,7 @@ export class Gateway {
     if (session.identified) return;
     const ok = this.hooks.authenticate(token, personaId);
     if (!ok) {
-      this.sessionLog('identify-rejected', session, `claimed="${logSafe(personaId)}" reason="auth failed"`);
+      this.rejectLog('identify-rejected', session, `claimed="${logSafe(personaId)}" reason="auth failed"`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'auth failed' } });
       session.close(4001, 'auth failed');
       return;
@@ -246,8 +279,14 @@ export class Gateway {
     try {
       ready = await this.hooks.buildReady(session);
     } catch (err) {
-      this.sessionLog(`${via}-failed`, session, `ready-ms=${Date.now() - t0} error="${logSafe((err as Error).message, 160)}"`);
       session.close(1011, 'ready failed');
+      this.sessionLog(`${via}-failed`, session, `ready-ms=${Date.now() - t0} error="${logSafe((err as Error).message, 160)}"`);
+      return;
+    }
+    if (session.disconnected) {
+      // The client left while ready was being built; `send` would drop the
+      // frame silently. Say so rather than record a success nobody received.
+      this.sessionLog(`${via}-abandoned`, session, `ready-ms=${Date.now() - t0}`);
       return;
     }
     session.send({ op: 'ready', d: ready });
@@ -262,6 +301,7 @@ export class Gateway {
   private async onRegister(session: Session, d: RegisterData): Promise<void> {
     if (session.identified) return;
     if (!this.hooks.enroll) {
+      this.sessionLog('register-rejected', session, 'reason="registration disabled"');
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'registration disabled' } });
       session.close(4003, 'registration disabled');
       return;
@@ -300,7 +340,7 @@ export class Gateway {
     const personaId = this.sessionPersona.get(sessionId);
     const stream = personaId ? this.streams.get(personaId) : undefined;
     if (!personaId || !stream) {
-      this.sessionLog('resume-rejected', session, `reason="unknown session" from-seq=${logSafe(fromSeq, 16)}`);
+      this.rejectLog('resume-rejected', session, `reason="unknown session" from-seq=${logSafe(fromSeq, 16)}`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'unknown session' } });
       return;
     }
@@ -311,8 +351,8 @@ export class Gateway {
     const oldest = stream.buffer[0]?.seq;
     const gap = oldest !== undefined ? fromSeq < oldest - 1 : fromSeq < stream.seq;
     if (gap) {
-      this.log(
-        `[portal-relay] session resume-rejected persona=${personaId} sess=${session.id.slice(5, 13)} reason="resume window exceeded" from-seq=${logSafe(fromSeq, 16)} stream-seq=${stream.seq} ${this.live()}`,
+      this.emit(
+        `[portal-relay] session resume-rejected persona=${logSafe(personaId)} sess=${session.id.slice(5, 13)} reason="resume window exceeded" from-seq=${logSafe(fromSeq, 16)} stream-seq=${stream.seq} ${this.live()}`,
       );
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'resume window exceeded' } });
       return;
@@ -336,15 +376,20 @@ export class Gateway {
   }
 
   private onDisconnect(session: Session, why = ''): void {
-    // ws emits `error` and then `close` for the same socket: handle it once.
     if (session.disconnected) return;
     session.disconnected = true;
     this.sessions.delete(session.id);
     this.byPersona.get(session.personaId)?.delete(session);
+    const extra = [
+      session.lastError ? `error="${logSafe(session.lastError)}"` : '',
+      session.rejections ? `rejections=${session.rejections}` : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
     this.sessionLog(
       session.identified ? 'close' : 'close-unidentified',
       session,
-      `${why} age-s=${Math.round((Date.now() - session.connectedAt) / 1000)}`,
+      `${why}${extra ? ' ' + extra : ''} age-s=${Math.round((Date.now() - session.connectedAt) / 1000)}`,
     );
     this.hooks.onClose?.(session);
     // Keep sessionPersona for resume; it's pruned by buffer turnover.
@@ -353,7 +398,8 @@ export class Gateway {
   private reapStale(): void {
     const cutoff = Date.now() - this.heartbeatIntervalMs * 2;
     for (const s of this.sessions.values()) {
-      if (s.lastSeen < cutoff) {
+      if (s.lastSeen < cutoff && !s.reaped) {
+        s.reaped = true; // the socket stays in `sessions` until its close event
         this.sessionLog('heartbeat-timeout', s, `idle-s=${Math.round((Date.now() - s.lastSeen) / 1000)}`);
         s.close(4000, 'heartbeat timeout');
       }
