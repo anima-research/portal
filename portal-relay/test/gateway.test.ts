@@ -245,3 +245,64 @@ test('ephemeral dispatch: fans out live, never sequenced, never replayed', async
     await gw.close();
   }
 });
+
+test('session lifecycle is logged: identify timing, auth reject, resume, close, failed ready', async () => {
+  const lines: string[] = [];
+  let failReady = false;
+  const h = hooks();
+  const baseReady = h.buildReady;
+  h.buildReady = async (s) => {
+    if (failReady) throw new Error('discord unavailable');
+    return baseReady(s);
+  };
+  const gw = new Gateway(h, 30_000, { log: (l) => lines.push(l) });
+  gw.listen(PORT);
+  const has = (re: RegExp) => lines.some((l) => re.test(l));
+  try {
+    // identify → one line with ready time, persona, and the live count
+    const { ws: ws1, frames: f1 } = await open();
+    await f1.next((f) => f.op === 'hello');
+    ws1.send(JSON.stringify({ op: 'identify', d: { protocolVersion: 4, token: 'secret', personaId: 'p1' } }));
+    const ready = (await f1.next((f) => f.op === 'ready')) as Extract<ServerFrame, { op: 'ready' }>;
+    assert.ok(has(/session identify persona=p1 sess=\S+ ready-ms=\d+ since-connect-ms=\d+ channels=0 subs=0 live=1\/1/), lines.join('\n'));
+
+    // close → code and age, live count back to zero
+    ws1.close(1000, 'bye');
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(has(/session close persona=p1 .*code=1000 reason="bye" age-s=\d+ live=0\/0/), lines.join('\n'));
+    assert.equal(lines.filter((l) => / close /.test(l)).length, 1, 'one close line per socket');
+
+    // resume → replay count
+    const { ws: ws2, frames: f2 } = await open();
+    await f2.next((f) => f.op === 'hello');
+    ws2.send(JSON.stringify({ op: 'resume', d: { sessionId: ready.d.sessionId, seq: 0 } }));
+    await f2.next((f) => f.op === 'resumed');
+    assert.ok(has(/session resume persona=p1 .*replayed=0/), lines.join('\n'));
+    ws2.close();
+
+    // unknown resume + bad auth → rejected lines; the claimed id is sanitized and no token is logged
+    const { ws: ws3, frames: f3 } = await open();
+    await f3.next((f) => f.op === 'hello');
+    ws3.send(JSON.stringify({ op: 'resume', d: { sessionId: 'sess_nope', seq: 0 } }));
+    await f3.next((f) => f.op === 'invalid_session');
+    assert.ok(has(/session resume-rejected persona=- .*reason="unknown session"/), lines.join('\n'));
+    ws3.send(JSON.stringify({ op: 'identify', d: { protocolVersion: 4, token: 'WRONG-TOKEN', personaId: 'evil\n[portal-relay] forged' } }));
+    await f3.next((f) => f.op === 'invalid_session');
+    assert.ok(has(/session identify-rejected persona=- .*claimed="evil\?\[portal-relay\] forged" reason="auth failed"/), lines.join('\n'));
+    assert.ok(!lines.some((l) => l.includes('WRONG-TOKEN') || l.includes('secret')), 'tokens never reach the log');
+    assert.ok(lines.every((l) => !l.includes('\n')), 'one event, one line');
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(has(/session close-unidentified persona=- .*code=4001/), lines.join('\n'));
+
+    // buildReady throws → logged, and the socket is closed instead of left waiting for ready
+    failReady = true;
+    const { ws: ws4, frames: f4 } = await open();
+    await f4.next((f) => f.op === 'hello');
+    const closed = new Promise<number>((resolve) => ws4.on('close', (code) => resolve(code)));
+    ws4.send(JSON.stringify({ op: 'identify', d: { protocolVersion: 4, token: 'secret', personaId: 'p2' } }));
+    assert.equal(await closed, 1011);
+    assert.ok(has(/session identify-failed persona=p2 .*ready-ms=\d+ error="discord unavailable"/), lines.join('\n'));
+  } finally {
+    await gw.close();
+  }
+});

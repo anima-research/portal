@@ -137,7 +137,7 @@ export class Relay implements GatewayHooks {
     if (config.invitesPath) this.invites = new InviteStore(config.invitesPath);
     this.roles = new RolePool(this.bot, config.rolePool.size, config.rolePool.prefix, config.rolePool.persistPath);
     this.webhooks = new WebhookPool(this.bot, config.webhookPoolSize);
-    this.gateway = new Gateway(this, config.heartbeatIntervalMs);
+    this.gateway = new Gateway(this, config.heartbeatIntervalMs, config.sessionLog === false ? { log: () => {} } : {});
     // RFC-005: admin HTTP API. The deps object closes over the bot/gateway so the
     // admin module stays decoupled from discord.js and is unit-testable.
     if (config.admin) {

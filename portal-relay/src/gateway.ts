@@ -52,12 +52,33 @@ interface PersonaStream {
 
 const BUFFER_CAP = 1000;
 
+export interface GatewayOptions {
+  /**
+   * Sink for session-lifecycle lines (identify / resume / register / close /
+   * heartbeat reap). Defaults to stderr. These are the only record of whether a
+   * client that reports "can't connect" ever reached the relay, and how long
+   * `ready` took — pass `() => {}` to silence.
+   */
+  log?: (line: string) => void;
+}
+
+/** Client-supplied strings go into log lines: bound them and strip anything
+ *  that could forge or break a line. */
+function logSafe(v: unknown, max = 80): string {
+  return String(v ?? '')
+    .replace(/[^\x20-\x7e]/g, '?')
+    .slice(0, max);
+}
+
 export class Session {
   readonly id: string;
   personaId = '';
   subscriptions = new Set<string>();
   identified = false;
   lastSeen = Date.now();
+  readonly connectedAt = Date.now();
+  /** Set once the disconnect has been handled (ws emits `error` then `close`). */
+  disconnected = false;
 
   constructor(
     private ws: WebSocket,
@@ -101,10 +122,30 @@ export class Gateway {
   private sessionPersona = new Map<string, string>();
   private heartbeatTimer?: ReturnType<typeof setInterval>;
 
+  private log: (line: string) => void;
+
   constructor(
     private hooks: GatewayHooks,
     private heartbeatIntervalMs: number,
-  ) {}
+    opts: GatewayOptions = {},
+  ) {
+    this.log = opts.log ?? ((line) => console.error(line));
+  }
+
+  /** `live=<sessions>/<personas>` — appended to lifecycle lines so a reconnect
+   *  storm or a slow leak is visible from the log alone. */
+  private live(): string {
+    let personas = 0;
+    for (const set of this.byPersona.values()) if (set.size > 0) personas++;
+    return `live=${this.sessions.size}/${personas}`;
+  }
+
+  private sessionLog(event: string, session: Session, detail = ''): void {
+    const who = session.personaId ? `persona=${session.personaId}` : 'persona=-';
+    this.log(
+      `[portal-relay] session ${event} ${who} sess=${session.id.slice(5, 13)}${detail ? ' ' + detail : ''} ${this.live()}`,
+    );
+  }
 
   listen(port: number): void {
     this.wss = new WebSocketServer({ port, host: '127.0.0.1' });
@@ -142,8 +183,8 @@ export class Gateway {
         console.error('[portal-relay] frame error:', (err as Error).message),
       );
     });
-    ws.on('close', () => this.onDisconnect(session));
-    ws.on('error', () => this.onDisconnect(session));
+    ws.on('close', (code, reason) => this.onDisconnect(session, `code=${code}${reason?.length ? ` reason="${logSafe(reason.toString())}"` : ''}`));
+    ws.on('error', (err) => this.onDisconnect(session, `error="${logSafe(err.message)}"`));
   }
 
   private async onFrame(session: Session, frame: ClientFrame): Promise<void> {
@@ -179,6 +220,7 @@ export class Gateway {
     if (session.identified) return;
     const ok = this.hooks.authenticate(token, personaId);
     if (!ok) {
+      this.sessionLog('identify-rejected', session, `claimed="${logSafe(personaId)}" reason="auth failed"`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'auth failed' } });
       session.close(4001, 'auth failed');
       return;
@@ -189,8 +231,31 @@ export class Gateway {
     this.register(session);
     this.streams.set(ok, this.streams.get(ok) ?? { seq: 0, buffer: [] });
 
-    const ready = await this.hooks.buildReady(session);
+    await this.sendReady(session, 'identify');
+  }
+
+  /**
+   * Build and send `ready`, timing it. `buildReady` awaits real Discord calls;
+   * if it throws, the client would otherwise sit on an open, heartbeating
+   * socket waiting for a `ready` that never comes — close instead, so its
+   * reconnect loop gets another try.
+   */
+  private async sendReady(session: Session, via: 'identify' | 'register'): Promise<void> {
+    const t0 = Date.now();
+    let ready: ReadyData;
+    try {
+      ready = await this.hooks.buildReady(session);
+    } catch (err) {
+      this.sessionLog(`${via}-failed`, session, `ready-ms=${Date.now() - t0} error="${logSafe((err as Error).message, 160)}"`);
+      session.close(1011, 'ready failed');
+      return;
+    }
     session.send({ op: 'ready', d: ready });
+    this.sessionLog(
+      via,
+      session,
+      `ready-ms=${Date.now() - t0} since-connect-ms=${Date.now() - session.connectedAt} channels=${ready.channels.length} subs=${session.subscriptions.size}`,
+    );
     this.hooks.onOpen?.(session);
   }
 
@@ -203,6 +268,7 @@ export class Gateway {
     }
     const res = await this.hooks.enroll(d);
     if ('error' in res) {
+      this.sessionLog('register-rejected', session, `reason="${logSafe(res.error, 160)}"`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: res.error } });
       session.close(4003, 'register failed');
       return;
@@ -217,9 +283,7 @@ export class Gateway {
     this.streams.set(res.personaId, this.streams.get(res.personaId) ?? { seq: 0, buffer: [] });
 
     session.send({ op: 'registered', d: res });
-    const ready = await this.hooks.buildReady(session);
-    session.send({ op: 'ready', d: ready });
-    this.hooks.onOpen?.(session);
+    await this.sendReady(session, 'register');
   }
 
   /** Restore the client's requested ambient subscriptions, dropping (silently —
@@ -236,6 +300,7 @@ export class Gateway {
     const personaId = this.sessionPersona.get(sessionId);
     const stream = personaId ? this.streams.get(personaId) : undefined;
     if (!personaId || !stream) {
+      this.sessionLog('resume-rejected', session, `reason="unknown session" from-seq=${logSafe(fromSeq, 16)}`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'unknown session' } });
       return;
     }
@@ -246,6 +311,9 @@ export class Gateway {
     const oldest = stream.buffer[0]?.seq;
     const gap = oldest !== undefined ? fromSeq < oldest - 1 : fromSeq < stream.seq;
     if (gap) {
+      this.log(
+        `[portal-relay] session resume-rejected persona=${personaId} sess=${session.id.slice(5, 13)} reason="resume window exceeded" from-seq=${logSafe(fromSeq, 16)} stream-seq=${stream.seq} ${this.live()}`,
+      );
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'resume window exceeded' } });
       return;
     }
@@ -255,6 +323,7 @@ export class Gateway {
     const missed = stream.buffer.filter((e) => e.seq > fromSeq);
     for (const e of missed) session.send({ op: 'dispatch', seq: e.seq, d: e.event });
     session.send({ op: 'resumed', d: { replayedEvents: missed.length } });
+    this.sessionLog('resume', session, `replayed=${missed.length} since-connect-ms=${Date.now() - session.connectedAt}`);
     this.hooks.onOpen?.(session);
   }
 
@@ -266,9 +335,17 @@ export class Gateway {
     set.add(session);
   }
 
-  private onDisconnect(session: Session): void {
+  private onDisconnect(session: Session, why = ''): void {
+    // ws emits `error` and then `close` for the same socket: handle it once.
+    if (session.disconnected) return;
+    session.disconnected = true;
     this.sessions.delete(session.id);
     this.byPersona.get(session.personaId)?.delete(session);
+    this.sessionLog(
+      session.identified ? 'close' : 'close-unidentified',
+      session,
+      `${why} age-s=${Math.round((Date.now() - session.connectedAt) / 1000)}`,
+    );
     this.hooks.onClose?.(session);
     // Keep sessionPersona for resume; it's pruned by buffer turnover.
   }
@@ -276,7 +353,10 @@ export class Gateway {
   private reapStale(): void {
     const cutoff = Date.now() - this.heartbeatIntervalMs * 2;
     for (const s of this.sessions.values()) {
-      if (s.lastSeen < cutoff) s.close(4000, 'heartbeat timeout');
+      if (s.lastSeen < cutoff) {
+        this.sessionLog('heartbeat-timeout', s, `idle-s=${Math.round((Date.now() - s.lastSeen) / 1000)}`);
+        s.close(4000, 'heartbeat timeout');
+      }
     }
   }
 
