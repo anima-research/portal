@@ -7,11 +7,11 @@
 // invisible until an operator noticed).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Relay } from '../src/relay.js';
-import type { RelayConfig } from '../src/config.js';
+import type { AccessRole, RelayConfig } from '../src/config.js';
 
 const GUILD = 'g1';
 const CHAN_A = 'chan-a';
@@ -40,7 +40,8 @@ function makeRelay() {
       invites: [
         { code: 'mirror-mint', grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } }, guildId: GUILD },
         { code: 'mirror-aug', mode: 'augment', grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } }, guildId: GUILD },
-        { code: 'mirror-noguild', mode: 'both', grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } } },
+        { code: 'mirror-noguild', mode: 'both', maxUses: 1, grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } } },
+        { code: 'mirror-emptyguild', mode: 'both', maxUses: 1, guildId: '', grant: { caps: [...RW], scope: { mirrorRoles: [DISCORD_ROLE] } } },
       ],
     }),
   );
@@ -83,7 +84,18 @@ function makeRelay() {
   };
 
   const caps = (pid: string, cid: string) => [...relay.capsFor(pid, cid, GUILD)].sort();
-  return { relay, visible, caps, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  const changes: unknown[] = [];
+  relay.identity.onChange((change: unknown) => changes.push(change));
+  relay.permissions.onChange((change: unknown) => changes.push(change));
+  const snapshot = () => structuredClone({
+    identities: relay.identity.all(),
+    permissions: [...relay.permissions.personas],
+    roles: relay.permissions.allRoles(),
+    invites: relay.invites.all(),
+    files: ['identity.json', 'permissions.json', 'invites.json'].map((file) => readFileSync(join(dir, file), 'utf8')),
+    changes,
+  });
+  return { relay, visible, caps, snapshot, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 test('enroll with a mirror grant materializes a live access role, not a snapshot', async () => {
@@ -146,15 +158,119 @@ test('augment claim adds the live role and leaves the existing inline policy int
   }
 });
 
-test('mirror grant without guildId: enroll denies, augment rejects loudly', async () => {
+for (const code of ['mirror-noguild', 'mirror-emptyguild']) {
+  test(`${code}: enroll and augment reject without mutations or invite consumption`, async () => {
+    const t = makeRelay();
+    try {
+      const before = t.snapshot();
+      const request = { invite: code, desiredName: 'lost', subscriptions: [CHAN_A] };
+      const enrolled = await t.relay.enroll(request);
+      assert.match(enrolled.error, /invite mirror grant is missing guildId/);
+      assert.deepEqual(t.snapshot(), before);
+      assert.deepEqual(request.subscriptions, [CHAN_A]);
+
+      assert.throws(() => t.relay.applyInviteAugment(EXISTING, code), {
+        code: 'INVALID_PARAMS', message: /invite mirror grant is missing guildId/,
+      });
+      assert.deepEqual(t.snapshot(), before);
+      assert.equal(t.relay.invites.check(code, Date.now()).code, code);
+    } finally {
+      t.cleanup();
+    }
+  });
+}
+
+const mismatches: [string, Partial<AccessRole>][] = [
+  ['guild', { guildId: 'other-guild' }],
+  ['cap set', { caps: ['VIEW_CHANNEL'] }],
+  ['role-id set', { scope: { mirrorRoles: [DISCORD_ROLE, 'another-role'] } }],
+  ['all scope', { scope: { all: true } }],
+  ['channel scope', { scope: { channels: [CHAN_A] } }],
+  ['mixed all/mirror scope', { scope: { all: true, mirrorRole: DISCORD_ROLE } }],
+  ['mixed channel/mirror scope', { scope: { channels: [CHAN_A], mirrorRole: DISCORD_ROLE } }],
+  ['mirrorCaps', { mirrorCaps: true }],
+];
+
+for (const [dimension, replacement] of mismatches) {
+  test(`colliding mirror role (${dimension}): both claims reject before any mutation`, async () => {
+    const t = makeRelay();
+    try {
+      const first = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'first' });
+      assert.ok(!('error' in first));
+      const [name] = t.relay.permissions.getRoleNames(first.personaId);
+      t.relay.permissions.setRole(name, { ...t.relay.permissions.getRole(name), ...replacement });
+      const before = t.snapshot();
+
+      const second = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'second' });
+      assert.match(second.error, /invite mirror grant conflicts with existing role/);
+      assert.ok(second.error.includes(name));
+      assert.deepEqual(t.snapshot(), before);
+
+      assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mirror-aug'), {
+        code: 'INVALID_PARAMS', message: /invite mirror grant conflicts with existing role/,
+      });
+      assert.deepEqual(t.snapshot(), before);
+    } finally {
+      t.cleanup();
+    }
+  });
+}
+
+test('equivalent single/plural mirror scopes and duplicate caps reuse the existing role unchanged', async () => {
   const t = makeRelay();
   try {
-    const enrolled = await t.relay.enroll({ invite: 'mirror-noguild', desiredName: 'lost' });
-    assert.ok(!('error' in enrolled));
-    assert.deepEqual(t.relay.permissions.getRoleNames(enrolled.personaId), []);
-    assert.deepEqual(t.caps(enrolled.personaId, CHAN_A), []);
+    const first = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'first' });
+    assert.ok(!('error' in first));
+    const [name] = t.relay.permissions.getRoleNames(first.personaId);
+    const equivalent: AccessRole = {
+      guildId: GUILD, caps: ['VIEW_CHANNEL', ...RW].reverse(),
+      scope: { mirrorRoles: [DISCORD_ROLE, DISCORD_ROLE] }, mirrorCaps: false,
+    };
+    t.relay.permissions.setRole(name, equivalent);
+    t.relay.invites.mint({
+      code: 'equivalent', mode: 'both', guildId: GUILD,
+      grant: { caps: [...RW, 'VIEW_CHANNEL'].reverse(), scope: { mirrorRoles: [DISCORD_ROLE] } },
+    });
+    const second = await t.relay.enroll({ invite: 'equivalent', desiredName: 'second' });
+    assert.ok(!('error' in second), JSON.stringify(second));
+    const claimed = t.relay.applyInviteAugment(EXISTING, 'equivalent');
+    assert.deepEqual(t.relay.permissions.getRoleNames(second.personaId), [name]);
+    assert.deepEqual(claimed.roles, [name]);
+    assert.deepEqual(t.relay.permissions.allRoles(), { [name]: equivalent });
+    assert.deepEqual(t.caps(second.personaId, CHAN_A), [...RW]);
+    assert.deepEqual(t.caps(EXISTING, CHAN_A), [...RW]);
+    assert.equal(t.relay.invites.get('equivalent').uses, 2);
+  } finally {
+    t.cleanup();
+  }
+});
 
-    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mirror-noguild'), /missing guildId/);
+test('multi-role grants normalize role order and duplicates for both naming and reuse', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({
+      code: 'multi', mode: 'both', guildId: GUILD,
+      grant: { caps: [...RW], scope: { mirrorRoles: ['other-role', DISCORD_ROLE] } },
+    });
+    const first = await t.relay.enroll({ invite: 'multi', desiredName: 'first' });
+    assert.ok(!('error' in first));
+    const [name] = t.relay.permissions.getRoleNames(first.personaId);
+    const equivalent: AccessRole = {
+      guildId: GUILD, caps: [...RW],
+      scope: { mirrorRoles: ['other-role', DISCORD_ROLE, 'other-role'] },
+    };
+    t.relay.permissions.setRole(name, equivalent);
+    t.relay.invites.mint({
+      code: 'multi-reordered', mode: 'both', guildId: GUILD,
+      grant: { caps: [...RW].reverse(), scope: { mirrorRoles: [DISCORD_ROLE, 'other-role', DISCORD_ROLE] } },
+    });
+    const second = await t.relay.enroll({ invite: 'multi-reordered', desiredName: 'second' });
+    assert.ok(!('error' in second), JSON.stringify(second));
+    const claimed = t.relay.applyInviteAugment(EXISTING, 'multi-reordered');
+    assert.deepEqual(t.relay.permissions.getRoleNames(second.personaId), [name]);
+    assert.deepEqual(claimed.roles, [name]);
+    assert.deepEqual(t.relay.permissions.allRoles(), { [name]: equivalent });
+    assert.equal(t.relay.invites.get('multi-reordered').uses, 2);
   } finally {
     t.cleanup();
   }
