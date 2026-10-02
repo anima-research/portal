@@ -20,7 +20,7 @@ const DISCORD_ROLE = 'dr-everyone';
 const EXISTING = 'existing-1';
 const RW = ['READ_HISTORY', 'SEND_MESSAGES', 'VIEW_CHANNEL'] as const;
 
-function makeRelay() {
+function makeRelay(roles: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'portal-mirror-'));
   writeFileSync(
     join(dir, 'identity.json'),
@@ -29,6 +29,7 @@ function makeRelay() {
   writeFileSync(
     join(dir, 'permissions.json'),
     JSON.stringify({
+      roles,
       personas: {
         [EXISTING]: { default: [], guilds: { [GUILD]: { default: [], channels: { [CHAN_A]: ['VIEW_CHANNEL'] } } } },
       },
@@ -210,6 +211,44 @@ for (const [dimension, replacement] of mismatches) {
         code: 'INVALID_PARAMS', message: /invite mirror grant conflicts with existing role/,
       });
       assert.deepEqual(t.snapshot(), before);
+    } finally {
+      t.cleanup();
+    }
+  });
+}
+
+for (const [kind, role] of [
+  ['guildless', { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } }],
+  ['null', null],
+] as const) {
+  test(`quarantined ${kind} role: claims preserve the occupied name and existing references`, async () => {
+    const seed = makeRelay();
+    let name: string;
+    try {
+      const enrolled = await seed.relay.enroll({ invite: 'mirror-mint', desiredName: 'seed' });
+      assert.ok(!('error' in enrolled));
+      [name] = seed.relay.permissions.getRoleNames(enrolled.personaId);
+    } finally {
+      seed.cleanup();
+    }
+
+    const t = makeRelay({ [name!]: role });
+    try {
+      t.relay.permissions.addPersonaRoles(EXISTING, [name!]);
+      assert.equal(t.relay.permissions.getRole(name!), undefined);
+      assert.equal(t.relay.permissions.hasRoleName(name!), true);
+      const before = t.snapshot();
+
+      const enrolled = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'new' });
+      assert.match(enrolled.error, /invite mirror grant conflicts with quarantined role/);
+      assert.ok(enrolled.error.includes(name!));
+      assert.deepEqual(t.snapshot(), before);
+
+      assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mirror-aug'), {
+        code: 'INVALID_PARAMS', message: /invite mirror grant conflicts with quarantined role/,
+      });
+      assert.deepEqual(t.snapshot(), before);
+      assert.deepEqual(t.caps(EXISTING, CHAN_A), ['VIEW_CHANNEL']);
     } finally {
       t.cleanup();
     }

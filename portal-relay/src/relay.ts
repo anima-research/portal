@@ -705,6 +705,9 @@ export class Relay implements GatewayHooks {
       .slice(0, 8);
     const name = `mirror-${hash}`;
     const existing = this.permissions.getRole(name);
+    if (!existing && this.permissions.hasRoleName(name)) {
+      return { error: `invite mirror grant conflicts with quarantined role "${name}"` };
+    }
     if (existing) {
       // Static fields take precedence during permission resolution, even if a
       // hand-authored scope also contains a mirror field.
