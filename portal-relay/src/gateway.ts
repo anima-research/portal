@@ -50,9 +50,20 @@ interface PersonaStream {
   buffer: Array<{ seq: number; event: PortalEvent }>;
 }
 
+interface ResumeSession {
+  personaId: string;
+  /** Absent while a socket using this resume key is live. */
+  expiresAt?: number;
+}
+
 const BUFFER_CAP = 1000;
+const RESUME_RETENTION_MS = 5 * 60_000;
 
 export interface GatewayOptions {
+  /** How long a disconnected session may resume (default 5 minutes).
+   *  Replay is also limited by the 1000-event buffer. Live sessions never age
+   *  out; events arriving while offline do not extend this deadline. */
+  resumeRetentionMs?: number;
   /**
    * Sink for session-lifecycle lines (identify / resume / register / close /
    * heartbeat reap). Defaults to stderr. These are the only record of whether a
@@ -78,6 +89,8 @@ const REJECT_LOG_CAP = 3;
 
 export class Session {
   readonly id: string;
+  /** The original ready.sessionId, retained across successful resumes. */
+  resumeId: string;
   personaId = '';
   subscriptions = new Set<string>();
   identified = false;
@@ -97,6 +110,7 @@ export class Session {
     private gateway: Gateway,
   ) {
     this.id = `sess_${randomUUID()}`;
+    this.resumeId = this.id;
   }
 
   send(frame: ServerFrame): void {
@@ -131,10 +145,11 @@ export class Gateway {
   private byPersona = new Map<string, Set<Session>>();
   private streams = new Map<string, PersonaStream>();
   /** Retains sessionId → personaId for a window so resume can find the stream. */
-  private sessionPersona = new Map<string, string>();
+  private sessionPersona = new Map<string, ResumeSession>();
   private heartbeatTimer?: ReturnType<typeof setInterval>;
 
   private log: (line: string) => void;
+  private resumeRetentionMs: number;
 
   constructor(
     private hooks: GatewayHooks,
@@ -142,6 +157,10 @@ export class Gateway {
     opts: GatewayOptions = {},
   ) {
     this.log = opts.log ?? ((line) => console.error(line));
+    this.resumeRetentionMs = opts.resumeRetentionMs ?? RESUME_RETENTION_MS;
+    if (!Number.isFinite(this.resumeRetentionMs) || this.resumeRetentionMs < 0) {
+      throw new RangeError('resumeRetentionMs must be a finite nonnegative number');
+    }
   }
 
   /** `live=<sessions>/<personas>` — appended to lifecycle lines so a reconnect
@@ -337,7 +356,9 @@ export class Gateway {
   }
 
   private onResume(session: Session, sessionId: string, fromSeq: number): void {
-    const personaId = this.sessionPersona.get(sessionId);
+    if (session.identified || session.disconnected) return;
+    this.pruneResumeState(Date.now());
+    const personaId = this.sessionPersona.get(sessionId)?.personaId;
     const stream = personaId ? this.streams.get(personaId) : undefined;
     if (!personaId || !stream) {
       this.rejectLog('resume-rejected', session, `reason="unknown session" from-seq=${logSafe(fromSeq, 16)}`);
@@ -359,6 +380,10 @@ export class Gateway {
     }
     session.personaId = personaId;
     session.identified = true;
+    // The resumed frame supplies no replacement sessionId. Keep accepting
+    // the key the client received in ready, rather than leaking one key per
+    // reconnect or expiring a key that is still in active use.
+    session.resumeId = sessionId;
     this.register(session);
     const missed = stream.buffer.filter((e) => e.seq > fromSeq);
     for (const e of missed) session.send({ op: 'dispatch', seq: e.seq, d: e.event });
@@ -369,7 +394,7 @@ export class Gateway {
 
   private register(session: Session): void {
     this.sessions.set(session.id, session);
-    this.sessionPersona.set(session.id, session.personaId);
+    this.sessionPersona.set(session.resumeId, { personaId: session.personaId });
     let set = this.byPersona.get(session.personaId);
     if (!set) this.byPersona.set(session.personaId, (set = new Set()));
     set.add(session);
@@ -379,7 +404,13 @@ export class Gateway {
     if (session.disconnected) return;
     session.disconnected = true;
     this.sessions.delete(session.id);
-    this.byPersona.get(session.personaId)?.delete(session);
+    const live = this.byPersona.get(session.personaId);
+    live?.delete(session);
+    if (live?.size === 0) this.byPersona.delete(session.personaId);
+    const retained = this.sessionPersona.get(session.resumeId);
+    if (retained && ![...(live ?? [])].some((s) => s.resumeId === session.resumeId)) {
+      retained.expiresAt = Date.now() + this.resumeRetentionMs;
+    }
     const extra = [
       session.lastError ? `error="${logSafe(session.lastError)}"` : '',
       session.rejections ? `rejections=${session.rejections}` : '',
@@ -392,16 +423,37 @@ export class Gateway {
       `${why}${extra ? ' ' + extra : ''} age-s=${Math.round((Date.now() - session.connectedAt) / 1000)}`,
     );
     this.hooks.onClose?.(session);
-    // Keep sessionPersona for resume; it's pruned by buffer turnover.
+    // The heartbeat sweep releases expired resume keys and unused streams.
   }
 
   private reapStale(): void {
-    const cutoff = Date.now() - this.heartbeatIntervalMs * 2;
+    const now = Date.now();
+    this.pruneResumeState(now);
+    const cutoff = now - this.heartbeatIntervalMs * 2;
     for (const s of this.sessions.values()) {
       if (s.lastSeen < cutoff && !s.reaped) {
         s.reaped = true; // the socket stays in `sessions` until its close event
         this.sessionLog('heartbeat-timeout', s, `idle-s=${Math.round((Date.now() - s.lastSeen) / 1000)}`);
         s.close(4000, 'heartbeat timeout');
+      }
+    }
+  }
+
+  /** Expire disconnected keys, then release streams nobody can resume.
+   *  Dispatch does not refresh retention: a busy guild must not keep an
+   *  absent persona's replay buffer alive forever. */
+  private pruneResumeState(now: number): void {
+    const retainedPersonas = new Set<string>();
+    for (const [id, retained] of this.sessionPersona) {
+      if (retained.expiresAt !== undefined && retained.expiresAt <= now) {
+        this.sessionPersona.delete(id);
+      } else {
+        retainedPersonas.add(retained.personaId);
+      }
+    }
+    for (const personaId of this.streams.keys()) {
+      if (!retainedPersonas.has(personaId) && !this.byPersona.has(personaId)) {
+        this.streams.delete(personaId);
       }
     }
   }
@@ -415,8 +467,10 @@ export class Gateway {
 
   /** Append an event to a persona's stream and fan out to its live sessions. */
   dispatch(personaId: string, event: PortalEvent): void {
-    const stream = this.streams.get(personaId) ?? { seq: 0, buffer: [] };
-    this.streams.set(personaId, stream);
+    const stream = this.streams.get(personaId);
+    // Only identify/register establishes a stream. An offline identity update
+    // or a late voice event must not recreate state after retention expires.
+    if (!stream) return;
     const seq = ++stream.seq;
     stream.buffer.push({ seq, event });
     if (stream.buffer.length > BUFFER_CAP) stream.buffer.shift();
@@ -443,8 +497,8 @@ export class Gateway {
 
   /**
    * Personas with a retained event stream — identified at least once since
-   * boot, live or not. Structural/rights events dispatch to these (buffered
-   * for resume) so a briefly-dropped single-session agent doesn't miss a
+   * boot and still live or within the resume window. Structural/rights events
+   * dispatch to these (buffered for resume) so a briefly-dropped agent doesn't miss a
    * channel_create/channel_delete/capabilities_update; messages deliberately
    * do NOT (offline message catch-up rides durable read-state instead).
    */
@@ -460,6 +514,9 @@ export class Gateway {
    *  which keeps the stream so re-authed sessions can resume). */
   dropStream(personaId: string): void {
     this.streams.delete(personaId);
+    for (const [id, retained] of this.sessionPersona) {
+      if (retained.personaId === personaId) this.sessionPersona.delete(id);
+    }
   }
 
   sessionsOf(personaId: string): Session[] {

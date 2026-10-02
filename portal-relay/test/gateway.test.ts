@@ -331,6 +331,10 @@ test('session lifecycle is logged: identify timing, auth reject, resume, close, 
     assert.equal(await closed, 1011);
     assert.ok(has(/session identify-failed persona=p2 .*ready-ms=\d+ error="discord unavailable"/), lines.join('\n'));
 
+    // Wait for the server-side close log too: the client close above can
+    // arrive first, and that late line belongs to gw, not the throwing sink.
+    await until(/session close persona=p2 .*code=1011/);
+
     // a throwing log sink neither kills the session nor skips the 1011 close
     const sinkLines = lines.length;
     const gwThrow = new Gateway(h, 30_000, { log: () => { throw new Error('sink down'); } });
