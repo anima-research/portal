@@ -181,7 +181,7 @@ for (const code of ['mirror-noguild', 'mirror-emptyguild']) {
   });
 }
 
-const mismatches: [string, Partial<AccessRole>][] = [
+const mismatches: [string, Record<string, unknown>][] = [
   ['guild', { guildId: 'other-guild' }],
   ['cap set', { caps: ['VIEW_CHANNEL'] }],
   ['role-id set', { scope: { mirrorRoles: [DISCORD_ROLE, 'another-role'] } }],
@@ -190,6 +190,22 @@ const mismatches: [string, Partial<AccessRole>][] = [
   ['mixed all/mirror scope', { scope: { all: true, mirrorRole: DISCORD_ROLE } }],
   ['mixed channel/mirror scope', { scope: { channels: [CHAN_A], mirrorRole: DISCORD_ROLE } }],
   ['mirrorCaps', { mirrorCaps: true }],
+  ['missing scope', { scope: undefined }],
+  ['null scope', { scope: null }],
+  ['string scope', { scope: DISCORD_ROLE }],
+  ['missing caps', { caps: undefined }],
+  ['null caps', { caps: null }],
+  ['string caps', { caps: 'VIEW_CHANNEL' }],
+  ['numeric caps', { caps: 1 }],
+  ['non-string cap', { caps: [...RW, 1] }],
+  ['missing mirror role id', { scope: { mirrorRole: undefined } }],
+  ['numeric mirror role id', { scope: { mirrorRole: 1 } }],
+  ['null mirror role ids', { scope: { mirrorRoles: null } }],
+  ['string mirror role ids', { scope: { mirrorRoles: DISCORD_ROLE } }],
+  ['non-string mirror role id', { scope: { mirrorRoles: [DISCORD_ROLE, 1] } }],
+  ['null mirrorCaps', { mirrorCaps: null }],
+  ['numeric mirrorCaps', { mirrorCaps: 0 }],
+  ['string mirrorCaps', { mirrorCaps: 'false' }],
 ];
 
 for (const [dimension, replacement] of mismatches) {

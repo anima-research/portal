@@ -709,10 +709,13 @@ export class Relay implements GatewayHooks {
       return { error: `invite mirror grant conflicts with quarantined role "${name}"` };
     }
     if (existing) {
-      // Static fields take precedence during permission resolution, even if a
-      // hand-authored scope also contains a mirror field.
+      // File-loaded entries can have malformed fields despite their static
+      // type. Treat those as conflicts rather than throwing during comparison.
+      // Static scope fields take precedence over mirror fields in resolution.
       const matches = existing.guildId === guildId
-        && !existing.mirrorCaps
+        && (existing.mirrorCaps === undefined || existing.mirrorCaps === false)
+        && existing.scope !== null
+        && typeof existing.scope === 'object'
         && !('all' in existing.scope)
         && !('channels' in existing.scope)
         && isMirrorScope(existing.scope)
@@ -1952,7 +1955,8 @@ function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirror
 }
 
 /** Capabilities and mirrored role ids are sets: order and duplicates are inert. */
-function sameStringSet(a: string[], b: string[]): boolean {
+function sameStringSet(a: unknown, b: string[]): boolean {
+  if (!Array.isArray(a) || a.some((value) => typeof value !== 'string')) return false;
   const values = new Set(a);
   return values.size === new Set(b).size && b.every((value) => values.has(value));
 }
