@@ -1191,7 +1191,7 @@ export class Relay implements GatewayHooks {
       }
       case 'create_text_channel': {
         const p = params as RpcParams<'create_text_channel'>;
-        this.requireCreateTextChannel(personaId, p.guildId, p.categoryId);
+        await this.requireCreateTextChannel(personaId, p.guildId, p.categoryId);
         const meta = await this.bot.createTextChannel(p.guildId, p.name, p.categoryId);
         return { channel: this.toPortalChannel(meta, personaId) };
       }
@@ -1942,7 +1942,7 @@ export class Relay implements GatewayHooks {
   /** Creation is authorized at its destination: the category, or the guild
    *  root when no category is supplied. Rights on a sibling channel never
    *  confer authority to create elsewhere in the guild. */
-  private requireCreateTextChannel(personaId: string, guildId: string, categoryId?: string): void {
+  private async requireCreateTextChannel(personaId: string, guildId: string, categoryId?: string): Promise<void> {
     if (typeof guildId !== 'string' || !guildId ||
         (categoryId !== undefined && (typeof categoryId !== 'string' || !categoryId))) {
       throw rpcError('INVALID_PARAMS', 'guildId and categoryId must be non-empty strings');
@@ -1951,7 +1951,15 @@ export class Relay implements GatewayHooks {
       throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
     }
     if (categoryId !== undefined) {
-      const category = this.bot.channelForPerms(categoryId);
+      let category = this.bot.channelForPerms(categoryId);
+      if (!category) {
+        // REST can know a category before its gateway event arrives. Fetching
+        // populates discord.js's cache, which the effective-capability check uses.
+        await this.bot.getChannelMeta(categoryId);
+        category = this.bot.channelForPerms(categoryId);
+        // A mirror lookup may predate this newly fetched channel as well.
+        if (category?.guildId === guildId) this.mirror.invalidateGuild(guildId);
+      }
       if (!category || category.guildId !== guildId || category.type !== ChannelType.GuildCategory) {
         throw rpcError('FORBIDDEN', 'categoryId must identify a category in the requested guild');
       }

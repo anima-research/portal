@@ -10,6 +10,7 @@ import { ChannelType, PermissionsBitField } from 'discord.js';
 import type { Capability } from '@animalabs/portal-protocol';
 import { Relay } from '../src/relay.js';
 import { hashToken } from '../src/identity.js';
+import { MirrorCache } from '../src/mirror-cache.js';
 import type { PermissionsFile, RelayConfig } from '../src/config.js';
 import type { Session } from '../src/gateway.js';
 
@@ -44,6 +45,7 @@ function makeRelay(t: TestContext, policy: PermissionsFile) {
   const state = {
     allowedGuilds: new Set([GUILD, OTHER_GUILD]),
     botInGuild: true,
+    onFetch: undefined as (() => void) | undefined,
     guildPerms: new PermissionsBitField(PermissionsBitField.Flags.ManageChannels),
     categoryPerms: new PermissionsBitField(PermissionsBitField.Flags.ManageChannels),
   };
@@ -54,6 +56,9 @@ function makeRelay(t: TestContext, policy: PermissionsFile) {
     [TEXT, { guildId: GUILD, type: ChannelType.GuildText }],
     [THREAD, { guildId: GUILD, type: ChannelType.PublicThread }],
   ]);
+  // REST can know about channels before the gateway has cached them.
+  const remoteChannels = new Map(channels);
+  const fetchCalls: string[] = [];
   const calls: unknown[][] = [];
   relay.bot = {
     isGuildAllowed: (id: string) => state.allowedGuilds.has(id),
@@ -63,6 +68,18 @@ function makeRelay(t: TestContext, policy: PermissionsFile) {
       const channel = channels.get(id);
       return channel && { ...channel, permissionsFor: () => state.categoryPerms };
     },
+    getChannelMeta: async (id: string) => {
+      fetchCalls.push(id);
+      await state.onFetch?.();
+      const channel = remoteChannels.get(id);
+      if (!channel) return null;
+      channels.set(id, channel); // discord.js fetch caches its result
+      return { id, guildId: channel.guildId, type: channel.type === ChannelType.GuildCategory ? 'category' : 'text' };
+    },
+    roleCapsByChannel: (guildId: string) => new Map(
+      [...channels].filter(([, channel]) => channel.guildId === guildId)
+        .map(([id]) => [id, new Set(MANAGE)]),
+    ),
     createTextChannel: async (guildId: string, name: string, categoryId?: string) => {
       calls.push([guildId, name, categoryId]);
       const id = 'created-' + calls.length;
@@ -97,7 +114,7 @@ function makeRelay(t: TestContext, policy: PermissionsFile) {
     assert.equal(response.result.channel.guildId, params.guildId);
     assert.equal(response.result.channel.type, 'text');
   };
-  return { relay, state, channels, calls, rpc, denied, allowed };
+  return { relay, state, channels, remoteChannels, fetchCalls, calls, rpc, denied, allowed };
 }
 
 test('no grant or unrelated capabilities cannot create at the root or in a category', async (t) => {
@@ -214,6 +231,70 @@ test('full-fidelity mirrors stay local in admitted scopes that also contain all:
     });
     await h.allowed({ guildId: GUILD });
   }
+});
+
+test('a valid uncached category is fetched before authorization; cached/root paths need no fetch', async (t) => {
+  const h = makeRelay(t, { personas: { alice: { default: MANAGE } } });
+  h.channels.delete(CATEGORY);
+  await h.allowed({ guildId: GUILD, categoryId: CATEGORY });
+  assert.deepEqual(h.fetchCalls, [CATEGORY]);
+  assert.ok(h.channels.has(CATEGORY));
+  await h.allowed({ guildId: GUILD, categoryId: CATEGORY });
+  await h.allowed({ guildId: GUILD });
+  assert.deepEqual(h.fetchCalls, [CATEGORY]);
+});
+
+test('fetching a category refreshes mirror grants cached before it existed', async (t) => {
+  for (const mirrorCaps of [false, true]) {
+    const h = makeRelay(t, {
+      roles: { manager: { guildId: GUILD, scope: { mirrorRole: 'r1' }, caps: MANAGE, mirrorCaps } },
+      personas: { alice: { roles: ['manager'] } },
+    });
+    h.channels.delete(CATEGORY);
+    h.relay.mirror = new MirrorCache(h.relay.bot);
+    // Warm the real MirrorCache without the new category.
+    assert.equal(h.relay.permissions.resolve('alice', GUILD, CATEGORY).size, 0);
+    await h.allowed({ guildId: GUILD, categoryId: CATEGORY });
+    assert.deepEqual(h.fetchCalls, [CATEGORY]);
+    await h.denied({ guildId: GUILD }); // still local after the refresh
+  }
+});
+
+test('fetched destinations still require category type, guild membership, and manage authority', async (t) => {
+  for (const categoryId of [TEXT, THREAD, FOREIGN_CATEGORY, 'unfetchable']) {
+    const h = makeRelay(t, { default: MANAGE });
+    h.channels.delete(categoryId);
+    await h.denied({ guildId: GUILD, categoryId });
+    assert.deepEqual(h.fetchCalls, [categoryId]);
+  }
+  const h = makeRelay(t, { personas: { alice: { default: VIEW } } });
+  h.channels.delete(CATEGORY);
+  await h.denied({ guildId: GUILD, categoryId: CATEGORY });
+  assert.deepEqual(h.fetchCalls, [CATEGORY]);
+});
+
+test('authorization revoked during a category fetch prevents creation', async (t) => {
+  for (const revoke of [
+    (h: ReturnType<typeof makeRelay>) => h.relay.identity.remove('alice'),
+    (h: ReturnType<typeof makeRelay>) => h.state.allowedGuilds.clear(),
+    (h: ReturnType<typeof makeRelay>) => h.relay.permissions.setPersonaDefault('alice', []),
+    (h: ReturnType<typeof makeRelay>) => { h.state.categoryPerms = new PermissionsBitField(); },
+  ]) {
+    const h = makeRelay(t, { personas: { alice: { default: MANAGE } } });
+    h.channels.delete(CATEGORY);
+    h.state.onFetch = () => { revoke(h); };
+    await h.denied({ guildId: GUILD, categoryId: CATEGORY });
+    assert.deepEqual(h.fetchCalls, [CATEGORY]);
+  }
+});
+
+test('invalid identity or disallowed guild is rejected before fetching a category', async (t) => {
+  const h = makeRelay(t, { default: MANAGE });
+  h.channels.delete(CATEGORY);
+  await h.denied({ guildId: GUILD, categoryId: CATEGORY }, 'deleted-persona');
+  h.state.allowedGuilds.clear();
+  await h.denied({ guildId: GUILD, categoryId: CATEGORY });
+  assert.deepEqual(h.fetchCalls, []);
 });
 
 test('category must exist, be a category, and belong to the requested guild', async (t) => {
