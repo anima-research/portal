@@ -121,7 +121,12 @@ export class PermissionsStore {
     const out = new Set<Capability>();
     for (const name of entry.roles ?? []) {
       const role = this.roles.get(name);
-      if (role?.guildId === guildId && 'all' in role.scope && role.scope.all === true) {
+      if (!role || role.guildId !== guildId) continue;
+      // Match resolveForRoles precedence for hand-authored mixed scopes:
+      // full-fidelity mirrors stay local even if the scope also has all:true.
+      const isMirror = 'mirrorRole' in role.scope || 'mirrorRoles' in role.scope;
+      if (isMirror && role.mirrorCaps) continue;
+      if ('all' in role.scope && role.scope.all === true) {
         for (const cap of role.caps) out.add(cap);
       }
     }

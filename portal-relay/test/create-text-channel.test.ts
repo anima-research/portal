@@ -194,6 +194,28 @@ test('category resolution honors inline overrides and full-fidelity mirror masks
   await mirror.denied({ guildId: GUILD }); // mirror remains channel-scoped
 });
 
+test('full-fidelity mirrors stay local in admitted scopes that also contain all:true', async (t) => {
+  for (const mirrorScope of [{ mirrorRole: 'r1' }, { mirrorRoles: ['r1', 'r2'] }]) {
+    const h = makeRelay(t, {
+      roles: { manager: {
+        guildId: GUILD, scope: { all: true, ...mirrorScope }, caps: MANAGE, mirrorCaps: true,
+      } },
+      personas: { alice: { roles: ['manager'] } },
+    });
+    h.relay.permissions.setMirrorLookup(() => new Map([[CATEGORY, new Set(MANAGE)]]));
+    assert.deepEqual([...h.relay.permissions.resolve('alice', GUILD, OTHER_CATEGORY)], []);
+    await h.allowed({ guildId: GUILD, categoryId: CATEGORY });
+    await h.denied({ guildId: GUILD, categoryId: OTHER_CATEGORY });
+    await h.denied({ guildId: GUILD });
+
+    // Disabling mirrorCaps restores the existing all-scope precedence.
+    h.relay.permissions.setRole('manager', {
+      guildId: GUILD, scope: { all: true, ...mirrorScope }, caps: MANAGE, mirrorCaps: false,
+    });
+    await h.allowed({ guildId: GUILD });
+  }
+});
+
 test('category must exist, be a category, and belong to the requested guild', async (t) => {
   const h = makeRelay(t, { personas: { alice: { default: MANAGE } } });
   for (const categoryId of ['unknown', TEXT, THREAD, FOREIGN_CATEGORY]) {
