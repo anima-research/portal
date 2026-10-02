@@ -269,7 +269,7 @@ export class Gateway {
     personaId: string,
     subscriptions?: string[],
   ): Promise<void> {
-    if (session.identified) return;
+    if (session.identified || session.disconnected) return;
     const ok = this.hooks.authenticate(token, personaId);
     if (!ok) {
       this.rejectLog('identify-rejected', session, `claimed="${logSafe(personaId)}" reason="auth failed"`);
@@ -318,7 +318,7 @@ export class Gateway {
   }
 
   private async onRegister(session: Session, d: RegisterData): Promise<void> {
-    if (session.identified) return;
+    if (session.identified || session.disconnected) return;
     if (!this.hooks.enroll) {
       this.sessionLog('register-rejected', session, 'reason="registration disabled"');
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'registration disabled' } });
@@ -326,6 +326,10 @@ export class Gateway {
       return;
     }
     const res = await this.hooks.enroll(d);
+    // Enrollment hooks may await external work. A closed socket has already
+    // had its only disconnect, and another identify/register may have won
+    // while we waited. Neither may be promoted into a new live session here.
+    if (session.disconnected || session.identified) return;
     if ('error' in res) {
       this.sessionLog('register-rejected', session, `reason="${logSafe(res.error, 160)}"`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: res.error } });

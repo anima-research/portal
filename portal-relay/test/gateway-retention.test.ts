@@ -1,8 +1,8 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
-import type { ServerFrame } from '@animalabs/portal-protocol';
-import { Gateway, Session } from '../src/gateway.js';
+import type { RegisterData, RegisteredData, ServerFrame } from '@animalabs/portal-protocol';
+import { Gateway, type GatewayHooks, Session } from '../src/gateway.js';
 
 // Exercise retention with a controlled clock rather than minute-long sleeps.
 // The existing gateway suite covers the real WebSocket handshake/replay path.
@@ -10,12 +10,13 @@ interface GatewayInternals {
   sessionPersona: Map<string, unknown>;
   byPersona: Map<string, unknown>;
   onIdentify(s: Session, token: string, personaId: string): Promise<void>;
+  onRegister(s: Session, data: RegisterData): Promise<void>;
   onResume(s: Session, sessionId: string, seq: number): void;
   onDisconnect(s: Session): void;
   reapStale(): void;
 }
 
-function fixture(t: TestContext) {
+function fixture(t: TestContext, enroll?: GatewayHooks['enroll']) {
   let now = 0;
   t.mock.method(Date, 'now', () => now);
   const gw = new Gateway({
@@ -26,6 +27,7 @@ function fixture(t: TestContext) {
       guilds: [], channels: [], seq: gw.seqOf(s.personaId),
     }),
     handleRpc: async () => {},
+    enroll,
   }, 30_000, { resumeRetentionMs: 100, log: () => {} });
   const internals = gw as unknown as GatewayInternals;
   const socket = () => {
@@ -178,6 +180,49 @@ test('an identified socket cannot resume into a second persona or leave stale li
   assert.equal(a.session.personaId, 'p1');
   f.disconnect(a.session);
   assert.deepEqual(f.gw.activePersonas(), ['p2']);
+});
+
+test('late enrollment cannot promote a disconnected socket into an immortal session', async (t) => {
+  let complete!: (data: RegisteredData) => void;
+  const pending = new Promise<RegisteredData>((resolve) => { complete = resolve; });
+  const f = fixture(t, () => pending);
+  const a = f.socket();
+  const registering = f.internals.onRegister(a.session, {
+    protocolVersion: 4, invite: 'invite', desiredName: 'new',
+  });
+  f.disconnect(a.session);
+  complete({ personaId: 'new', token: 'new-token', persona: { id: 'new', displayName: 'New', avatarUrl: '' } });
+  await registering;
+  f.at(1000);
+  f.sweep();
+  assert.equal(a.session.identified, false);
+  assert.deepEqual(a.frames, []);
+  assert.equal(f.internals.sessionPersona.size, 0);
+  assert.deepEqual(f.gw.activePersonas(), []);
+  assert.deepEqual(f.gw.streamPersonas(), []);
+});
+
+test('late enrollment cannot replace a concurrent successful identify', async (t) => {
+  let complete!: (data: RegisteredData) => void;
+  const pending = new Promise<RegisteredData>((resolve) => { complete = resolve; });
+  const f = fixture(t, () => pending);
+  const a = f.socket();
+  const registering = f.internals.onRegister(a.session, {
+    protocolVersion: 4, invite: 'invite', desiredName: 'new',
+  });
+  await f.internals.onIdentify(a.session, 'secret', 'existing');
+  complete({ personaId: 'new', token: 'new-token', persona: { id: 'new', displayName: 'New', avatarUrl: '' } });
+  await registering;
+  assert.equal(a.session.personaId, 'existing');
+  assert.deepEqual(a.frames.map((frame) => frame.op), ['ready']);
+  assert.deepEqual(f.gw.activePersonas(), ['existing']);
+  assert.deepEqual(f.gw.streamPersonas(), ['existing']);
+  assert.equal(f.internals.sessionPersona.size, 1);
+  f.disconnect(a.session);
+  f.at(100);
+  f.sweep();
+  assert.equal(f.internals.sessionPersona.size, 0);
+  assert.deepEqual(f.gw.streamPersonas(), []);
 });
 
 test('resume retention must be finite and nonnegative', () => {
