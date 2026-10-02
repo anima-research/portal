@@ -11,6 +11,8 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Relay } from '../src/relay.js';
+import { Gateway } from '../src/gateway.js';
+import { parseClientFrame } from '@animalabs/portal-protocol';
 import type { AccessRole, RelayConfig } from '../src/config.js';
 
 const GUILD = 'g1';
@@ -180,6 +182,87 @@ for (const code of ['mirror-noguild', 'mirror-emptyguild']) {
     }
   });
 }
+
+for (const [field, value] of [
+  ['desiredName', 42],
+  ['desiredName', false],
+  ['desiredName', null],
+  ['desiredName', {}],
+  ['desiredName', []],
+  ['avatar', 42],
+  ['avatar', null],
+  ['avatar', {}],
+  ['subscriptions', 42],
+  ['subscriptions', null],
+  ['subscriptions', CHAN_A],
+  ['subscriptions', [CHAN_A, 42]],
+] as const) {
+  test(`malformed register ${field}=${JSON.stringify(value)} rejects without restoring a removed mirror role`, async () => {
+    const t = makeRelay();
+    try {
+      const first = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'first' });
+      const [name] = t.relay.permissions.getRoleNames(first.personaId);
+      t.relay.permissions.removeRole(name);
+      assert.deepEqual(t.relay.permissions.getRoleNames(first.personaId), [name]);
+      assert.deepEqual(t.caps(first.personaId, CHAN_A), []);
+      t.relay.invites.mint({
+        code: 'request-validation', guildId: GUILD, maxUses: 1, subscriptions: [CHAN_A],
+        grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } },
+      });
+      const before = t.snapshot();
+
+      // The wire guard deliberately routes without full field validation.
+      // Exercise that parsed frame through Gateway and the real Relay handler.
+      const frame = parseClientFrame(JSON.stringify({
+        op: 'register',
+        d: { protocolVersion: 1, invite: 'request-validation', desiredName: 'next', [field]: value },
+      }));
+      assert.ok(frame);
+      const sent: unknown[] = [];
+      const closed: unknown[] = [];
+      const gateway = new Gateway({
+        authenticate: () => null,
+        enroll: (data) => t.relay.enroll(data),
+        buildReady: async () => { throw new Error('invalid registration reached ready'); },
+        handleRpc: async () => {},
+      }, 30_000);
+      let thrown: unknown;
+      try {
+        await (gateway as any).onFrame({
+          id: 'sess-invalid-register', identified: false, touch: () => {},
+          send: (out: unknown) => sent.push(out),
+          close: (...args: unknown[]) => closed.push(args),
+        }, frame);
+      } catch (error) {
+        thrown = error;
+      }
+
+      assert.deepEqual(t.snapshot(), before, 'a rejected request must not recreate the catalog role or mutate any store');
+      assert.deepEqual(t.caps(first.personaId, CHAN_A), [], 'existing references stay inert');
+      assert.equal(thrown, undefined, 'the claimant receives an error frame rather than a thrown frame-handler error');
+      assert.deepEqual(sent, [{
+        op: 'invalid_session',
+        d: { resumable: false, reason: `registration ${field} must be ${field === 'subscriptions' ? 'an array of strings' : 'a string'}` },
+      }]);
+      assert.deepEqual(closed, [[4003, 'register failed']]);
+    } finally {
+      t.cleanup();
+    }
+  });
+}
+
+test('omitted or blank registration names retain the agent default', async () => {
+  const t = makeRelay();
+  try {
+    for (const desiredName of [undefined, '', '   ']) {
+      const result = await t.relay.enroll({ invite: 'mirror-mint', desiredName });
+      assert.ok(!('error' in result), JSON.stringify(result));
+      assert.equal(result.persona.displayName, 'agent');
+    }
+  } finally {
+    t.cleanup();
+  }
+});
 
 const mismatches: [string, Record<string, unknown>][] = [
   ['guild', { guildId: 'other-guild' }],

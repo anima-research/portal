@@ -619,6 +619,18 @@ export class Relay implements GatewayHooks {
    */
   async enroll(d: RegisterData): Promise<RegisteredData | { error: string }> {
     if (!this.invites) return { error: 'registration disabled' };
+    // Wire guards only check the frame shape. Validate fields used later before
+    // preparing a grant: creating a mirror role can activate existing references.
+    if (d.desiredName !== undefined && typeof d.desiredName !== 'string') {
+      return { error: 'registration desiredName must be a string' };
+    }
+    if (d.avatar !== undefined && typeof d.avatar !== 'string') {
+      return { error: 'registration avatar must be a string' };
+    }
+    if (d.subscriptions !== undefined
+      && (!Array.isArray(d.subscriptions) || d.subscriptions.some((id) => typeof id !== 'string'))) {
+      return { error: 'registration subscriptions must be an array of strings' };
+    }
     const checked = this.invites.check(d.invite, Date.now());
     if (typeof checked === 'string') return { error: `invite ${checked}` };
     // RFC-005 §5.6: an augment-only invite cannot mint a new persona.
