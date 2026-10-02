@@ -1,0 +1,47 @@
+name: Client CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  client:
+    name: Strict install, build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            portal-protocol/package-lock.json
+            portal-client/package-lock.json
+
+      # Build the client's TypeScript project reference first. The client's
+      # protocol dependency still comes from its own committed lockfile.
+      - name: Install, build & test protocol
+        working-directory: portal-protocol
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+      - name: Install, build & test client
+        working-directory: portal-client
+        run: |
+          npm ci
+          npm run build
+          npm test
