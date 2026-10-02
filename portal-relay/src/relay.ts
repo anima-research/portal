@@ -5,6 +5,7 @@
  *   - client RPC → capability-checked Discord actions via the pools
  */
 import { createHash, randomBytes } from 'node:crypto';
+import { ChannelType, PermissionsBitField } from 'discord.js';
 import type {
   AddressReason,
   Capability,
@@ -1190,7 +1191,7 @@ export class Relay implements GatewayHooks {
       }
       case 'create_text_channel': {
         const p = params as RpcParams<'create_text_channel'>;
-        const meta = await this.bot.createTextChannel(p.guildId, p.name, p.categoryId);
+        const meta = await this.createTextChannel(personaId, p);
         return { channel: this.toPortalChannel(meta, personaId) };
       }
       case 'delete_channel': {
@@ -1935,6 +1936,44 @@ export class Relay implements GatewayHooks {
     if (!this.capsFor(personaId, channelId, guildId).includes(cap)) {
       throw rpcError('FORBIDDEN', `missing capability ${cap}`);
     }
+  }
+
+  /** Creation is authorized at its destination: the category, or the guild
+   *  root when no category is supplied. Rights on a sibling channel never
+   *  confer authority to create elsewhere in the guild. */
+  private async createTextChannel(personaId: string, p: RpcParams<'create_text_channel'>): Promise<ChannelMeta> {
+    const { guildId, categoryId, name } = p;
+    if (typeof guildId !== 'string' || !guildId ||
+        (categoryId !== undefined && (typeof categoryId !== 'string' || !categoryId))) {
+      throw rpcError('INVALID_PARAMS', 'guildId and categoryId must be non-empty strings');
+    }
+    if (!this.identity.get(personaId) || !this.bot.isGuildAllowed(guildId)) {
+      throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
+    }
+    if (categoryId !== undefined) {
+      let category = this.bot.channelForPerms(categoryId);
+      if (!category) {
+        // REST can know a category before its gateway event arrives. Fetching
+        // populates discord.js's cache, which the effective-capability check uses.
+        await this.bot.getChannelMeta(categoryId);
+        category = this.bot.channelForPerms(categoryId);
+        // A mirror lookup may predate this newly fetched channel as well.
+        if (category?.guildId === guildId) this.mirror.invalidateGuild(guildId);
+      }
+      if (!category || category.guildId !== guildId || category.type !== ChannelType.GuildCategory) {
+        throw rpcError('FORBIDDEN', 'categoryId must identify a category in the requested guild');
+      }
+      this.requireCap(personaId, categoryId, 'MANAGE_CHANNELS');
+    } else {
+      const allowed = this.permissions.resolveGuild(personaId, guildId);
+      const me = this.bot.meIn(guildId);
+      if (!allowed.has('MANAGE_CHANNELS') || !me?.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+        throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
+      }
+    }
+    // Keep the final check and create invocation in the same continuation.
+    // Awaiting a separate authorization helper here would open a revocation gap.
+    return this.bot.createTextChannel(guildId, name, categoryId);
   }
 
   private displayName(personaId: string): string {
