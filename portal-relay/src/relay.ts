@@ -1191,8 +1191,7 @@ export class Relay implements GatewayHooks {
       }
       case 'create_text_channel': {
         const p = params as RpcParams<'create_text_channel'>;
-        await this.requireCreateTextChannel(personaId, p.guildId, p.categoryId);
-        const meta = await this.bot.createTextChannel(p.guildId, p.name, p.categoryId);
+        const meta = await this.createTextChannel(personaId, p);
         return { channel: this.toPortalChannel(meta, personaId) };
       }
       case 'delete_channel': {
@@ -1942,7 +1941,8 @@ export class Relay implements GatewayHooks {
   /** Creation is authorized at its destination: the category, or the guild
    *  root when no category is supplied. Rights on a sibling channel never
    *  confer authority to create elsewhere in the guild. */
-  private async requireCreateTextChannel(personaId: string, guildId: string, categoryId?: string): Promise<void> {
+  private async createTextChannel(personaId: string, p: RpcParams<'create_text_channel'>): Promise<ChannelMeta> {
+    const { guildId, categoryId, name } = p;
     if (typeof guildId !== 'string' || !guildId ||
         (categoryId !== undefined && (typeof categoryId !== 'string' || !categoryId))) {
       throw rpcError('INVALID_PARAMS', 'guildId and categoryId must be non-empty strings');
@@ -1964,13 +1964,16 @@ export class Relay implements GatewayHooks {
         throw rpcError('FORBIDDEN', 'categoryId must identify a category in the requested guild');
       }
       this.requireCap(personaId, categoryId, 'MANAGE_CHANNELS');
-      return;
+    } else {
+      const allowed = this.permissions.resolveGuild(personaId, guildId);
+      const me = this.bot.meIn(guildId);
+      if (!allowed.has('MANAGE_CHANNELS') || !me?.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+        throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
+      }
     }
-    const allowed = this.permissions.resolveGuild(personaId, guildId);
-    const me = this.bot.meIn(guildId);
-    if (!allowed.has('MANAGE_CHANNELS') || !me?.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
-      throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
-    }
+    // Keep the final check and create invocation in the same continuation.
+    // Awaiting a separate authorization helper here would open a revocation gap.
+    return this.bot.createTextChannel(guildId, name, categoryId);
   }
 
   private displayName(personaId: string): string {

@@ -288,6 +288,41 @@ test('authorization revoked during a category fetch prevents creation', async (t
   }
 });
 
+test('cached/root creation invokes the bot before returning control for a revocation', async (t) => {
+  for (const categoryId of [undefined, CATEGORY]) {
+    const h = makeRelay(t, { personas: { alice: { default: MANAGE } } });
+    const pending = h.rpc({ guildId: GUILD, categoryId });
+    const beforeRevocation = h.calls.length;
+    h.relay.permissions.setPersonaDefault('alice', []);
+    const response = await pending;
+    assert.equal(beforeRevocation, 1, 'the synchronous check and create must stay together');
+    assert.equal(h.calls.length, beforeRevocation, 'no new create may start after revocation');
+    assert.equal(response.ok, true);
+  }
+});
+
+test('final authority check cannot yield before create on any destination path', async (t) => {
+  for (const destination of ['root', 'cached', 'fetched']) {
+    const h = makeRelay(t, { personas: { alice: { default: MANAGE } } });
+    if (destination === 'fetched') h.channels.delete(CATEGORY);
+    const resolver = destination === 'root' ? 'resolveGuild' : 'resolve';
+    const original = h.relay.permissions[resolver].bind(h.relay.permissions);
+    let createsAtRevocation: number | undefined;
+    h.relay.permissions[resolver] = (...args: unknown[]) => {
+      const caps = original(...args);
+      // Run immediately after the stack that computed the final authority.
+      // The bot call must already have been initiated when this executes.
+      if (createsAtRevocation === undefined) queueMicrotask(() => {
+        createsAtRevocation = h.calls.length;
+        h.relay.permissions.setPersonaDefault('alice', []);
+      });
+      return caps;
+    };
+    await h.allowed({ guildId: GUILD, categoryId: destination === 'root' ? undefined : CATEGORY });
+    assert.equal(createsAtRevocation, 1, destination + ': no yield after final authorization');
+  }
+});
+
 test('invalid identity or disallowed guild is rejected before fetching a category', async (t) => {
   const h = makeRelay(t, { default: MANAGE });
   h.channels.delete(CATEGORY);
