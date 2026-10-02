@@ -5,6 +5,7 @@
  *   - client RPC → capability-checked Discord actions via the pools
  */
 import { createHash, randomBytes } from 'node:crypto';
+import { ChannelType, PermissionsBitField } from 'discord.js';
 import type {
   AddressReason,
   Capability,
@@ -1190,6 +1191,7 @@ export class Relay implements GatewayHooks {
       }
       case 'create_text_channel': {
         const p = params as RpcParams<'create_text_channel'>;
+        this.requireCreateTextChannel(personaId, p.guildId, p.categoryId);
         const meta = await this.bot.createTextChannel(p.guildId, p.name, p.categoryId);
         return { channel: this.toPortalChannel(meta, personaId) };
       }
@@ -1934,6 +1936,32 @@ export class Relay implements GatewayHooks {
     const guildId = this.bot.channelForPerms(channelId)?.guildId ?? null;
     if (!this.capsFor(personaId, channelId, guildId).includes(cap)) {
       throw rpcError('FORBIDDEN', `missing capability ${cap}`);
+    }
+  }
+
+  /** Creation is authorized at its destination: the category, or the guild
+   *  root when no category is supplied. Rights on a sibling channel never
+   *  confer authority to create elsewhere in the guild. */
+  private requireCreateTextChannel(personaId: string, guildId: string, categoryId?: string): void {
+    if (typeof guildId !== 'string' || !guildId ||
+        (categoryId !== undefined && (typeof categoryId !== 'string' || !categoryId))) {
+      throw rpcError('INVALID_PARAMS', 'guildId and categoryId must be non-empty strings');
+    }
+    if (!this.identity.get(personaId) || !this.bot.isGuildAllowed(guildId)) {
+      throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
+    }
+    if (categoryId !== undefined) {
+      const category = this.bot.channelForPerms(categoryId);
+      if (!category || category.guildId !== guildId || category.type !== ChannelType.GuildCategory) {
+        throw rpcError('FORBIDDEN', 'categoryId must identify a category in the requested guild');
+      }
+      this.requireCap(personaId, categoryId, 'MANAGE_CHANNELS');
+      return;
+    }
+    const allowed = this.permissions.resolveGuild(personaId, guildId);
+    const me = this.bot.meIn(guildId);
+    if (!allowed.has('MANAGE_CHANNELS') || !me?.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+      throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
     }
   }
 

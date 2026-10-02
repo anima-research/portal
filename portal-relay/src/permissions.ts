@@ -110,6 +110,29 @@ export class PermissionsStore {
   }
 
   /**
+   * Caps for an operation with no existing channel (e.g. creating one at the
+   * guild root). Only unrestricted grants apply: guild-bound all-channel roles
+   * and inline guild/persona defaults. Channel and mirror scopes remain local,
+   * even if they happen to cover every currently cached channel.
+   */
+  resolveGuild(personaId: string, guildId: string): Set<Capability> {
+    const entry = this.personas.get(personaId);
+    if (!entry) return new Set(this.fileDefault);
+    const out = new Set<Capability>();
+    for (const name of entry.roles ?? []) {
+      const role = this.roles.get(name);
+      if (role?.guildId === guildId && 'all' in role.scope && role.scope.all === true) {
+        for (const cap of role.caps) out.add(cap);
+      }
+    }
+    const policy = entry.policy;
+    if (policy) {
+      for (const cap of policy.guilds?.[guildId]?.default ?? policy.default) out.add(cap);
+    }
+    return out;
+  }
+
+  /**
    * Policy-level caps a hypothetical persona holding exactly `roleNames` would
    * have in (guildId, channelId). Backs resolve(), and lets callers attribute
    * WHICH held role contributes access (slash /caps, /remove explanations).
