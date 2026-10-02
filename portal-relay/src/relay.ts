@@ -619,6 +619,17 @@ export class Relay implements GatewayHooks {
    */
   async enroll(d: RegisterData): Promise<RegisteredData | { error: string }> {
     if (!this.invites) return { error: 'registration disabled' };
+    // Wire guards only check the frame shape. Validate fields used later before
+    // preparing a grant: creating a mirror role can activate existing references.
+    if (d.desiredName !== undefined && typeof d.desiredName !== 'string') {
+      return { error: 'registration desiredName must be a string' };
+    }
+    if (d.avatar !== undefined && typeof d.avatar !== 'string') {
+      return { error: 'registration avatar must be a string' };
+    }
+    if (d.subscriptions !== undefined && !isStringArray(d.subscriptions)) {
+      return { error: 'registration subscriptions must be an array of strings' };
+    }
     const checked = this.invites.check(d.invite, Date.now());
     if (typeof checked === 'string') return { error: `invite ${checked}` };
     // RFC-005 §5.6: an augment-only invite cannot mint a new persona.
@@ -628,6 +639,15 @@ export class Relay implements GatewayHooks {
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) return { error: staleMint };
 
+    if (checked.namePrefix !== undefined && typeof checked.namePrefix !== 'string') {
+      return { error: 'invite namePrefix must be a string' };
+    }
+    if (checked.subscriptions !== undefined && !isStringArray(checked.subscriptions)) {
+      return { error: 'invite subscriptions must be an array of strings' };
+    }
+
+    // Derive the full registration result before materialization can create a
+    // catalog role and activate existing references to it.
     const displayName = (d.desiredName || 'agent').slice(0, 80).trim() || 'agent';
     const personaId = this.mintPersonaId(checked.namePrefix ?? displayName);
     const token = generateToken(); // plaintext, returned to the agent
@@ -637,31 +657,37 @@ export class Relay implements GatewayHooks {
       avatar: d.avatar ?? '',
       token: hashToken(token), // stored hashed-at-rest (RFC-005 §5.9)
     };
+    const subscriptions = checked.subscriptions?.length
+      ? [...new Set([...(d.subscriptions ?? []), ...checked.subscriptions])]
+      : d.subscriptions;
+    const persona = this.identity.toPersona(identity);
+    const enrollmentLog = `[portal-relay] enrolled persona "${personaId}" via invite (${checked.label ?? d.invite})`;
+
+    // Reject malformed grants and catalog collisions before persisting or
+    // emitting the identity. Request/template derivations above are complete.
+    const prepared = this.prepareInviteGrant(checked);
+    if ('error' in prepared) return prepared;
+
     this.identity.upsert(identity);
-    this.applyInviteGrant(personaId, checked);
+    if ('roles' in prepared) this.permissions.setPersonaRoles(personaId, prepared.roles);
+    else this.permissions.setPersonaPolicy(personaId, prepared.policy);
     this.invites.consume(d.invite);
 
     // Carry the invite's default subscriptions through to this session.
-    if (checked.subscriptions?.length) {
-      d.subscriptions = [...new Set([...(d.subscriptions ?? []), ...checked.subscriptions])];
-    }
+    if (subscriptions !== undefined) d.subscriptions = subscriptions;
 
-    console.error(`[portal-relay] enrolled persona "${personaId}" via invite (${checked.label ?? d.invite})`);
-    return { personaId, token, persona: this.identity.toPersona(identity) };
+    console.error(enrollmentLog);
+    return { personaId, token, persona };
   }
 
   /**
-   * Translate an invite into the new persona's permissions (RFC-004). Prefers
-   * access roles (live resolution); else an inline scoped grant; else the
-   * deprecated blanket `caps` (honoured as scope:{all} with a warning). A grant
-   * with no scope-able guild, or an invite granting nothing, yields a
-   * default-deny entry.
+   * Prepare the new persona's permissions before creating its identity (RFC-004).
+   * Prefers access roles, then an inline scoped grant, then deprecated blanket
+   * caps. Mirror preparation may create a shared catalog role; malformed or
+   * conflicting mirrors return an error before any store mutation.
    */
-  private applyInviteGrant(personaId: string, inv: InviteTemplate): void {
-    if (inv.roles?.length) {
-      this.permissions.setPersonaRoles(personaId, inv.roles);
-      return;
-    }
+  private prepareInviteGrant(inv: InviteTemplate): { roles: string[] } | { policy: PersonaPolicy } | { error: string } {
+    if (inv.roles?.length) return { roles: inv.roles };
     let grant = inv.grant;
     if (!grant && inv.caps?.length) {
       console.error(
@@ -670,20 +696,12 @@ export class Relay implements GatewayHooks {
       );
       grant = { caps: inv.caps, scope: { all: true } };
     }
-    if (!grant) {
-      this.permissions.setPersonaPolicy(personaId, { default: [] }); // nothing granted → deny
-      return;
-    }
+    if (!grant) return { policy: { default: [] } }; // nothing granted → deny
     if (isMirrorScope(grant.scope)) {
       const role = this.materializeMirrorGrant(inv.guildId, grant.scope, grant.caps);
-      if (!role) {
-        this.permissions.setPersonaPolicy(personaId, { default: [] }); // malformed mirror grant → deny
-        return;
-      }
-      this.permissions.addPersonaRoles(personaId, [role]);
-      return;
+      return typeof role === 'string' ? { roles: [role] } : role;
     }
-    this.permissions.setPersonaPolicy(personaId, this.scopeToPolicy(inv.guildId, grant.scope, grant.caps));
+    return { policy: this.scopeToPolicy(inv.guildId, grant.scope, grant.caps) };
   }
 
   /**
@@ -693,18 +711,16 @@ export class Relay implements GatewayHooks {
    * enrollment stayed invisible to the persona until someone hand-edited its
    * policy. The role name is derived from the grant's content, so identical
    * grants (every use of one invite, or two invites minted alike) share one
-   * catalog entry instead of accreting duplicates. Returns the role name, or
-   * null for a malformed grant (no guild — mirrors are guild-scoped).
+   * catalog entry instead of accreting duplicates. A name match is not enough:
+   * reuse requires the same guild, mirrored roles, caps and mirroring semantics.
+   * Returns the role name or an error, with no store mutation on rejection.
    */
   private materializeMirrorGrant(
     guildId: string | undefined,
     scope: { mirrorRole: string } | { mirrorRoles: string[] },
     caps: Capability[],
-  ): string | null {
-    if (!guildId) {
-      console.error('[portal-relay] mirror grant without guildId — denying (no channels in scope)');
-      return null;
-    }
+  ): string | { error: string } {
+    if (!guildId) return { error: 'invite mirror grant is missing guildId' };
     const roleIds = [...new Set('mirrorRoles' in scope ? scope.mirrorRoles : [scope.mirrorRole])].sort();
     const sortedCaps = [...new Set(caps)].sort();
     const hash = createHash('sha256')
@@ -712,7 +728,25 @@ export class Relay implements GatewayHooks {
       .digest('hex')
       .slice(0, 8);
     const name = `mirror-${hash}`;
-    if (!this.permissions.getRole(name)) {
+    const existing = this.permissions.getRole(name);
+    if (!existing && this.permissions.hasRoleName(name)) {
+      return { error: `invite mirror grant conflicts with quarantined role "${name}"` };
+    }
+    if (existing) {
+      // File-loaded entries can have malformed fields despite their static
+      // type. Treat those as conflicts rather than throwing during comparison.
+      // Static scope fields take precedence over mirror fields in resolution.
+      const matches = existing.guildId === guildId
+        && (existing.mirrorCaps === undefined || existing.mirrorCaps === false)
+        && existing.scope !== null
+        && typeof existing.scope === 'object'
+        && !('all' in existing.scope)
+        && !('channels' in existing.scope)
+        && isMirrorScope(existing.scope)
+        && sameStringSet('mirrorRoles' in existing.scope ? existing.scope.mirrorRoles : [existing.scope.mirrorRole], roleIds)
+        && sameStringSet(existing.caps, sortedCaps);
+      if (!matches) return { error: `invite mirror grant conflicts with existing role "${name}"` };
+    } else {
       this.permissions.setRole(name, {
         caps: sortedCaps,
         scope: roleIds.length === 1 ? { mirrorRole: roleIds[0] } : { mirrorRoles: roleIds },
@@ -888,7 +922,7 @@ export class Relay implements GatewayHooks {
   private recheckMachineMint(inv: InviteTemplate): string | null {
     if (!inv.mintedBy) return null;
     // Re-validate what will actually be APPLIED, not what we expect to be
-    // there: applyInviteGrant short-circuits on roles (and legacy caps) BEFORE
+    // there: prepareInviteGrant short-circuits on roles (and legacy caps) BEFORE
     // it looks at grant, so a hand-edited invite carrying mintedBy + roles
     // would pass a grant-only recheck and then receive roles the subset rule
     // never examined (roles can carry scope:{all}/mirror shapes — exactly
@@ -938,12 +972,10 @@ export class Relay implements GatewayHooks {
     } else {
       const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
       if (grant && isMirrorScope(grant.scope)) {
-        // Same live-role materialization as enroll; a silent snapshot here is
-        // strictly worse because an augmented persona has no reason to suspect
-        // its shiny new scope is already fossilizing. Missing guildId is a
-        // hard reject (augment already throws on malformed invites).
+        // Validate/materialize before changing the persona or consuming a use,
+        // with the same rejection reasons as enrollment.
         const role = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
-        if (!role) throw rpcError('INVALID_PARAMS', 'invite mirror grant is missing guildId');
+        if (typeof role !== 'string') throw rpcError('INVALID_PARAMS', role.error);
         this.permissions.addPersonaRoles(personaId, [role]);
       } else if (grant) {
         const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
@@ -1944,6 +1976,17 @@ export class Relay implements GatewayHooks {
 
 function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirrorRoles: string[] } {
   return 'mirrorRole' in scope || 'mirrorRoles' in scope;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+/** Capabilities and mirrored role ids are sets: order and duplicates are inert. */
+function sameStringSet(a: unknown, b: string[]): boolean {
+  if (!isStringArray(a)) return false;
+  const values = new Set(a);
+  return values.size === new Set(b).size && b.every((value) => values.has(value));
 }
 
 function rpcError(code: string, message: string): Error & { code: string } {

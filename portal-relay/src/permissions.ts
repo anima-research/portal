@@ -207,6 +207,13 @@ export class PermissionsStore {
     return this.roles.get(name);
   }
 
+  /** Whether a catalog name is occupied, including an inert quarantined entry.
+   *  Use this before automatically creating a role so claims cannot overwrite
+   *  quarantined config or activate its existing persona references. */
+  hasRoleName(name: string): boolean {
+    return this.roles.has(name) || Object.hasOwn(this.quarantinedRoles, name);
+  }
+
   /** The full access-role catalog (read-only snapshot) — admin panel pickers. */
   allRoles(): Record<string, AccessRole> {
     return Object.fromEntries([...this.roles].map(([k, v]) => [k, structuredClone(v)]));
