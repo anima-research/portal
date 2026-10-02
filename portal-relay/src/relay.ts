@@ -627,8 +627,7 @@ export class Relay implements GatewayHooks {
     if (d.avatar !== undefined && typeof d.avatar !== 'string') {
       return { error: 'registration avatar must be a string' };
     }
-    if (d.subscriptions !== undefined
-      && (!Array.isArray(d.subscriptions) || d.subscriptions.some((id) => typeof id !== 'string'))) {
+    if (d.subscriptions !== undefined && !isStringArray(d.subscriptions)) {
       return { error: 'registration subscriptions must be an array of strings' };
     }
     const checked = this.invites.check(d.invite, Date.now());
@@ -640,11 +639,15 @@ export class Relay implements GatewayHooks {
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) return { error: staleMint };
 
-    // Resolve mirror grants before minting or emitting an identity: a malformed
-    // grant or catalog collision must leave the claimant and invite untouched.
-    const prepared = this.prepareInviteGrant(checked);
-    if ('error' in prepared) return prepared;
+    if (checked.namePrefix !== undefined && typeof checked.namePrefix !== 'string') {
+      return { error: 'invite namePrefix must be a string' };
+    }
+    if (checked.subscriptions !== undefined && !isStringArray(checked.subscriptions)) {
+      return { error: 'invite subscriptions must be an array of strings' };
+    }
 
+    // Derive the full registration result before materialization can create a
+    // catalog role and activate existing references to it.
     const displayName = (d.desiredName || 'agent').slice(0, 80).trim() || 'agent';
     const personaId = this.mintPersonaId(checked.namePrefix ?? displayName);
     const token = generateToken(); // plaintext, returned to the agent
@@ -654,18 +657,27 @@ export class Relay implements GatewayHooks {
       avatar: d.avatar ?? '',
       token: hashToken(token), // stored hashed-at-rest (RFC-005 §5.9)
     };
+    const subscriptions = checked.subscriptions?.length
+      ? [...new Set([...(d.subscriptions ?? []), ...checked.subscriptions])]
+      : d.subscriptions;
+    const persona = this.identity.toPersona(identity);
+    const enrollmentLog = `[portal-relay] enrolled persona "${personaId}" via invite (${checked.label ?? d.invite})`;
+
+    // Reject malformed grants and catalog collisions before persisting or
+    // emitting the identity. Request/template derivations above are complete.
+    const prepared = this.prepareInviteGrant(checked);
+    if ('error' in prepared) return prepared;
+
     this.identity.upsert(identity);
     if ('roles' in prepared) this.permissions.setPersonaRoles(personaId, prepared.roles);
     else this.permissions.setPersonaPolicy(personaId, prepared.policy);
     this.invites.consume(d.invite);
 
     // Carry the invite's default subscriptions through to this session.
-    if (checked.subscriptions?.length) {
-      d.subscriptions = [...new Set([...(d.subscriptions ?? []), ...checked.subscriptions])];
-    }
+    if (subscriptions !== undefined) d.subscriptions = subscriptions;
 
-    console.error(`[portal-relay] enrolled persona "${personaId}" via invite (${checked.label ?? d.invite})`);
-    return { personaId, token, persona: this.identity.toPersona(identity) };
+    console.error(enrollmentLog);
+    return { personaId, token, persona };
   }
 
   /**
@@ -1966,9 +1978,13 @@ function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirror
   return 'mirrorRole' in scope || 'mirrorRoles' in scope;
 }
 
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
 /** Capabilities and mirrored role ids are sets: order and duplicates are inert. */
 function sameStringSet(a: unknown, b: string[]): boolean {
-  if (!Array.isArray(a) || a.some((value) => typeof value !== 'string')) return false;
+  if (!isStringArray(a)) return false;
   const values = new Set(a);
   return values.size === new Set(b).size && b.every((value) => values.has(value));
 }

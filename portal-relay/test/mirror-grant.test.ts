@@ -183,21 +183,31 @@ for (const code of ['mirror-noguild', 'mirror-emptyguild']) {
   });
 }
 
-for (const [field, value] of [
-  ['desiredName', 42],
-  ['desiredName', false],
-  ['desiredName', null],
-  ['desiredName', {}],
-  ['desiredName', []],
-  ['avatar', 42],
-  ['avatar', null],
-  ['avatar', {}],
-  ['subscriptions', 42],
-  ['subscriptions', null],
-  ['subscriptions', CHAN_A],
-  ['subscriptions', [CHAN_A, 42]],
+for (const [source, field, value] of [
+  ['registration', 'desiredName', 42],
+  ['registration', 'desiredName', false],
+  ['registration', 'desiredName', null],
+  ['registration', 'desiredName', {}],
+  ['registration', 'desiredName', []],
+  ['registration', 'avatar', 42],
+  ['registration', 'avatar', null],
+  ['registration', 'avatar', {}],
+  ['registration', 'subscriptions', 42],
+  ['registration', 'subscriptions', null],
+  ['registration', 'subscriptions', CHAN_A],
+  ['registration', 'subscriptions', [CHAN_A, 42]],
+  ['invite', 'namePrefix', 17],
+  ['invite', 'namePrefix', false],
+  ['invite', 'namePrefix', null],
+  ['invite', 'namePrefix', {}],
+  ['invite', 'namePrefix', []],
+  ['invite', 'subscriptions', 42],
+  ['invite', 'subscriptions', null],
+  ['invite', 'subscriptions', { length: 1 }],
+  ['invite', 'subscriptions', CHAN_A],
+  ['invite', 'subscriptions', [CHAN_A, 42]],
 ] as const) {
-  test(`malformed register ${field}=${JSON.stringify(value)} rejects without restoring a removed mirror role`, async () => {
+  test(`malformed ${source} ${field}=${JSON.stringify(value)} rejects without restoring a removed mirror role`, async () => {
     const t = makeRelay();
     try {
       const first = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'first' });
@@ -208,6 +218,7 @@ for (const [field, value] of [
       t.relay.invites.mint({
         code: 'request-validation', guildId: GUILD, maxUses: 1, subscriptions: [CHAN_A],
         grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } },
+        ...(source === 'invite' ? { [field]: value } : {}),
       });
       const before = t.snapshot();
 
@@ -215,7 +226,10 @@ for (const [field, value] of [
       // Exercise that parsed frame through Gateway and the real Relay handler.
       const frame = parseClientFrame(JSON.stringify({
         op: 'register',
-        d: { protocolVersion: 1, invite: 'request-validation', desiredName: 'next', [field]: value },
+        d: {
+          protocolVersion: 1, invite: 'request-validation', desiredName: 'next',
+          ...(source === 'registration' ? { [field]: value } : {}),
+        },
       }));
       assert.ok(frame);
       const sent: unknown[] = [];
@@ -242,7 +256,7 @@ for (const [field, value] of [
       assert.equal(thrown, undefined, 'the claimant receives an error frame rather than a thrown frame-handler error');
       assert.deepEqual(sent, [{
         op: 'invalid_session',
-        d: { resumable: false, reason: `registration ${field} must be ${field === 'subscriptions' ? 'an array of strings' : 'a string'}` },
+        d: { resumable: false, reason: `${source} ${field} must be ${field === 'subscriptions' ? 'an array of strings' : 'a string'}` },
       }]);
       assert.deepEqual(closed, [[4003, 'register failed']]);
     } finally {
@@ -259,6 +273,30 @@ test('omitted or blank registration names retain the agent default', async () =>
       assert.ok(!('error' in result), JSON.stringify(result));
       assert.equal(result.persona.displayName, 'agent');
     }
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('valid registration preflight preserves name, avatar, and merged subscriptions', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({
+      code: 'preflight-valid', guildId: GUILD, namePrefix: 'worker', subscriptions: [CHAN_A, CHAN_NEW],
+      grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } },
+    });
+    const request = {
+      invite: 'preflight-valid', desiredName: '  Friendly Name  ',
+      avatar: 'https://example.org/avatar.png', subscriptions: [CHAN_A],
+    };
+    const result = await t.relay.enroll(request);
+    assert.ok(!('error' in result), JSON.stringify(result));
+    assert.match(result.personaId, /^worker-/);
+    assert.equal(result.persona.displayName, 'Friendly Name');
+    assert.equal(result.persona.avatarUrl, request.avatar);
+    assert.deepEqual(request.subscriptions, [CHAN_A, CHAN_NEW]);
+    assert.deepEqual(t.caps(result.personaId, CHAN_A), [...RW]);
+    assert.equal(t.relay.invites.get(request.invite).uses, 1);
   } finally {
     t.cleanup();
   }
