@@ -34,7 +34,14 @@ function makeClient() {
     },
   });
   client.connect().catch(() => {}); // opens ws #1
-  return { client, ws: created[0] };
+  const ws = created[0];
+  // RPCs are held until the session is ready, so bring it up first.
+  ws.feed({ op: 'hello', d: { protocolVersion: 3, heartbeatIntervalMs: 30000 } });
+  ws.feed({
+    op: 'ready',
+    d: { sessionId: 's1', seq: 0, persona: { id: 'p', displayName: 'x', avatarUrl: '' }, guilds: [], channels: [], capabilities: {}, subscriptions: [] },
+  });
+  return { client, ws };
 }
 
 test('reaction_add dispatch → typed reactionAdd event', () => {
