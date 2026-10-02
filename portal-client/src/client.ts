@@ -111,6 +111,12 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   private backoff = 1000;
   private closedByUser = false;
   private ready = false;
+  /** RPC frames issued while the session wasn't ready (before the first
+   *  `ready`, or during a reconnect). sendFrame drops anything sent on a
+   *  socket that isn't OPEN, and the relay ignores RPCs before identify, so
+   *  these are held and flushed on `ready`/`resumed`. Each call's own timer
+   *  still bounds how long it waits. */
+  private outbox: Array<{ op: 'rpc'; d: { id: string; method: string; params: unknown } }> = [];
 
   constructor(options: PortalClientOptions) {
     super();
@@ -159,10 +165,15 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     return new Promise<RpcResult<M>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        // A call that timed out while held must not be sent later, nor pile
+        // up across a long outage.
+        this.outbox = this.outbox.filter((f) => f.d.id !== id);
         reject(new Error(`RPC ${method} timed out`));
       }, this.opts.rpcTimeoutMs);
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
-      this.sendFrame({ op: 'rpc', d: { id, method, params } });
+      const frame = { op: 'rpc' as const, d: { id, method, params: params as unknown } };
+      if (this.ready) this.sendFrame(frame);
+      else this.outbox.push(frame);
     });
   }
 
@@ -268,11 +279,13 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         this.sessionId = frame.d.sessionId;
         this.lastSeq = frame.d.seq;
         this.cache.hydrate(frame.d);
+        this.flushOutbox();
         this.emit('ready', frame.d);
         return;
       case 'resumed':
         this.ready = true;
         this.backoff = 1000;
+        this.flushOutbox();
         this.emit('resumed', frame.d.replayedEvents);
         return;
       case 'invalid_session':
@@ -435,6 +448,13 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     }
 
     this.emit('close', { code, willReconnect });
+  }
+
+  /** Send the RPCs held while not ready, in call order. */
+  private flushOutbox(): void {
+    const queued = this.outbox;
+    this.outbox = [];
+    for (const frame of queued) this.sendFrame(frame);
   }
 
   private sendFrame(frame: unknown): void {
