@@ -651,16 +651,16 @@ export class Relay implements GatewayHooks {
   }
 
   /**
-   * Translate an invite into the new persona's permissions (RFC-004). Prefers
-   * access roles (live resolution); else an inline scoped grant; else the
-   * deprecated blanket `caps` (honoured as scope:{all} with a warning). A grant
-   * with no scope-able guild, or an invite granting nothing, yields a
-   * default-deny entry.
+   * Translate an invite into the new persona's permissions (RFC-004): access
+   * roles (live resolution) AND/OR an inline scoped grant — both apply when
+   * both are present, and the persona holds the union (resolve() unions roles
+   * with inline policy). The deprecated blanket `caps` is honoured as
+   * scope:{all} with a warning. A grant with no scope-able guild, or an invite
+   * granting nothing, yields a default-deny entry.
    */
   private applyInviteGrant(personaId: string, inv: InviteTemplate): void {
     if (inv.roles?.length) {
       this.permissions.setPersonaRoles(personaId, inv.roles);
-      return;
     }
     let grant = inv.grant;
     if (!grant && inv.caps?.length) {
@@ -935,21 +935,22 @@ export class Relay implements GatewayHooks {
     if (staleMint) throw rpcError('FORBIDDEN', staleMint);
     if (checked.roles?.length) {
       this.permissions.addPersonaRoles(personaId, checked.roles);
-    } else {
-      const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
-      if (grant && isMirrorScope(grant.scope)) {
-        // Same live-role materialization as enroll; a silent snapshot here is
-        // strictly worse because an augmented persona has no reason to suspect
-        // its shiny new scope is already fossilizing. Missing guildId is a
-        // hard reject (augment already throws on malformed invites).
-        const role = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
-        if (!role) throw rpcError('INVALID_PARAMS', 'invite mirror grant is missing guildId');
-        this.permissions.addPersonaRoles(personaId, [role]);
-      } else if (grant) {
-        const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
-        const base = this.permissions.getPolicy(personaId) ?? { default: [] };
-        this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
-      }
+    }
+    // Roles AND grant: an /invite carries roles plus a direct grant on the
+    // channel it was run in, and an augment must apply both.
+    const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
+    if (grant && isMirrorScope(grant.scope)) {
+      // Same live-role materialization as enroll; a silent snapshot here is
+      // strictly worse because an augmented persona has no reason to suspect
+      // its shiny new scope is already fossilizing. Missing guildId is a
+      // hard reject (augment already throws on malformed invites).
+      const role = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
+      if (!role) throw rpcError('INVALID_PARAMS', 'invite mirror grant is missing guildId');
+      this.permissions.addPersonaRoles(personaId, [role]);
+    } else if (grant) {
+      const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
+      const base = this.permissions.getPolicy(personaId) ?? { default: [] };
+      this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
     }
     this.invites.consume(code);
     return { roles: this.permissions.getRoleNames(personaId) };

@@ -124,12 +124,17 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
   },
   {
     name: 'invite',
-    description: 'Mint a single-use enrollment invite granting access roles',
+    description: 'Mint a single-use enrollment invite granting access roles, plus access to this channel',
     options: [
       { name: 'role', description: 'Access role the new persona will hold', required: true, autocomplete: true },
       { name: 'role2', description: 'Additional access role', autocomplete: true },
       { name: 'role3', description: 'Additional access role', autocomplete: true },
       { name: 'label', description: 'Human label for the invite (who is this for?)' },
+      {
+        name: 'level',
+        description: 'Access to THIS channel regardless of roles: read; write = +send/react/attach (default); full = +manage',
+        choices: ['read', 'write', 'full'],
+      },
     ],
   },
   {
@@ -364,16 +369,25 @@ export class SlashHandler {
       this.audit(inv, 'slash.invite', undefined, false, { roles: names, reason: 'guild-containment' });
       return `Role${uncontained.length === 1 ? '' : 's'} ${uncontained.map((n) => `\`${n}\``).join(', ')} not scoped to this guild — only a portal superadmin can mint invites carrying them.`;
     }
+    // The channel the command was run in is pinned as a direct grant on top of
+    // the roles: "/invite here" should mean the new persona can talk HERE, even
+    // when none of the roles happen to cover this channel. Same containment as
+    // /add — the admin is authorized for this guild, and the grant is scoped to
+    // exactly this channel in it.
+    const level = inv.options.level && LEVEL_CAPS[inv.options.level] ? inv.options.level : 'write';
     const code = this.deps.newInviteCode();
     this.deps.invites.mint({
       code,
       label: inv.options.label ?? `slash-invite by ${inv.invoker.name}`,
       roles: [...new Set(names)],
+      grant: { caps: LEVEL_CAPS[level], scope: { channels: [inv.channelId] } },
+      guildId: inv.guildId,
       maxUses: 1,
     });
-    this.audit(inv, 'slash.invite', code, true, { roles: names, label: inv.options.label });
+    this.audit(inv, 'slash.invite', code, true, { roles: names, label: inv.options.label, channelLevel: level });
     return (
-      `Single-use invite minted (roles: ${names.map((n) => `\`${n}\``).join(', ')}):\n\`${code}\`\n` +
+      `Single-use invite minted (roles: ${names.map((n) => `\`${n}\``).join(', ')}; ` +
+      `plus ${level} access to #${inv.channelName}):\n\`${code}\`\n` +
       `This message is only visible to you — hand the code to the enrolling agent.`
     );
   }
