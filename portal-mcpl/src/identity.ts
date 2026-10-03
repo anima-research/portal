@@ -10,10 +10,14 @@
  * the old one. A failed switch leaves the old session untouched.
  *
  * Authority is deliberately narrow:
- *   - Switching is limited to this instance's ROSTER: the identity it started
- *     as plus identities it minted itself. It is NOT "any creds file in
- *     ~/.portal" — that directory holds other residents' credentials, and a
- *     tool that could load them would be an impersonation primitive.
+ *   - Switching is limited to this instance's ROSTER FILE — in practice the
+ *     identity it started as plus identities it minted itself, because only
+ *     mint writes to it. The roster is the trust root: whoever can edit that
+ *     file can point a record at another resident's creds path (same-user
+ *     file integrity, not a boundary we hold). The tools themselves never
+ *     widen it — there is no "load any creds file in ~/.portal", because that
+ *     directory holds other residents' credentials and a tool that could load
+ *     them would be an impersonation primitive.
  *   - Minting needs an invite (PORTAL_INVITE, or one passed to the tool). The
  *     relay decides what that invite confers; nothing here widens it.
  *   - Tokens never leave this module: tool results carry names and persona ids
@@ -38,6 +42,7 @@ import {
 import type { PortalAgent } from './agent.js';
 import type { PortalFeatureSet } from './feature-sets.js';
 import type { ToolDefinition } from './tools.js';
+import { TOOL_CLASS_META_KEY } from './tool-classes.js';
 
 /** Slug a persona name into a safe filename stem / roster key. */
 export function slugName(name: string): string {
@@ -112,9 +117,16 @@ export const identityFeatureSets: Readonly<Record<string, PortalFeatureSet>> = {
   },
 };
 
+/** RFC-008: identity tools change who this connection IS — a control-plane
+ *  act with no message content in or out — so they are `control`. They live
+ *  outside tool-classes.ts's table because that table is checked against the
+ *  base surface; the class is stamped here instead. */
+const CONTROL = { [TOOL_CLASS_META_KEY]: ['control'] };
+
 export const identityToolDefinitions: ToolDefinition[] = [
   {
     name: 'list_identities',
+    _meta: CONTROL,
     description:
       'List the portal identities (personas) available to you — the one you started as plus any ' +
       'you minted — and which one is active right now.',
@@ -122,6 +134,7 @@ export const identityToolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'mint_identity',
+    _meta: CONTROL,
     description:
       'Create a NEW portal persona with the given display name and add it to your identities. ' +
       'By default you switch to it immediately; pass switch=false to only create it. The new ' +
@@ -141,6 +154,7 @@ export const identityToolDefinitions: ToolDefinition[] = [
   },
   {
     name: 'switch_identity',
+    _meta: CONTROL,
     description:
       'Switch which of your identities you act as. Takes effect immediately and persists across ' +
       'restarts. Everything you send afterwards is attributed to the new persona; channels it ' +
@@ -306,17 +320,22 @@ export class IdentityManager implements IdentityToolHandler {
       throw new Error(`could not connect as "${record.name}": ${(err as Error).message} — still ${this.activeName()}`);
     }
 
-    // Point of no return: the new session is live. Hand it to the server, then
-    // retire the old one (flushes its read-state, closes its socket).
+    // Hand the live session to the server. Only once that succeeds is the
+    // switch real: retire the old session and persist the new one as active.
+    // If the server refuses, the new session is torn down and the old one is
+    // still what serves tool calls — never a half-swapped process with the old
+    // socket gone.
     const previous = this.current;
-    this.current = next;
     try {
       await this.onSwitch(next);
-    } finally {
-      previous.close();
-      this.roster.active = key;
-      this.saveRoster();
+    } catch (err) {
+      next.close();
+      throw new Error(`switch to "${record.name}" failed: ${(err as Error).message} — still ${this.activeName()}`);
     }
+    this.current = next;
+    previous.close();
+    this.roster.active = key;
+    this.saveRoster();
     console.error(`[portal-mcpl] now acting as "${record.name}" (${record.personaId})`);
     return {
       active: record.name,

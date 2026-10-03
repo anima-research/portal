@@ -11,7 +11,7 @@
  */
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { readFile, realpath, stat } from 'node:fs/promises';
-import { isIP } from 'node:net';
+import { BlockList, isIP } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, extname, isAbsolute, resolve, sep } from 'node:path';
 import type { OutgoingFile } from '@animalabs/portal-protocol';
@@ -110,33 +110,65 @@ function decodeBase64Strict(b64: string, label: string): Buffer {
 }
 
 /**
- * Is this address one a fetch from the resident's host must never reach on a
- * model's say-so: loopback, RFC1918 / CGNAT private, link-local (cloud
- * metadata lives there), multicast, unspecified — v4, v6, and v4-mapped v6.
+ * Addresses a fetch from the resident's host must never reach on a model's
+ * say-so: loopback, RFC1918 / CGNAT private, link-local (cloud metadata lives
+ * there), multicast, unspecified — v4 and v6. v4-mapped (`::ffff:0:0/96`) and
+ * NAT64 (`64:ff9b::/96`) forms are checked as the v4 address they carry: the
+ * URL parser serialises `[::ffff:127.0.0.1]` as `[::ffff:7f00:1]`, so a
+ * dotted-quad regex never sees them (the first version of this guard didn't).
  */
-export function isPrivateAddress(addr: string): boolean {
-  const v4 = (a: string): boolean => {
-    const o = a.split('.').map(Number);
-    if (o.length !== 4 || o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
-    return (
-      o[0] === 0 || o[0] === 10 || o[0] === 127 ||
-      (o[0] === 100 && o[1] >= 64 && o[1] <= 127) ||
-      (o[0] === 169 && o[1] === 254) ||
-      (o[0] === 172 && o[1] >= 16 && o[1] <= 31) ||
-      (o[0] === 192 && o[1] === 168) ||
-      o[0] >= 224
-    );
-  };
-  const kind = isIP(addr);
-  if (kind === 4) return v4(addr);
-  if (kind !== 6) return true; // not an address at all → refuse
-  const a = addr.toLowerCase();
-  const mapped = a.match(/^(?:0*:)*ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped) return v4(mapped[1]);
-  if (a === '::' || a === '::1') return true;
-  const first = parseInt(a.split(':')[0] || '0', 16);
-  return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || (first & 0xff00) === 0xff00;
+const PRIVATE = new BlockList();
+for (const [net, bits] of [
+  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.168.0.0', 16], ['224.0.0.0', 3],
+] as const) PRIVATE.addSubnet(net, bits, 'ipv4');
+for (const [net, bits] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]] as const) {
+  PRIVATE.addSubnet(net, bits, 'ipv6');
 }
+
+/** The v4 address a v4-mapped or NAT64 v6 address carries, else undefined. */
+function embeddedV4(v6: string): string | undefined {
+  const groups = expandV6(v6);
+  if (!groups) return undefined;
+  const prefix = groups.slice(0, 6).join(':');
+  if (prefix !== '0:0:0:0:0:ffff' && prefix !== '64:ff9b:0:0:0:0') return undefined;
+  const hi = parseInt(groups[6], 16);
+  const lo = parseInt(groups[7], 16);
+  return `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+}
+
+/** Eight hex groups (no leading zeros) for any textual IPv6 form, else null. */
+function expandV6(addr: string): string[] | null {
+  let a = addr.toLowerCase().replace(/^\[|\]$/g, '').replace(/%.*$/, '');
+  const dotted = a.match(/^(.*:)(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (dotted) {
+    const [, head, o1, o2, o3, o4] = dotted;
+    a = `${head}${((+o1 << 8) | +o2).toString(16)}:${((+o3 << 8) | +o4).toString(16)}`;
+  }
+  const halves = a.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = halves.length === 2 ? 8 - left.length - right.length : 0;
+  if (fill < 0 || left.length + right.length + fill !== 8) return null;
+  const groups = [...left, ...Array(fill).fill('0'), ...right];
+  if (groups.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+  return groups.map((g) => parseInt(g, 16).toString(16));
+}
+
+export function isPrivateAddress(addr: string): boolean {
+  const kind = isIP(addr);
+  if (kind === 4) return PRIVATE.check(addr, 'ipv4');
+  if (kind !== 6) return true; // not an address at all → refuse
+  const inner = embeddedV4(addr);
+  if (inner) return PRIVATE.check(inner, 'ipv4');
+  return PRIVATE.check(addr, 'ipv6');
+}
+
+/** Files that are never attachable, whatever the roots: other residents' (and
+ *  this one's) portal credentials and identity rosters. A hard floor —
+ *  identity.ts refuses to load these on a model's say-so for the same reason. */
+const NEVER_ATTACH = [/\.creds\.json$/i, /\.identities\.json$/i, /\.state\.json$/i];
 
 /** Refuse a URL whose host is, or resolves to, a private address. Checked at
  *  every redirect hop. (DNS is looked up here and again inside fetch, so a
@@ -260,26 +292,27 @@ export async function resolveOutgoingFiles(
     if (spec.path != null) {
       const raw = expandHome(spec.path);
       const abs = isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw);
-      let st;
-      try {
-        st = await stat(abs);
-      } catch {
-        throw new Error(`files[${i}]: no such file: ${abs}`);
-      }
+      // Resolve what the OS will actually open (a symlink inside a root pointing
+      // outside it must not pass), then fence, then stat — in that order, so a
+      // path outside the roots learns nothing about whether it exists.
+      const real = await realpath(abs).catch(() => undefined);
       if (opts.allowedRoots?.length) {
-        // Fence the file the OS will actually open, not the name it was asked
-        // by: a symlink inside a root pointing outside it must not pass.
-        const [real, roots] = await Promise.all([
-          realpath(abs),
-          Promise.all(opts.allowedRoots.map((r) => realpath(expandHome(r)).catch(() => resolve(expandHome(r))))),
-        ]);
-        if (!roots.some((r) => insideRoot(real, r))) {
-          throw new Error(`files[${i}]: path is outside the allowed roots: ${abs}${real !== abs ? ` (→ ${real})` : ''}`);
+        const roots = await Promise.all(
+          opts.allowedRoots.map((r) => realpath(expandHome(r)).catch(() => resolve(expandHome(r)))),
+        );
+        const target = real ?? abs;
+        if (!roots.some((r) => insideRoot(target, r))) {
+          throw new Error(`files[${i}]: path is outside the allowed roots: ${abs}${real && real !== abs ? ` (→ ${real})` : ''}`);
         }
       }
+      if (real === undefined) throw new Error(`files[${i}]: no such file: ${abs}`);
+      if (NEVER_ATTACH.some((re) => re.test(basename(real)) || re.test(basename(abs)))) {
+        throw new Error(`files[${i}]: refusing to attach a credentials/identity file: ${abs}`);
+      }
+      const st = await stat(real);
       if (!st.isFile()) throw new Error(`files[${i}]: not a regular file: ${abs}`);
       account(st.size, `files[${i}] (${abs})`);
-      const data = await readFile(abs);
+      const data = await readFile(real);
       const name = spec.name || basename(abs);
       out.push({
         name,

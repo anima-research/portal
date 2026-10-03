@@ -34,7 +34,7 @@ function fakeSession(creds: PortalCredentials, connect: () => Promise<unknown>):
   return session;
 }
 
-function harness(opts: { connect?: (creds: PortalCredentials) => Promise<unknown>; invite?: string; max?: number } = {}) {
+function harness(opts: { connect?: (creds: PortalCredentials) => Promise<unknown>; invite?: string; max?: number; onSwitch?: (next: PortalSession) => Promise<void> } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'portal-identity-'));
   const sessions: FakeSession[] = [];
   const swaps: string[] = [];
@@ -57,7 +57,7 @@ function harness(opts: { connect?: (creds: PortalCredentials) => Promise<unknown
     });
   const manager = make();
   const rootSession = fakeSession(ROOT, () => Promise.resolve({}));
-  manager.bind(rootSession, async (next) => void swaps.push(next.creds.personaId));
+  manager.bind(rootSession, async (next) => { if (opts.onSwitch) await opts.onSwitch(next); swaps.push(next.creds.personaId); });
   return { dir, manager, make, sessions, swaps, rootSession };
 }
 
@@ -100,6 +100,21 @@ test('a failed connect leaves the old identity live and closes the attempt', asy
   assert.equal(h.rootSession.closed, false);
   assert.equal(h.sessions.at(-1)!.closed, true, 'the abandoned session must stop reconnecting');
   assert.equal(h.manager.session, h.rootSession);
+});
+
+test('the server refusing the swap leaves the old session live and the roster unchanged', async () => {
+  let refuse = false;
+  const h = harness({ invite: 'inv', onSwitch: async () => { if (refuse) throw new Error('host said no'); } });
+  await h.manager.handleToolCall('mint_identity', { name: 'Alt', switch: false });
+  refuse = true;
+  await assert.rejects(h.manager.handleToolCall('switch_identity', { name: 'alt' }), /switch to "Alt" failed: host said no — still Root/);
+  assert.equal(h.manager.session, h.rootSession, 'still serving the old session');
+  assert.equal(h.rootSession.closed, false, 'old socket still open');
+  assert.equal(h.sessions.at(-1)!.closed, true, 'the refused session was torn down');
+  assert.equal(h.make().startupCreds().personaId, 'p_root', 'roster still names root as active');
+  refuse = false;
+  await h.manager.handleToolCall('switch_identity', { name: 'alt' });
+  assert.equal(h.make().startupCreds().personaId, 'p_1');
 });
 
 test('no invite → mint fails cleanly; limit is enforced', async () => {

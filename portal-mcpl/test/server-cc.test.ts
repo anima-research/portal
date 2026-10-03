@@ -141,3 +141,93 @@ test('ambient messages never wake; a second mention does not re-fold what was se
   assert.equal(h.wakes.length, 2);
   assert.doesNotMatch(h.wakes[1].content, /mb[238]/);
 });
+
+
+// ── Backlog larger than a wake: oldest first, watermark only as far as delivered ──
+
+const S = (n: number) => `2026-09-21T11:${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}.000Z`;
+
+/** Relay double with a long B backlog and a history endpoint that pages like the
+ *  real one: newest first, `limit` per call, `before` exclusive, `after` a stop. */
+function bigHarness(opts: { missed: number; cap: number; watermark?: string }) {
+  process.env.PORTAL_CONTEXT_CAP = String(opts.cap);
+  try {
+    const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
+    client.cache.hydrate({
+      sessionId: 's', persona: { id: 'p', displayName: 'P', avatarUrl: '' },
+      guilds: [{ id: 'g1', name: 'G' }], channels: [chan(A, 'alpha'), chan(B, 'beta')], seq: 0,
+    });
+    const since = opts.watermark ?? S(0);
+    // b1..bN all above the watermark, one second apart, plus one older message under it.
+    const bHistory = [msg('b0', B, S(0)), ...Array.from({ length: opts.missed }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)))];
+    const fetches: Array<{ limit?: number; before?: string; after?: string }> = [];
+    const marked: Array<{ channelId: string; uptoCreatedAt?: string }> = [];
+    Object.assign(client, {
+      async fetchHistory(p: { channelId: string; limit?: number; before?: string; after?: string }) {
+        fetches.push({ limit: p.limit, before: p.before, after: p.after });
+        const hist = p.channelId === B ? bHistory : [msg('a1', A, S(1))];
+        let newestFirst = [...hist].reverse();
+        if (p.before) {
+          const idx = newestFirst.findIndex((m) => m.id === p.before);
+          newestFirst = idx >= 0 ? newestFirst.slice(idx + 1) : [];
+        }
+        return { messages: newestFirst.slice(0, p.limit ?? 50) };
+      },
+      async call(method: string, params: Record<string, unknown>) {
+        switch (method) {
+          case 'list_unread': return { channels: [{ channelId: B, count: opts.missed, lastAt: S(opts.missed) }] };
+          case 'channel_missed': return { channelId: B, messages: opts.missed, characters: 0, since, lastAt: S(opts.missed) };
+          case 'mark_read': marked.push(params as never); return {};
+          case 'get_pending_pings': return { pings: [] };
+          default: throw new Error(`unexpected rpc ${method}`);
+        }
+      },
+    });
+    const state = new AgentState();
+    state.subscribe(A); state.subscribe(B);
+    const server = new PortalCcChannelServer(client, new PortalAgent(client, { state }));
+    const wakes: Array<{ content: string }> = [];
+    const internal = server as unknown as { conn: unknown; wireClient(): void; wakeChain: Promise<void> };
+    internal.conn = { sendNotification: (_m: string, p: { content: string }) => void wakes.push(p) };
+    internal.wireClient();
+    const settle = async () => { await internal.wakeChain; await new Promise((r) => setImmediate(r)); };
+    return { client, wakes, marked, fetches, settle, state };
+  } finally {
+    delete process.env.PORTAL_CONTEXT_CAP;
+  }
+}
+
+test('200 missed, cap 50: the OLDEST are delivered, the watermark advances only to the last shown, the rest fold next time', async () => {
+  const h = bigHarness({ missed: 200, cap: 50 });
+  h.client.emit('message', { message: msg('a9', A, S(500), '@P ping'), addressedToMe: true, reasons: ['role_mention'] });
+  await h.settle();
+  assert.equal(h.wakes.length, 1);
+  const c = h.wakes[0].content;
+  const shown = [...c.matchAll(/Bob: mb(\d+)/g)].map((m) => Number(m[1]));
+  // cap 50, minus the trigger and A's one-message backfill = 48 of B, oldest first.
+  assert.deepEqual(shown, Array.from({ length: 48 }, (_, i) => i + 1), 'oldest first, a prefix of the unseen');
+  assert.doesNotMatch(c, /mb0\b/, 'under the watermark: not shown');
+  assert.match(c, /\[152 more unread message\(s\) in #beta will fold into your next wake\]/);
+  assert.deepEqual(h.marked, [{ channelId: B, uptoCreatedAt: S(48) }], 'watermark = last message shown, not the relay lastAt');
+  // Paged back to the watermark with cursors, not one uncursored newest-N call.
+  const bFetches = h.fetches.filter((f) => f.after !== undefined);
+  assert.ok(bFetches.length >= 2 && bFetches[1].before !== undefined, `paged with before (${JSON.stringify(bFetches)})`);
+
+  // Next wake: the local watermark is now S(50); the next oldest fold in.
+  h.client.emit('message', { message: msg('a10', A, S(501), '@P again'), addressedToMe: true, reasons: ['role_mention'] });
+  await h.settle();
+  const shown2 = [...h.wakes[1].content.matchAll(/Bob: mb(\d+)/g)].map((m) => Number(m[1]));
+  assert.equal(shown2[0], 49, 'continues exactly where the watermark left off — nothing skipped');
+  assert.equal(shown2.length, 49);
+  assert.equal(h.marked[1].uptoCreatedAt, S(97));
+});
+
+test('more missed than the fold bound: a note, no paging, no watermark move', async () => {
+  const h = bigHarness({ missed: 600, cap: 50 });
+  h.client.emit('message', { message: msg('a9', A, S(900), '@P ping'), addressedToMe: true, reasons: ['role_mention'] });
+  await h.settle();
+  assert.match(h.wakes[0].content, /\[600 message\(s\) missed in #beta — more than a wake folds; use channel_missed/);
+  assert.doesNotMatch(h.wakes[0].content, /Bob: mb\d/);
+  assert.deepEqual(h.marked, []);
+  assert.equal(h.fetches.filter((f) => f.after !== undefined).length, 0, 'no history paged for that channel');
+});

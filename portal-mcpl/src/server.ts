@@ -133,9 +133,19 @@ export class PortalMcplServer {
    *  ambient traffic folds into the open conversation; closed channels use
    *  push/event (which the host's wake gate evaluates). Mirrors discord-mcpl. */
   private openChannels = new Set<string>();
-  /** Ping message ids already surfaced as a wake (live or catch-up), so a
-   *  reconnect doesn't re-wake for the same offline-accrued pings. */
-  private wokenPings = new Set<string>();
+  /** Per persona: ping message ids already surfaced as a wake (live or
+   *  catch-up), so a reconnect doesn't re-wake for the same offline-accrued
+   *  pings. Keyed by persona because the host's context does not change on an
+   *  identity switch — A→B→A must not re-deliver A's pings. */
+  private wokenByPersona = new Map<string, Set<string>>();
+  private get wokenPings(): Set<string> {
+    let set = this.wokenByPersona.get(this.client.personaId);
+    if (!set) this.wokenByPersona.set(this.client.personaId, (set = new Set()));
+    return set;
+  }
+  /** Bumped by every identity swap; async work that read state from one
+   *  persona must not push it on behalf of the next. */
+  private swapEpoch = 0;
   private eventSeq = 0;
   /**
    * The connection's effective capability grant and derived feature sets
@@ -753,8 +763,12 @@ export class PortalMcplServer {
    *     subscriptions under the new identity wherever that identity can see the
    *     channel, and dropped where it cannot.
    *   - `advertised` is reconciled against the new view (see below).
-   *   - `wokenPings` is per-persona and resets, so pings the new identity
-   *     accrued while inactive surface as one catch-up.
+   *   - Woken-ping sets are per persona, so pings the new identity accrued
+   *     while inactive surface as one catch-up, and switching back does not
+   *     re-deliver.
+   *   - `swapEpoch` moves, so a catch-up that read the OLD persona's pending
+   *     pings before the swap drops them instead of pushing them as the new
+   *     persona's (one relay round trip wide).
    */
   async swapSession(client: PortalClient, agent: PortalAgent): Promise<void> {
     // Let any registration finish against the OLD view first: its ack stamps
@@ -763,9 +777,9 @@ export class PortalMcplServer {
     // is no await between the loop exiting and the swap, so nothing interleaves.)
     while (this.registrationInFlight) await this.registrationInFlight.catch(() => {});
 
+    this.swapEpoch++;
     this.client = client;
     this.agent = agent;
-    this.wokenPings.clear();
     this.pendingRemovals.clear(); // observations about the old identity's view
     this.wireClient(); // detaches the outgoing client's listeners first
 
@@ -951,6 +965,7 @@ export class PortalMcplServer {
   private async catchUp(): Promise<void> {
     if (!this.conn || !this.canPush()) return;
     const conn = this.conn;
+    const epoch = this.swapEpoch;
     let pings: PendingPing[];
     try {
       pings = await this.agent.pendingPingsFromRelay();
@@ -959,8 +974,9 @@ export class PortalMcplServer {
     }
     // Re-check after the await: `pendingPingsFromRelay()` is a round trip, and a
     // reduction landing inside it MUST be respected immediately (§6.7). The
-    // watermark below is consumed, so this has to happen before it moves.
-    if (this.conn !== conn || !this.canPush()) return;
+    // watermark below is consumed, so this has to happen before it moves. An
+    // identity swap inside the round trip means these are the OLD persona's.
+    if (this.conn !== conn || !this.canPush() || this.swapEpoch !== epoch) return;
     const fresh = pings.filter((p) => !this.wokenPings.has(p.message.id));
     if (fresh.length === 0) return;
     for (const p of fresh) this.wokenPings.add(p.message.id);

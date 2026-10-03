@@ -36,9 +36,16 @@ export class PortalCcChannelServer {
   private conn: McplConnection | null = null;
   /** Channels we've already backfilled history for (first-contact context). */
   private seeded = new Set<string>();
-  /** Ping message ids we've already surfaced as a wake (live or catch-up), so a
-   *  reconnect doesn't re-wake for the same offline-accrued pings. */
-  private wokenPings = new Set<string>();
+  /** Per persona: ping message ids already surfaced as a wake (live or
+   *  catch-up), so a reconnect doesn't re-wake for the same offline-accrued
+   *  pings. Keyed by persona because the session's context does not change on
+   *  an identity switch — A→B→A must not re-deliver A's pings. */
+  private wokenByPersona = new Map<string, Set<string>>();
+  private get wokenPings(): Set<string> {
+    let set = this.wokenByPersona.get(this.client.personaId);
+    if (!set) this.wokenByPersona.set(this.client.personaId, (set = new Set()));
+    return set;
+  }
   /** Max messages to prepend per wake; older are truncated (scroll back via
    *  fetch_history). Configurable via PORTAL_CONTEXT_CAP (default 80). */
   private readonly contextCap = Math.max(1, Number(process.env.PORTAL_CONTEXT_CAP ?? '80') || 80);
@@ -188,15 +195,21 @@ export class PortalCcChannelServer {
    * silently going deaf to the rooms it was in would be a surprise. They are
    * added to the new identity's durable subscriptions wherever it can see the
    * channel. `seeded` is kept for the same reason — it records what is already
-   * in this session's context, which the switch did not change. `wokenPings`
-   * is per-persona and resets, so pings the new identity accrued while inactive
-   * arrive as one catch-up.
+   * in this session's context, which the switch did not change. Woken-ping
+   * sets are per persona, so pings the new identity accrued while inactive
+   * arrive as one catch-up, and switching back does not re-deliver.
+   *
+   * Runs on the wake chain: a wake queued before the swap completes against
+   * the client and agent it was queued for, never against the next persona's.
    */
-  async swapSession(client: PortalClient, agent: PortalAgent): Promise<void> {
+  swapSession(client: PortalClient, agent: PortalAgent): Promise<void> {
+    return this.serialized(async () => this.swapNow(client, agent));
+  }
+
+  private swapNow(client: PortalClient, agent: PortalAgent): void {
     const following = this.agent.state.subscriptionList();
     this.client = client;
     this.agent = agent;
-    this.wokenPings.clear();
     this.wireClient(); // detaches the outgoing client's listeners first
 
     const visible = new Set(client.cache.allChannels().map((channel) => channel.id));
@@ -228,9 +241,12 @@ export class PortalCcChannelServer {
       const pingIds = new Set(fresh.map((p) => p.message.id));
       const pingChannels = new Set(fresh.map((p) => p.message.channelId));
       const missed = await this.collectMissed();
-      const { messages: all, omitted } = this.capped(
-        dedupeById([...fresh.map((p) => p.message), ...missed.flatMap((m) => m.messages)]),
-      );
+      // Pings first (newest win if even they overflow), then folded backlog
+      // in whatever room is left — trimmed at its NEWEST end, so what a
+      // channel shows is always a prefix of its unseen and its watermark can
+      // follow safely.
+      const { messages: base, omitted } = this.capped(dedupeById(fresh.map((p) => p.message)));
+      const all = [...base, ...foldWithin(missed, this.contextCap - base.length)].sort(byCreatedAt);
 
       const lines = [`[catch-up] ${fresh.length} message(s) addressed to you while you were away` +
         (missed.length ? `, plus what you missed in ${missed.length} followed channel(s):` : ':')];
@@ -238,6 +254,7 @@ export class PortalCcChannelServer {
         const why = fresh.find((f) => f.message.id === p.id)?.reasons ?? [];
         return why.length ? ` (${why.join(',')})` : '';
       }));
+      lines.push(...this.remainingNotes(missed, all));
       lines.push('\n[use fetch_history / fetch_around to read surrounding context, then mark_read]');
 
       const latest = fresh[fresh.length - 1].message;
@@ -253,26 +270,33 @@ export class PortalCcChannelServer {
         console.error(`[portal-cc] CATCH-UP wake: ${fresh.length} missed ping(s), ${missed.length} channel(s) of ambient`);
       }
       this.deliverWake(lines.join('\n'), meta, [...pingIds], () =>
-        this.settleFolded(missed, pingChannels),
+        this.settleFolded(missed, pingChannels, all),
       );
     });
   }
 
   /**
    * What the relay says this persona missed in the channels it FOLLOWS, with
-   * bodies. The relay's read-state is server-authoritative and survives
-   * everything this process does not: a restart (every new Claude Code session
-   * is a fresh cc-cli with an empty in-memory backlog), a non-resumable
-   * reconnect, an identity switch. Before this, all of that ambient traffic
-   * silently vanished — a catch-up wake carried only the pings.
+   * bodies, OLDEST FIRST. The relay's read-state is server-authoritative and
+   * survives everything this process does not: a restart (every new Claude
+   * Code session is a fresh cc-cli with an empty in-memory backlog), a
+   * non-resumable reconnect, an identity switch. Before this, all of that
+   * ambient traffic silently vanished — a catch-up wake carried only the pings.
    *
-   * The relay keeps tallies, not bodies (Discord is the durable store), so each
-   * followed channel with unread is re-read via fetch_history and cut at the
-   * watermark. Restricted to followed channels on purpose: the relay tallies
-   * every channel the persona can VIEW, which for a guild-wide role is the
-   * whole guild. Best-effort per channel (no READ_HISTORY ⇒ skipped).
+   * The relay keeps tallies, not bodies (Discord is the durable store), and
+   * its fetch_history pages newest-first (`after` is only a stop), so each
+   * followed channel with unread is paged back to its watermark and the
+   * oldest unseen messages come first: what a wake can't fit stays unread for
+   * the next one rather than being skipped. A channel with more missed than
+   * FOLD_BOUND is not paged at all — it gets a note and keeps its watermark —
+   * because folding the newest slice and advancing past the rest is exactly
+   * the loss this exists to prevent.
+   *
+   * Restricted to followed channels on purpose: the relay tallies every
+   * channel the persona can VIEW, which for a guild-wide role is the whole
+   * guild. Best-effort per channel (no READ_HISTORY ⇒ skipped).
    */
-  private async collectMissed(): Promise<Array<{ channelId: string; messages: PortalMessage[]; upto: string }>> {
+  private async collectMissed(): Promise<FoldedChannel[]> {
     const followed = new Set(this.agent.state.subscriptionList());
     if (followed.size === 0) return [];
     let unread: ChannelUnread[];
@@ -281,26 +305,50 @@ export class PortalCcChannelServer {
     } catch {
       return [];
     }
-    const out: Array<{ channelId: string; messages: PortalMessage[]; upto: string }> = [];
+    const out: FoldedChannel[] = [];
     for (const u of unread) {
       if (!followed.has(u.channelId) || u.count <= 0) continue;
       try {
         const missed = await this.client.call('channel_missed', { channelId: u.channelId });
         const upto = missed.lastAt ?? u.lastAt;
         if (!upto) continue;
-        // The tally skips this persona's own posts; history does not — so ask
-        // for a little more than the count and cut at the watermark.
-        const limit = Math.min(this.contextCap, u.count + 10);
-        const { messages } = await this.client.fetchHistory({ channelId: u.channelId, limit });
         // Cut at whichever watermark is further along: the relay's, or the
         // local one — settleFolded advances the relay's asynchronously, so a
         // wake landing right behind another must not re-fold the same backlog.
         const local = this.agent.state.watermark(u.channelId);
         const since = [missed.since, local].filter((w): w is string => !!w).sort().pop();
-        const fresh = messages
-          .filter((m) => (!since || m.createdAt > since) && m.createdAt <= upto)
-          .sort(byCreatedAt);
-        if (fresh.length) out.push({ channelId: u.channelId, messages: fresh, upto });
+        if (missed.messages > FOLD_BOUND) {
+          out.push({ channelId: u.channelId, messages: [], tooMany: missed.messages });
+          continue;
+        }
+        // Page back from the newest until the page reaches the watermark (the
+        // relay's `after` stops the page there too), bounded by FOLD_BOUND.
+        const fresh: PortalMessage[] = [];
+        let before: string | undefined;
+        let reachedWatermark = !since;
+        while (fresh.length < FOLD_BOUND) {
+          const { messages } = await this.client.fetchHistory({
+            channelId: u.channelId,
+            limit: FOLD_PAGE,
+            ...(before ? { before } : {}),
+            ...(since ? { after: sinceCursor(since) } : {}),
+          });
+          if (messages.length === 0) { reachedWatermark = true; break; }
+          const page = [...messages].sort(byCreatedAt);
+          fresh.unshift(...page.filter((m) => (!since || m.createdAt > since) && m.createdAt <= upto));
+          if (since && page[0].createdAt <= since) { reachedWatermark = true; break; }
+          if (messages.length < FOLD_PAGE) { reachedWatermark = true; break; }
+          before = page[0].id;
+        }
+        if (!reachedWatermark) {
+          // The bound was hit before the watermark: the oldest fetched is not
+          // the oldest unseen, so folding would skip what lies beneath. Note it
+          // and leave the watermark where it is.
+          out.push({ channelId: u.channelId, messages: [], tooMany: missed.messages });
+          continue;
+        }
+        const ordered = dedupeById(fresh).sort(byCreatedAt);
+        if (ordered.length) out.push({ channelId: u.channelId, messages: ordered, remaining: 0 });
       } catch (err) {
         if (process.env.PORTAL_DEBUG) {
           console.error(`[portal-cc] could not fold missed traffic for ${u.channelId}:`, (err as Error).message);
@@ -308,6 +356,21 @@ export class PortalCcChannelServer {
       }
     }
     return out;
+  }
+
+  /** Lines telling the agent what a wake could not carry, per channel. */
+  private remainingNotes(folded: FoldedChannel[], delivered: PortalMessage[]): string[] {
+    const notes: string[] = [];
+    for (const f of folded) {
+      const label = this.channelLabel(f.channelId);
+      if (f.tooMany !== undefined) {
+        notes.push(`[${f.tooMany} message(s) missed in ${label} — more than a wake folds; use channel_missed / fetch_history there, then mark_read]`);
+        continue;
+      }
+      const left = f.remaining ?? 0;
+      if (left > 0) notes.push(`[${left} more unread message(s) in ${label} will fold into your next wake]`);
+    }
+    return notes;
   }
 
   /**
@@ -318,14 +381,16 @@ export class PortalCcChannelServer {
    * with mark_read once it has actually handled the ping, so a turn that dies
    * mid-way keeps the ping pending on the relay.
    */
-  private settleFolded(
-    folded: Array<{ channelId: string; upto: string }>,
-    keep: Set<string>,
-  ): void {
+  private settleFolded(folded: FoldedChannel[], keep: Set<string>, delivered: PortalMessage[]): void {
     for (const f of folded) {
-      if (keep.has(f.channelId)) continue;
-      this.agent.state.markRead(f.channelId, f.upto);
-      void this.client.call('mark_read', { channelId: f.channelId, uptoCreatedAt: f.upto }).catch((err) =>
+      if (keep.has(f.channelId) || f.tooMany !== undefined) continue;
+      // Only as far as what the wake actually carried — never the relay's
+      // `lastAt`, which may be past messages the cap trimmed off.
+      const shown = delivered.filter((m) => m.channelId === f.channelId);
+      if (shown.length === 0) continue;
+      const upto = shown[shown.length - 1].createdAt;
+      this.agent.state.markRead(f.channelId, upto);
+      void this.client.call('mark_read', { channelId: f.channelId, uptoCreatedAt: upto }).catch((err) =>
         console.error(`[portal-cc] mark_read after fold failed for ${f.channelId}:`, (err as Error).message),
       );
     }
@@ -413,9 +478,13 @@ export class PortalCcChannelServer {
     // Combine missed + other channels' unread + this channel's context,
     // time-ordered, capped.
     const others = drained.filter((m) => m.channelId !== channelId);
-    const { messages: all, omitted } = this.capped(
-      dedupeById([...missed.flatMap((m) => m.messages), ...others, ...triggerCtx, message]),
-    );
+    // Live context (other channels' unseen, this channel's backfill, the
+    // trigger) is capped newest-wins; the relay backlog then fills what is
+    // left, trimmed at its NEWEST end so each folded channel shows a prefix of
+    // its unseen and its watermark can follow safely (see foldWithin).
+    const { messages: base, omitted } = this.capped(dedupeById([...others, ...triggerCtx, message]));
+    const all = [...base, ...foldWithin(missed, this.contextCap - base.length)].sort(byCreatedAt);
+    const notes = this.remainingNotes(missed, all);
 
     const meta: Record<string, string> = {
       source: 'discord',
@@ -434,9 +503,8 @@ export class PortalCcChannelServer {
           `(relay backlog ${missed.length} ch + live backlog + trigger)`,
       );
     }
-    this.deliverWake(this.buildContent(all, new Set([message.id]), omitted), meta, [message.id], () =>
-      this.settleFolded(missed, new Set([channelId])),
-    );
+    const body = [this.buildContent(all, new Set([message.id]), omitted), ...notes].join('\n');
+    this.deliverWake(body, meta, [message.id], () => this.settleFolded(missed, new Set([channelId]), all));
   }
 
   /** Render the wake payload: optional truncation note, channel-labeled lines,
@@ -468,6 +536,48 @@ export class PortalCcChannelServer {
     const name = this.client.cache.getChannel(channelId)?.name;
     return name ? `#${name}` : channelId;
   }
+}
+
+/** One followed channel's folded backlog (oldest first), or why it wasn't folded. */
+interface FoldedChannel {
+  channelId: string;
+  messages: PortalMessage[];
+  /** Unseen messages newer than the last one here — they fold next time. */
+  remaining?: number;
+  /** Set when the channel was NOT folded: more missed than FOLD_BOUND. */
+  tooMany?: number;
+}
+
+/**
+ * Fit folded backlog into `budget` messages: channels in order, each taking
+ * from its OLDEST; whatever doesn't fit is trimmed from the newest end and
+ * counted in `remaining` (it is still unread on the relay and folds next
+ * time). Mutates the entries so settle/notes see what was actually shown.
+ */
+function foldWithin(folded: FoldedChannel[], budget: number): PortalMessage[] {
+  const out: PortalMessage[] = [];
+  let left = Math.max(0, budget);
+  for (const f of folded) {
+    if (f.tooMany !== undefined) continue;
+    const take = f.messages.slice(0, left);
+    f.remaining = (f.remaining ?? 0) + (f.messages.length - take.length);
+    f.messages = take;
+    left -= take.length;
+    out.push(...take);
+  }
+  return out;
+}
+
+/** Relay page size (Discord's max per request). */
+const FOLD_PAGE = 100;
+/** Most messages paged for one channel in one wake. */
+const FOLD_BOUND = 500;
+
+/** A Discord snowflake at `iso`: the relay accepts a raw snowflake as a
+ *  history cursor, so a watermark timestamp becomes an `after` bound. */
+function sinceCursor(iso: string): string {
+  const ms = Date.parse(iso);
+  return ((BigInt(ms) - 1420070400000n) << 22n).toString();
 }
 
 function byCreatedAt(a: PortalMessage, b: PortalMessage): number {

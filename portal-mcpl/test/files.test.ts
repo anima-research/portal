@@ -124,10 +124,40 @@ test('url: private, loopback and link-local targets are refused, including via r
   // Explicit override for deliberately-internal deployments.
   const ok = await resolveOutgoingFiles(['http://127.0.0.1:8810/health'], { ...o, allowPrivateUrls: true });
   assert.equal(ok!.length, 1);
-  for (const a of ['10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1', '100.64.0.1', '0.0.0.0', '224.0.0.1', 'fc00::1', 'fe80::1', '::ffff:127.0.0.1']) {
+  for (const a of ['10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1', '100.64.0.1', '0.0.0.0', '224.0.0.1', 'fc00::1', 'fe80::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '64:ff9b::7f00:1', '::ffff:a00:1']) {
     assert.equal(isPrivateAddress(a), true, a);
   }
-  for (const a of ['8.8.8.8', '172.32.0.1', '2606:2800:220:1:248:1893:25c8:1946']) assert.equal(isPrivateAddress(a), false, a);
+  for (const a of ['8.8.8.8', '172.32.0.1', '2606:2800:220:1:248:1893:25c8:1946', '::ffff:808:808', '64:ff9b::808:808']) assert.equal(isPrivateAddress(a), false, a);
+});
+
+test('url: v4-mapped and NAT64 v6 literals are refused THROUGH the URL path (the parser rewrites them to hex)', async () => {
+  const calls: string[] = [];
+  const fakeFetch = (async (u: string) => { calls.push(u); return new Response(png, { status: 200 }); }) as unknown as typeof fetch;
+  const o = { fetch: fakeFetch, lookup: publicDns };
+  for (const u of ['http://[::ffff:127.0.0.1]:8810/a.txt', 'http://[::ffff:7f00:1]:8810/a.txt', 'http://[64:ff9b::7f00:1]/a.txt', 'http://[::ffff:169.254.169.254]/latest/meta-data/']) {
+    await assert.rejects(resolveOutgoingFiles([u], o), /private\/loopback/, u);
+  }
+  assert.deepEqual(calls, [], 'nothing was fetched');
+  // A public v4-mapped literal still works.
+  assert.equal((await resolveOutgoingFiles(['http://[::ffff:8.8.8.8]/x.png'], o))!.length, 1);
+});
+
+test('credentials and identity files are never attachable, roots or not', async () => {
+  for (const name of ['lena46.creds.json', 'root.identities.json', 'p1.state.json']) {
+    writeFileSync(join(dir, name), '{"token":"SECRET"}');
+    await assert.rejects(resolveOutgoingFiles([join(dir, name)]), /refusing to attach a credentials/, name);
+    await assert.rejects(resolveOutgoingFiles([join(dir, name)], { allowedRoots: [dir] }), /refusing to attach/, name);
+    await assert.rejects(resolveOutgoingFiles([{ path: join(dir, name), name: 'innocent.txt' }]), /refusing to attach/, name);
+  }
+  // Via a symlink with an innocent name, too.
+  symlinkSync(join(dir, 'lena46.creds.json'), join(dir, 'readme.txt'));
+  await assert.rejects(resolveOutgoingFiles([join(dir, 'readme.txt')]), /refusing to attach/);
+});
+
+test('a path outside the roots learns nothing about whether it exists', async () => {
+  const o = { allowedRoots: [dir] };
+  await assert.rejects(resolveOutgoingFiles(['/etc/hosts'], o), /outside the allowed roots/);
+  await assert.rejects(resolveOutgoingFiles(['/etc/definitely-not-a-file-xyz'], o), /outside the allowed roots/);
 });
 
 test('url: a body with no Content-Length is cut off at the budget, not buffered whole', async () => {
