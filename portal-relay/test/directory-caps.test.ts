@@ -87,6 +87,7 @@ function makeRelay() {
     meIn: () => ({}),
     isGuildAllowed: (g: string) => g === G1 || g === G2,
     hasMembersIntent: true,
+    membersComplete: () => true,
     listGuilds: () => [
       { id: G1, name: 'One', memberCount: 3 },
       { id: G2, name: 'Two', memberCount: 5 },

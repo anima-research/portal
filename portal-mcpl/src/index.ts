@@ -16,3 +16,5 @@ export { buildSession } from './session.js';
 export type { BuildSessionOptions } from './session.js';
 export { IdentityManager, identityToolDefinitions, identityFeatureSets } from './identity.js';
 export type { IdentityManagerOptions, IdentityRecord, IdentityToolHandler, PortalSession } from './identity.js';
+export { TOOL_CLASSES, UNCLASSED, TOOL_CLASS_VOCABULARY, withToolClass } from './tool-classes.js';
+export type { ToolClass } from './tool-classes.js';

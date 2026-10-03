@@ -159,8 +159,9 @@ export interface ListMembersParams {
 }
 export interface ListMembersResult {
   members: PortalMember[];
-  /** false when the relay bot lacks the GuildMembers intent (results are then
-   *  opportunistic/partial rather than the full roster). */
+  /** false unless the relay's member cache holds the guild's whole roster —
+   *  the bot lacks the GuildMembers intent, or the member warm failed or hasn't
+   *  finished (results are then opportunistic/partial). */
   membersAvailable: boolean;
 }
 

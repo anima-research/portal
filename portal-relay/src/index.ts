@@ -17,6 +17,10 @@
  *   PORTAL_WS_PORT          WS gateway port (default 8790, bound to 127.0.0.1).
  *   PORTAL_WEBHOOK_POOL     Webhooks per hot channel (default 1).
  *   PORTAL_HEARTBEAT_MS     Heartbeat interval (default 30000).
+ *   PORTAL_SESSION_LOG      Log gateway session lifecycle — identify (with
+ *                           ready time), resume, register, close (code +
+ *                           age), heartbeat reaps — to stderr. Default on;
+ *                           'false' disables.
  *   DISCORD_GUILD_ID        Optional comma-separated guild allow-list. With
  *                           PORTAL_GUILDS set it is only the first-run seed.
  *   PORTAL_GUILDS           Optional path to a persisted guild allow-list JSON
