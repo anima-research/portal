@@ -14,8 +14,28 @@ export type PortalChannelDescriptor = ChannelDescriptor & {
   capabilities?: {
     history?: { maxMessages?: number; supportsBeforeMessage?: boolean };
     acknowledgment?: { kind?: string; supportsValue?: boolean };
+    publish?: { target: PublishTarget };
   };
 };
+
+/**
+ * Where a channels/publish lands (MCPL RFC-011 `capabilities.publish`).
+ *
+ * - `exact`: a guild text or forum channel holds threads; a publish naming
+ *   one (`threadId`) lands exactly in that thread, and `null` in the channel
+ *   itself, or it fails with nothing posted. The relay resolves the place
+ *   exactly (a thread under this channel, or the channel) or refuses.
+ * - `root`: a thread, a DM or a voice channel's chat has no threads inside
+ *   it, so a publish lands in the channel itself.
+ * - none: a category or an unknown channel kind promises nothing.
+ */
+export type PublishTarget = 'exact' | 'root';
+
+export function publishTarget(channel: PortalChannel): PublishTarget | undefined {
+  if (channel.type === 'thread' || channel.type === 'voice' || !channel.guildId) return 'root';
+  if (channel.type === 'text' || channel.type === 'forum') return 'exact';
+  return undefined;
+}
 
 export function portalChannelId(channelId: string): string {
   return `portal:${channelId}`;
@@ -41,6 +61,7 @@ export function toDescriptor(
   const label = channel.guildId
     ? formatChannelLabel(channel.name ?? channel.id, guildName)
     : `${formatChannelLabel(channel.name ?? channel.id)} (dm)`;
+  const target = publishTarget(channel);
   return {
     id: portalChannelId(channel.id),
     type: 'portal',
@@ -57,6 +78,7 @@ export function toDescriptor(
     capabilities: {
       history: { maxMessages: maxHistory, supportsBeforeMessage: true },
       acknowledgment: { kind: 'reaction', supportsValue: true },
+      ...(target ? { publish: { target } } : {}),
     },
   };
 }

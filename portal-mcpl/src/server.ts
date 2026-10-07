@@ -412,13 +412,16 @@ export class PortalMcplServer {
     }
   }
 
-  private async handlePublish(pub: ChannelsPublishParams): Promise<ChannelsPublishResult> {
+  private async handlePublish(
+    pub: ChannelsPublishParams & { threadId?: unknown },
+  ): Promise<ChannelsPublishResult & { threadId?: string | null; reason?: string }> {
     const channelId = parsePortalChannelId(pub.channelId);
     if (!channelId) return { delivered: false };
     const text = pub.content
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
       .map((b) => b.text)
       .join('\n');
+    if (pub.threadId !== undefined) return this.publishTargeted(channelId, text, pub.threadId);
     // Discord caps content at 2000 chars — split long prose into sequential
     // messages instead of letting the whole publish 400 and vanish.
     let firstId: string | undefined;
@@ -427,6 +430,62 @@ export class PortalMcplServer {
       firstId ??= messageId;
     }
     return { delivered: true, messageId: firstId };
+  }
+
+  /**
+   * A channels/publish naming its place (MCPL RFC-011 `threadId`): a thread
+   * under this channel, or `null` for the channel itself. It lands exactly
+   * there or fails with nothing posted, as `{delivered: false, reason}` with
+   * no message id, and the result echoes where the relay says it posted.
+   */
+  private async publishTargeted(
+    channelId: string,
+    text: string,
+    target: unknown,
+  ): Promise<ChannelsPublishResult & { threadId?: string | null; reason?: string }> {
+    const refuse = (reason: string) => ({ delivered: false, reason });
+    if (target !== null && !(typeof target === 'string' && /^\d+$/.test(target))) {
+      return refuse(`invalid threadId ${JSON.stringify(target)}: expected a thread id, or null for the channel itself`);
+    }
+    if (!text) return refuse('no text content to send; nothing was posted');
+    // What this channel's descriptor declares (the same declaration the host
+    // was given at registration).
+    const channel = this.client.cache.getChannel(channelId);
+    const declared = channel ? toDescriptor(channel).capabilities?.publish?.target : undefined;
+    if (typeof target === 'string' && declared !== 'exact') {
+      return refuse(`${channel ? 'this channel has no threads inside it' : 'unknown channel'} (thread ${target} requested); nothing was posted`);
+    }
+    // The relay resolves the container exactly — a thread under channelId,
+    // or channelId itself — or refuses before posting. Long text goes out in
+    // chunks; only a refusal of the first chunk is a certain no-post.
+    let firstId: string | undefined;
+    const landed = new Set<string | null | undefined>();
+    for (const [i, chunk] of chunkText(text).entries()) {
+      let result: { messageId: string; threadId?: string | null };
+      try {
+        result = await this.client.sendMessage({
+          channelId,
+          ...(typeof target === 'string' ? { threadId: target } : {}),
+          content: chunk,
+        });
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        if (i === 0 && (code === 'NOT_FOUND' || code === 'FORBIDDEN' || code === 'INVALID_PARAMS')) {
+          return refuse(`the relay refused the post (${code}: ${(err as Error).message}); nothing was posted`);
+        }
+        throw err;
+      }
+      firstId ??= result.messageId;
+      // A relay that predates the field says nothing (undefined). A bare
+      // thread channel posted at its own root reports itself: that is null.
+      landed.add(result.threadId === undefined ? undefined : result.threadId === channelId ? null : result.threadId);
+    }
+    const [only] = landed;
+    return {
+      delivered: true,
+      messageId: firstId,
+      ...(landed.size === 1 && only !== undefined ? { threadId: only } : {}),
+    };
   }
 
   private async handleChannelOpen(open: ChannelsOpenParams): Promise<ChannelsOpenResult> {

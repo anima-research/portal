@@ -1408,7 +1408,7 @@ export class Relay implements GatewayHooks {
   private async sendMessage(
     personaId: string,
     p: RpcParams<'send_message'>,
-  ): Promise<{ messageId: string }> {
+  ): Promise<{ messageId: string; threadId: string | null }> {
     const cfg = this.identity.get(personaId)!;
     const target = await this.resolveContainer(p.channelId, p.threadId);
     if (!target) throw rpcError('NOT_FOUND', 'channel not found');
@@ -1467,7 +1467,9 @@ export class Relay implements GatewayHooks {
       personaId,
       webhookId,
     });
-    return { messageId: ref.relayId };
+    // Where it went: resolveContainer is exact (a thread under channelId, or
+    // channelId itself), and the webhook posts into that container or fails.
+    return { messageId: ref.relayId, threadId: target.threadId ?? null };
   }
 
   private async react(
