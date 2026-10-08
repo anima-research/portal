@@ -24,7 +24,9 @@ export type PortalChannelDescriptor = ChannelDescriptor & {
  * - `exact`: a guild text or forum channel holds threads; a publish naming
  *   one (`threadId`) lands exactly in that thread, and `null` in the channel
  *   itself, or it fails with nothing posted. The relay resolves the place
- *   exactly (a thread under this channel, or the channel) or refuses.
+ *   exactly (a thread under this channel, or the channel) or refuses. A forum
+ *   has no root (Discord takes messages there only inside its posts), so
+ *   `null` on a forum is refused before anything is sent.
  * - `root`: a thread, a DM or a voice channel's chat has no threads inside
  *   it, so a publish lands in the channel itself.
  * - none: a category or an unknown channel kind promises nothing.

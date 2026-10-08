@@ -3,7 +3,8 @@
  * declares `exact` (it holds threads), and a thread, a DM or a voice
  * channel's chat declares `root`. A publish naming its place lands exactly
  * there, through the relay's exact container resolution, or fails with
- * nothing posted. The echo is where the relay says it posted.
+ * nothing posted. A forum has no root, so `null` there is refused. The echo
+ * is where the relay says it posted.
  *
  * Platform boundary: the relay is a stub here (send_message's answers are
  * modeled); the relay's own resolution is covered in
@@ -84,6 +85,27 @@ test('null posts in the channel itself and echoes null, a bare thread channel in
     assert.deepEqual(res, { delivered: true, messageId: 'm1', threadId: null }, channel);
     assert.deepEqual(sent, [{ channelId: id, content: 'answer' }]);
   }
+});
+
+test('a forum takes a publish in one of its posts, and refuses its root', async () => {
+  // A forum's posts are threads under it, and Discord takes no message at
+  // the forum's root. The stub would accept a root post, so a refusal here
+  // comes from portal-mcpl itself, before the relay is asked.
+  const post = setup(relayLike);
+  assert.deepEqual(await post.publish({ channelId: 'portal:500', threadId: '510' }), {
+    delivered: true,
+    messageId: 'm1',
+    threadId: '510',
+  });
+  assert.deepEqual(post.sent, [{ channelId: '500', threadId: '510', content: 'answer' }]);
+
+  const root = setup(relayLike);
+  const res = await root.publish({ channelId: 'portal:500', threadId: null });
+  assert.equal(res.delivered, false);
+  assert.equal('messageId' in res, false);
+  assert.equal('threadId' in res, false);
+  assert.match(String(res.reason), /forum channel has no root/);
+  assert.equal(root.sent.length, 0);
 });
 
 test('targets that cannot be honored post nothing', async () => {

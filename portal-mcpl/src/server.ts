@@ -455,6 +455,12 @@ export class PortalMcplServer {
     if (typeof target === 'string' && declared !== 'exact') {
       return refuse(`${channel ? 'this channel has no threads inside it' : 'unknown channel'} (thread ${target} requested); nothing was posted`);
     }
+    // A forum holds only posts, which are threads: Discord takes no message
+    // at its root. Sent on, that rejection would reach the host as an error,
+    // an unconfirmed outcome for a post that provably didn't happen.
+    if (target === null && channel?.type === 'forum') {
+      return refuse('a forum channel has no root, only posts: name a post as threadId; nothing was posted');
+    }
     // The relay resolves the container exactly — a thread under channelId,
     // or channelId itself — or refuses before posting. Long text goes out in
     // chunks; only a refusal of the first chunk is a certain no-post.
