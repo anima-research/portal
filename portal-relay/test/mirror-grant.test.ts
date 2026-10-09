@@ -22,6 +22,32 @@ const DISCORD_ROLE = 'dr-everyone';
 const EXISTING = 'existing-1';
 const RW = ['READ_HISTORY', 'SEND_MESSAGES', 'VIEW_CHANNEL'] as const;
 
+/** Invites whose deciding fields have the wrong shape, each with the reason
+ *  enroll gives (and augment, unless the entry names augment's own refusal).
+ *  Read as found, a string where an array belongs is taken one character at a
+ *  time, `all: false` grants everything, a misspelled mode mints, and a
+ *  non-numeric maxUses or uses never exhausts. */
+const MALFORMED_GRANTS: Array<[string, Record<string, unknown>, RegExp, { code: string; message: RegExp }?]> = [
+  ['shape-roles-string', { roles: 'reader' }, /invite roles must be an array of strings/],
+  ['shape-roles-mixed', { roles: ['reader', 7] }, /invite roles must be an array of strings/],
+  ['shape-caps-string', { caps: 'SEND_MESSAGES' }, /invite caps must be an array of strings/],
+  ['shape-grant-null', { grant: null }, /invite grant must be an object/],
+  ['shape-grant-caps-string', { grant: { caps: 'SEND_MESSAGES', scope: { all: true } } }, /invite grant caps must be an array of strings/],
+  ['shape-grant-scope-null', { grant: { caps: [...RW], scope: null } }, /invite grant scope must be an object/],
+  ['shape-grant-channels-string', { grant: { caps: [...RW], scope: { channels: CHAN_A } } }, /invite grant scope channels must be an array of strings/],
+  ['shape-grant-mirrorRoles-string', { grant: { caps: [...RW], scope: { mirrorRoles: DISCORD_ROLE } } }, /invite grant scope mirrorRoles must be an array of strings/],
+  ['shape-grant-mirrorRole-number', { grant: { caps: [...RW], scope: { mirrorRole: 7 } } }, /invite grant scope mirrorRole must be a string/],
+  ['shape-scope-all-false', { grant: { caps: [...RW], scope: { all: false } } }, /invite grant scope all must be true/],
+  ['shape-scope-all-false-channels', { grant: { caps: [...RW], scope: { all: false, channels: [CHAN_A] } } }, /exactly one of channels, mirrorRole, mirrorRoles or all/],
+  ['shape-scope-empty', { grant: { caps: [...RW], scope: {} } }, /exactly one of channels, mirrorRole, mirrorRoles or all/],
+  ['shape-maxUses-string', { maxUses: 'one' }, /invite maxUses must be a non-negative integer/],
+  ['shape-uses-string', { uses: 'x' }, /invite uses must be a non-negative integer/],
+  // Augment's mode gate stays first, so a misspelled mode is refused there as not claimable.
+  ['shape-mode-typo', { mode: 'augmnet' }, /invite mode must be "mint", "augment" or "both"/, { code: 'FORBIDDEN', message: /not claimable/ }],
+  // A machine mint's recheck reads the grant too: the shape check runs first.
+  ['shape-mint-scope-null', { mintedBy: EXISTING, grant: { caps: [...RW], scope: null } }, /invite grant scope must be an object/],
+];
+
 function makeRelay(roles: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'portal-mirror-'));
   writeFileSync(
@@ -45,6 +71,8 @@ function makeRelay(roles: Record<string, unknown> = {}) {
         { code: 'mirror-aug', mode: 'augment', grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } }, guildId: GUILD },
         { code: 'mirror-noguild', mode: 'both', maxUses: 1, grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } } },
         { code: 'mirror-emptyguild', mode: 'both', maxUses: 1, guildId: '', grant: { caps: [...RW], scope: { mirrorRoles: [DISCORD_ROLE] } } },
+        // Hand-edited grant fields of the wrong shape (see MALFORMED_GRANTS).
+        ...MALFORMED_GRANTS.map(([code, fields]) => ({ code, mode: 'both', maxUses: 1, guildId: GUILD, ...fields })),
       ],
     }),
   );
@@ -175,6 +203,25 @@ for (const code of ['mirror-noguild', 'mirror-emptyguild']) {
       assert.throws(() => t.relay.applyInviteAugment(EXISTING, code), {
         code: 'INVALID_PARAMS', message: /invite mirror grant is missing guildId/,
       });
+      assert.deepEqual(t.snapshot(), before);
+      assert.equal(t.relay.invites.check(code, Date.now()).code, code);
+    } finally {
+      t.cleanup();
+    }
+  });
+}
+
+for (const [code, , reason, augmentRefusal] of MALFORMED_GRANTS) {
+  test(`${code}: enroll and augment reject a malformed invite field without mutations or invite consumption`, async () => {
+    // A role whose one-letter name a string `roles` would be read as.
+    const t = makeRelay({ r: { caps: ['MANAGE_CHANNELS', 'VIEW_CHANNEL'], scope: { all: true }, guildId: GUILD } });
+    try {
+      const before = t.snapshot();
+      const enrolled = await t.relay.enroll({ invite: code, desiredName: 'shaped' });
+      assert.match(enrolled.error ?? '', reason, JSON.stringify(enrolled));
+      assert.deepEqual(t.snapshot(), before);
+
+      assert.throws(() => t.relay.applyInviteAugment(EXISTING, code), augmentRefusal ?? { code: 'INVALID_PARAMS', message: reason });
       assert.deepEqual(t.snapshot(), before);
       assert.equal(t.relay.invites.check(code, Date.now()).code, code);
     } finally {

@@ -634,6 +634,11 @@ export class Relay implements GatewayHooks {
     if (typeof checked === 'string') return { error: `invite ${checked}` };
     // RFC-005 §5.6: an augment-only invite cannot mint a new persona.
     if (checked.mode === 'augment') return { error: 'invite is augment-only' };
+    // The invite comes from a hand-editable file. Check the shapes of the
+    // fields that decide the claim before anything reads them, the
+    // machine-mint recheck included.
+    const malformed = inviteShapeError(checked);
+    if (malformed) return { error: malformed };
     // Machine mints re-verify the subset rule against the minter's CURRENT
     // rights — a revoked/demoted spawner's outstanding codes die here.
     const staleMint = this.recheckMachineMint(checked);
@@ -965,6 +970,8 @@ export class Relay implements GatewayHooks {
     if (checked.mode !== 'augment' && checked.mode !== 'both') {
       throw rpcError('FORBIDDEN', 'invite is not claimable (mint-only)');
     }
+    const malformed = inviteShapeError(checked);
+    if (malformed) throw rpcError('INVALID_PARAMS', malformed);
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) throw rpcError('FORBIDDEN', staleMint);
     if (checked.roles?.length) {
@@ -1980,6 +1987,57 @@ function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirror
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+/**
+ * The invite fields that decide what a claim grants and who may make it,
+ * checked for shape before enroll or augment reads them: `mode`, `maxUses`,
+ * `uses`, `roles`, legacy `caps`, and `grant` with its scope. The file is
+ * hand-editable, and the code reads several of these by presence or as
+ * found: a string where an array belongs would be read one character at a
+ * time (as role names, capabilities or channel ids), `scope: { all: false }`
+ * would grant everything because `all` is tested by presence, a misspelled
+ * `mode` would make an augment-only invite mint personas, and a non-numeric
+ * `maxUses` or `uses` would never exhaust. Returns the reason, or null when the shapes
+ * are sound. Names are not checked: an unknown role, capability or channel
+ * grants nothing.
+ */
+function inviteShapeError(inv: InviteTemplate): string | null {
+  const mode: unknown = inv.mode;
+  if (mode !== undefined && mode !== 'mint' && mode !== 'augment' && mode !== 'both') {
+    return 'invite mode must be "mint", "augment" or "both"';
+  }
+  const maxUses: unknown = inv.maxUses;
+  if (maxUses !== undefined && !(Number.isInteger(maxUses) && (maxUses as number) >= 0)) {
+    return 'invite maxUses must be a non-negative integer';
+  }
+  // The relay keeps `uses`, but in the same file: a string would never reach
+  // maxUses, and consume() would concatenate onto it.
+  const uses: unknown = inv.uses;
+  if (uses !== undefined && !(Number.isInteger(uses) && (uses as number) >= 0)) {
+    return 'invite uses must be a non-negative integer';
+  }
+  if (inv.roles !== undefined && !isStringArray(inv.roles)) return 'invite roles must be an array of strings';
+  if (inv.caps !== undefined && !isStringArray(inv.caps)) return 'invite caps must be an array of strings';
+  const grant: unknown = inv.grant;
+  if (grant === undefined) return null;
+  if (grant === null || typeof grant !== 'object') return 'invite grant must be an object';
+  const { caps, scope } = grant as { caps?: unknown; scope?: unknown };
+  if (!isStringArray(caps)) return 'invite grant caps must be an array of strings';
+  if (scope === null || typeof scope !== 'object' || Array.isArray(scope)) return 'invite grant scope must be an object';
+  // A Scope is exactly one of its four forms; code downstream branches on
+  // which key is present, so a second key or a false `all` would be misread.
+  const kinds = ['channels', 'mirrorRole', 'mirrorRoles', 'all'].filter((key) => key in scope);
+  if (kinds.length !== 1) {
+    return 'invite grant scope must have exactly one of channels, mirrorRole, mirrorRoles or all';
+  }
+  const value = (scope as Record<string, unknown>)[kinds[0]!];
+  if (kinds[0] === 'all' && value !== true) return 'invite grant scope all must be true';
+  if ((kinds[0] === 'channels' || kinds[0] === 'mirrorRoles') && !isStringArray(value)) {
+    return `invite grant scope ${kinds[0]} must be an array of strings`;
+  }
+  if (kinds[0] === 'mirrorRole' && typeof value !== 'string') return 'invite grant scope mirrorRole must be a string';
+  return null;
 }
 
 /** Capabilities and mirrored role ids are sets: order and duplicates are inert. */
