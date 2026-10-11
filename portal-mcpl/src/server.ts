@@ -38,7 +38,7 @@ import { chunkText } from './chunk.js';
 import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
 import type { PortalAgent } from './agent.js';
 import type { PendingPing } from './agent-state.js';
-import { parsePortalChannelId, portalChannelId, toDescriptor } from './channels.js';
+import { parsePortalChannelId, portalChannelId, publishTarget, rootTakesPosts, toDescriptor } from './channels.js';
 import { featureSets, TOOL_FEATURE_SETS } from './feature-sets.js';
 import {
   McplPolicy,
@@ -412,16 +412,24 @@ export class PortalMcplServer {
     }
   }
 
-  private async handlePublish(
-    pub: ChannelsPublishParams & { threadId?: unknown },
-  ): Promise<ChannelsPublishResult & { threadId?: string | null; reason?: string }> {
+  private async handlePublish(pub: ChannelsPublishParams & { threadId?: unknown }): Promise<PublishResult> {
+    const targeted = pub.threadId !== undefined;
     const channelId = parsePortalChannelId(pub.channelId);
-    if (!channelId) return { delivered: false };
+    if (!channelId) {
+      // A targeted publish's refusal says why (RFC-011 §4); the legacy
+      // result keeps the shape it had.
+      return targeted
+        ? {
+            delivered: false,
+            reason: `invalid channelId ${describeValue(pub.channelId)}: expected portal:<channel id>; nothing was posted`,
+          }
+        : { delivered: false };
+    }
     const text = pub.content
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
       .map((b) => b.text)
       .join('\n');
-    if (pub.threadId !== undefined) return this.publishTargeted(channelId, text, pub.threadId);
+    if (targeted) return this.publishTargeted(channelId, text, pub.threadId);
     // Discord caps content at 2000 chars — split long prose into sequential
     // messages instead of letting the whole publish 400 and vanish.
     let firstId: string | undefined;
@@ -434,39 +442,68 @@ export class PortalMcplServer {
 
   /**
    * A channels/publish naming its place (MCPL RFC-011 `threadId`): a thread
-   * under this channel, or `null` for the channel itself. It lands exactly
-   * there or fails with nothing posted, as `{delivered: false, reason}` with
-   * no message id, and the result echoes where the relay says it posted.
+   * under this channel, or `null` for the channel itself.
+   *
+   * A target this server can't honor is refused before anything is sent, as
+   * `{delivered: false, reason}` with no message id: RFC-011's definitive
+   * "nothing was posted". So is a refusal of the first chunk by the relay or
+   * by Discord. Long text goes out in chunks, and a later chunk's failure is
+   * reported with what was posted: `delivered: false` with the first chunk's
+   * `messageId`, which a host reads as unconfirmed (RFC-011 §5), never as a
+   * refusal. A first chunk that fails without a refusal is thrown, which a
+   * host also reads as unconfirmed, since it may have posted. A delivered
+   * result echoes where the relay says it posted.
    */
-  private async publishTargeted(
-    channelId: string,
-    text: string,
-    target: unknown,
-  ): Promise<ChannelsPublishResult & { threadId?: string | null; reason?: string }> {
-    const refuse = (reason: string) => ({ delivered: false, reason });
+  private async publishTargeted(channelId: string, text: string, target: unknown): Promise<PublishResult> {
+    const refuse = (reason: string): PublishResult => ({ delivered: false, reason: `${reason}; nothing was posted` });
     if (target !== null && !(typeof target === 'string' && /^\d+$/.test(target))) {
-      return refuse(`invalid threadId ${JSON.stringify(target)}: expected a thread id, or null for the channel itself`);
+      return refuse(`invalid threadId ${describeValue(target)}: expected a thread id, or null for the channel itself`);
     }
-    if (!text) return refuse('no text content to send; nothing was posted');
-    // What this channel's descriptor declares (the same declaration the host
-    // was given at registration).
+    if (!text.trim()) return refuse('no text to send: the content is empty or only whitespace');
+    // The decision reads the channel cache, which the relay's ready frame
+    // hydrates, and this server answers the host before that frame arrives.
+    if (!(await this.relayReady())) {
+      return refuse(
+        `not connected to the relay yet (no ready frame within ${this.readyWaitMs / 1000}s), so where this ` +
+          'channel takes posts is unknown; try again shortly',
+      );
+    }
     const channel = this.client.cache.getChannel(channelId);
-    const declared = channel ? toDescriptor(channel).capabilities?.publish?.target : undefined;
+    if (!channel) return refuse(`unknown channel ${channelId}`);
+    // What this channel's descriptor declares (the same declaration the host
+    // was given at registration), and whether its root takes posts.
+    const declared = publishTarget(channel);
+    const kind = channel.guildId ? `its kind, ${channel.type},` : 'a DM';
     if (typeof target === 'string' && declared !== 'exact') {
-      return refuse(`${channel ? 'this channel has no threads inside it' : 'unknown channel'} (thread ${target} requested); nothing was posted`);
+      return refuse(
+        declared === 'root'
+          ? `this channel declares publish target root: it holds no threads, so thread ${target} can't be targeted`
+          : `this channel declares no publish target (${kind} isn't one this server posts into), so thread ${target} can't be targeted`,
+      );
     }
-    // A forum holds only posts, which are threads: Discord takes no message
-    // at its root. Sent on, that rejection would reach the host as an error,
-    // an unconfirmed outcome for a post that provably didn't happen.
-    if (target === null && channel?.type === 'forum') {
-      return refuse('a forum channel has no root, only posts: name a post as threadId; nothing was posted');
+    if (target === null && !rootTakesPosts(channel)) {
+      // A forum holds only posts, which are threads: Discord takes no message
+      // at its root. Sent on, that rejection would reach the host as an
+      // error, an unconfirmed outcome for a post that provably didn't happen.
+      return refuse(
+        channel.type === 'forum' && declared === 'exact'
+          ? 'a forum channel has no root, only posts: name a post as threadId'
+          : `this channel declares no publish target (${kind} isn't one this server posts into), so it can't take a post at its root`,
+      );
     }
-    // The relay resolves the container exactly — a thread under channelId,
-    // or channelId itself — or refuses before posting. Long text goes out in
-    // chunks; only a refusal of the first chunk is a certain no-post.
+    // The relay resolves the container exactly, a thread under channelId or
+    // channelId itself, or refuses before posting.
+    const chunks = chunkText(text);
     let firstId: string | undefined;
     const landed = new Set<string | null | undefined>();
-    for (const [i, chunk] of chunkText(text).entries()) {
+    // Where the posted chunks landed, when the relay said and they agree. A
+    // relay that predates the field says nothing (undefined), and a bare
+    // thread channel posted at its own root reports itself, which is null.
+    const echo = () => {
+      const [only] = landed;
+      return landed.size === 1 && only !== undefined ? { threadId: only } : {};
+    };
+    for (const [i, chunk] of chunks.entries()) {
       let result: { messageId: string; threadId?: string | null };
       try {
         result = await this.client.sendMessage({
@@ -475,23 +512,52 @@ export class PortalMcplServer {
           content: chunk,
         });
       } catch (err) {
-        const code = (err as { code?: string }).code;
-        if (i === 0 && (code === 'NOT_FOUND' || code === 'FORBIDDEN' || code === 'INVALID_PARAMS')) {
-          return refuse(`the relay refused the post (${code}: ${(err as Error).message}); nothing was posted`);
+        const { code, message } = err as { code?: unknown; message?: string };
+        if (i === 0) {
+          // The relay's own refusals come before it posts. A numeric code is
+          // Discord's JSON error code, which the relay passes through from a
+          // 4xx: Discord created no message. Anything else (a transport
+          // failure, a timeout, a 5xx, an unrecognised code) may have posted,
+          // so it stays an error, unconfirmed.
+          if (typeof code === 'number') return refuse(`Discord refused the post (${code}: ${message})`);
+          if (code === 'NOT_FOUND' || code === 'FORBIDDEN' || code === 'INVALID_PARAMS') {
+            return refuse(`the relay refused the post (${code}: ${message})`);
+          }
+          throw err;
         }
-        throw err;
+        return {
+          delivered: false,
+          messageId: firstId,
+          ...echo(),
+          reason:
+            `chunk ${i + 1} of ${chunks.length} failed (${String(code ?? 'no code')}: ${message}) after the ` +
+            `first ${i === 1 ? 'chunk was' : `${i} chunks were`} posted, starting with message ${firstId}; the rest was not sent`,
+        };
       }
       firstId ??= result.messageId;
-      // A relay that predates the field says nothing (undefined). A bare
-      // thread channel posted at its own root reports itself: that is null.
-      landed.add(result.threadId === undefined ? undefined : result.threadId === channelId ? null : result.threadId);
+      landed.add(result.threadId === channelId ? null : result.threadId);
     }
-    const [only] = landed;
-    return {
-      delivered: true,
-      messageId: firstId,
-      ...(landed.size === 1 && only !== undefined ? { threadId: only } : {}),
-    };
+    return { delivered: true, messageId: firstId, ...echo() };
+  }
+
+  /** How long a targeted publish waits for the relay's ready frame. */
+  private readyWaitMs = READY_WAIT_MS;
+
+  /** Whether the client's cache is hydrated by the relay's ready frame,
+   *  waiting for it up to readyWaitMs. */
+  private relayReady(): Promise<boolean> {
+    if (this.client.cache.persona) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        off();
+        resolve(false);
+      }, this.readyWaitMs);
+      const off = this.client.on('ready', () => {
+        clearTimeout(timer);
+        off();
+        resolve(true);
+      });
+    });
   }
 
   private async handleChannelOpen(open: ChannelsOpenParams): Promise<ChannelsOpenResult> {
@@ -1269,6 +1335,29 @@ function render(m: PortalMessage): string {
 function renderReactionEmoji(emoji: string): string {
   const m = /^(\w+):\d+$/.exec(emoji);
   return m ? `:${m[1]}:` : emoji;
+}
+
+/** A channels/publish result with MCPL RFC-011's fields. mcpl-core 0.2.2
+ *  predates RFC-011 (no `threadId` on the params, no `threadId` or `reason` on
+ *  the result), so this, with handlePublish's widened params, stands in for
+ *  mcpl-core-ts#9's types until that is released and the dependency bumped. */
+type PublishResult = ChannelsPublishResult & { threadId?: string | null; reason?: string };
+
+/** How long a targeted publish waits for the relay's ready frame, unless
+ *  the server's readyWaitMs is changed. */
+const READY_WAIT_MS = 10_000;
+
+/** A value the caller sent, described for a refusal by its type, with a
+ *  short excerpt of a string rather than the whole value. */
+function describeValue(v: unknown): string {
+  if (typeof v === 'string') {
+    if (!v) return '(an empty string)';
+    const points = Array.from(v);
+    return `(the string ${JSON.stringify(points.length > 40 ? `${points.slice(0, 39).join('')}…` : v)})`;
+  }
+  if (v === null) return '(null)';
+  if (Array.isArray(v)) return '(an array)';
+  return `(${/^[aeiou]/.test(typeof v) ? 'an' : 'a'} ${typeof v})`;
 }
 
 function stringify(v: unknown): string {

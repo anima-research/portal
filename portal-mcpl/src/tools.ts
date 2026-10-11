@@ -58,7 +58,9 @@ const definitions: ToolDefinition[] = [
     name: 'send_message',
     description:
       'Post a message to a channel or thread as your persona (via webhook). ' +
-      'Pass a thread channel id directly to post in a thread.',
+      'Pass a thread channel id directly to post in a thread. ' +
+      "Returns the first message's messageId and threadId: the thread it was posted in, or null for a channel " +
+      '(a relay that predates threadId leaves it out).',
     inputSchema: {
       type: 'object',
       properties: {
