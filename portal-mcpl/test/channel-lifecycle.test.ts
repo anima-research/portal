@@ -5,6 +5,7 @@ import type { PortalChannel, PortalMessage } from '@animalabs/portal-protocol';
 import { AgentState } from '../src/agent-state.js';
 import { PortalAgent } from '../src/agent.js';
 import { PortalMcplServer } from '../src/server.js';
+import { PortalCcChannelServer } from '../src/server-cc.js';
 import { featureSets } from '../src/feature-sets.js';
 
 /**
@@ -443,4 +444,51 @@ test('a removal landing during the in-flight initial register is retracted after
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].method, 'channels/changed');
   assert.deepEqual(notifications[0].params, { removed: [`portal:${channel.id}`] });
+});
+
+test('a catch-up wake names the thread of each message in one, and says to pass it as threadId', async () => {
+  const client = clientWithChannel();
+  const agent = new PortalAgent(client, { hostOwnsChannelLifecycle: true });
+  const inThread = { ...message('m1', '2026-01-01T00:00:00Z'), threadId: '1526659685036331999' };
+  const inChannel = message('m2', '2026-01-01T00:01:00Z');
+  (agent as unknown as { pendingPingsFromRelay(): Promise<unknown> }).pendingPingsFromRelay = async () => [
+    { message: inThread, reasons: ['mention'], at: inThread.createdAt },
+    { message: inChannel, reasons: ['mention'], at: inChannel.createdAt },
+  ];
+
+  // The MCPL server: one push/event carries the catch-up.
+  const server = new PortalMcplServer(client, agent);
+  const pushes: Array<{ method: string; params: unknown }> = [];
+  const internal = server as unknown as {
+    conn: { sendRequest(method: string, params: unknown): Promise<unknown>; sendNotification(): void };
+    catchUp(): Promise<void>;
+  };
+  internal.conn = {
+    async sendRequest(method, params) {
+      pushes.push({ method, params });
+      return {};
+    },
+    sendNotification() {},
+  };
+  grant(server);
+  await internal.catchUp();
+  assert.equal(pushes.length, 1);
+  const text = (pushes[0].params as { payload: { content: Array<{ text: string }> } }).payload.content[0].text;
+  const lines = text.split('\n');
+  assert.ok(lines.some((l) => l.includes('message m1') && l.endsWith('[thread 1526659685036331999]')), text);
+  assert.ok(lines.some((l) => l.includes('message m2') && !l.includes('[thread')), text);
+  assert.ok(text.includes('send_message with the channel as channelId and the thread as threadId'), text);
+
+  // The Claude Code server, through a wake sink: the same lines and hint.
+  const wakes: Array<{ content: string }> = [];
+  const cc = new PortalCcChannelServer(client, agent, {
+    wakeSink: { kind: 'test', deliver: async (payload) => { wakes.push(payload); } },
+  });
+  (cc as unknown as { conn: unknown }).conn = { sendNotification() {} };
+  await (cc as unknown as { catchUp(): Promise<void> }).catchUp();
+  assert.equal(wakes.length, 1);
+  const ccLines = wakes[0].content.split('\n');
+  assert.ok(ccLines.some((l) => l.includes('message m1') && l.endsWith('[thread 1526659685036331999]')), wakes[0].content);
+  assert.ok(ccLines.some((l) => l.includes('message m2') && !l.includes('[thread')), wakes[0].content);
+  assert.ok(wakes[0].content.includes('send_message with the channel as channelId and the thread as threadId'), wakes[0].content);
 });
