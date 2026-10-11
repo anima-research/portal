@@ -621,13 +621,14 @@ export class Relay implements GatewayHooks {
     if (!this.invites) return { error: 'registration disabled' };
     // Wire guards only check the frame shape. Validate fields used later before
     // preparing a grant: creating a mirror role can activate existing references.
-    if (d.desiredName !== undefined && typeof d.desiredName !== 'string') {
+    // An optional field given as null reads as absent, as it always has.
+    if (d.desiredName != null && typeof d.desiredName !== 'string') {
       return { error: 'registration desiredName must be a string' };
     }
-    if (d.avatar !== undefined && typeof d.avatar !== 'string') {
+    if (d.avatar != null && typeof d.avatar !== 'string') {
       return { error: 'registration avatar must be a string' };
     }
-    if (d.subscriptions !== undefined && !isStringArray(d.subscriptions)) {
+    if (d.subscriptions != null && !isStringArray(d.subscriptions)) {
       return { error: 'registration subscriptions must be an array of strings' };
     }
     const checked = this.invites.check(d.invite, Date.now());
@@ -644,10 +645,10 @@ export class Relay implements GatewayHooks {
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) return { error: staleMint };
 
-    if (checked.namePrefix !== undefined && typeof checked.namePrefix !== 'string') {
+    if (checked.namePrefix != null && typeof checked.namePrefix !== 'string') {
       return { error: 'invite namePrefix must be a string' };
     }
-    if (checked.subscriptions !== undefined && !isStringArray(checked.subscriptions)) {
+    if (checked.subscriptions != null && !isStringArray(checked.subscriptions)) {
       return { error: 'invite subscriptions must be an array of strings' };
     }
 
@@ -664,9 +665,9 @@ export class Relay implements GatewayHooks {
     };
     const subscriptions = checked.subscriptions?.length
       ? [...new Set([...(d.subscriptions ?? []), ...checked.subscriptions])]
-      : d.subscriptions;
+      : d.subscriptions ?? undefined;
     const persona = this.identity.toPersona(identity);
-    const enrollmentLog = `[portal-relay] enrolled persona "${personaId}" via invite (${checked.label ?? d.invite})`;
+    const enrollmentLog = `[portal-relay] enrolled persona "${personaId}" via invite (${inviteName(checked, d.invite)})`;
 
     // Reject malformed grants and catalog collisions before persisting or
     // emitting the identity. Request/template derivations above are complete.
@@ -696,7 +697,7 @@ export class Relay implements GatewayHooks {
     let grant = inv.grant;
     if (!grant && inv.caps?.length) {
       console.error(
-        `[portal-relay] invite "${inv.label ?? inv.code}" uses deprecated blanket caps; ` +
+        `[portal-relay] invite "${inviteName(inv, inv.code)}" uses deprecated blanket caps; ` +
           `honouring as scope:{all}. Re-mint scoped (RFC-004).`,
       );
       grant = { caps: inv.caps, scope: { all: true } };
@@ -737,10 +738,17 @@ export class Relay implements GatewayHooks {
     if (!existing && this.permissions.hasRoleName(name)) {
       return { error: `invite mirror grant conflicts with quarantined role "${name}"` };
     }
+    // An admin's removeRole keeps personas' references to it, inert. Recreating
+    // the role here would silently hand its caps back to every one of them.
+    if (!existing && this.permissions.isRoleReferenced(name)) {
+      return { error: `invite mirror grant conflicts with removed role "${name}", which personas still name` };
+    }
     if (existing) {
       // File-loaded entries can have malformed fields despite their static
       // type. Treat those as conflicts rather than throwing during comparison.
-      // Static scope fields take precedence over mirror fields in resolution.
+      // Reuse needs a pure mirror scope without mirrorCaps: resolution reads a
+      // mirrorCaps role, or one with static scope fields beside its mirror
+      // fields, differently from the grant this claim describes.
       const matches = existing.guildId === guildId
         && (existing.mirrorCaps === undefined || existing.mirrorCaps === false)
         && existing.scope !== null
@@ -1985,6 +1993,12 @@ function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirror
   return 'mirrorRole' in scope || 'mirrorRoles' in scope;
 }
 
+/** How logs name an invite: its label, or the start of its code. The code is a
+ *  bearer credential, so a log line never carries it whole. */
+function inviteName(inv: InviteTemplate, code: string): string {
+  return inv.label || `${String(code).slice(0, 4)}…`;
+}
+
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string');
 }
@@ -2003,25 +2017,34 @@ function isStringArray(value: unknown): value is string[] {
  * grants nothing.
  */
 function inviteShapeError(inv: InviteTemplate): string | null {
+  // An optional field given as null reads as absent, as the code downstream
+  // has always read it (?., ?? and !grant).
   const mode: unknown = inv.mode;
-  if (mode !== undefined && mode !== 'mint' && mode !== 'augment' && mode !== 'both') {
+  if (mode != null && mode !== 'mint' && mode !== 'augment' && mode !== 'both') {
     return 'invite mode must be "mint", "augment" or "both"';
   }
   const maxUses: unknown = inv.maxUses;
-  if (maxUses !== undefined && !(Number.isInteger(maxUses) && (maxUses as number) >= 0)) {
+  if (maxUses != null && !(Number.isInteger(maxUses) && (maxUses as number) >= 0)) {
     return 'invite maxUses must be a non-negative integer';
   }
   // The relay keeps `uses`, but in the same file: a string would never reach
   // maxUses, and consume() would concatenate onto it.
   const uses: unknown = inv.uses;
-  if (uses !== undefined && !(Number.isInteger(uses) && (uses as number) >= 0)) {
+  if (uses != null && !(Number.isInteger(uses) && (uses as number) >= 0)) {
     return 'invite uses must be a non-negative integer';
   }
-  if (inv.roles !== undefined && !isStringArray(inv.roles)) return 'invite roles must be an array of strings';
-  if (inv.caps !== undefined && !isStringArray(inv.caps)) return 'invite caps must be an array of strings';
+  if (inv.roles != null && !isStringArray(inv.roles)) return 'invite roles must be an array of strings';
+  if (inv.caps != null && !isStringArray(inv.caps)) return 'invite caps must be an array of strings';
+  // A guild the strict comparisons downstream could never match would leave
+  // the persona with an inert grant and the invite spent.
+  const guildId: unknown = inv.guildId;
+  if (guildId != null && typeof guildId !== 'string') return 'invite guildId must be a string';
+  // A falsy minter would skip the machine-mint recheck as if an admin had minted it.
+  const mintedBy: unknown = inv.mintedBy;
+  if (mintedBy != null && (typeof mintedBy !== 'string' || !mintedBy)) return 'invite mintedBy must be a non-empty string';
   const grant: unknown = inv.grant;
-  if (grant === undefined) return null;
-  if (grant === null || typeof grant !== 'object') return 'invite grant must be an object';
+  if (grant == null) return null;
+  if (typeof grant !== 'object') return 'invite grant must be an object';
   const { caps, scope } = grant as { caps?: unknown; scope?: unknown };
   if (!isStringArray(caps)) return 'invite grant caps must be an array of strings';
   if (scope === null || typeof scope !== 'object' || Array.isArray(scope)) return 'invite grant scope must be an object';
@@ -2037,6 +2060,12 @@ function inviteShapeError(inv: InviteTemplate): string | null {
     return `invite grant scope ${kinds[0]} must be an array of strings`;
   }
   if (kinds[0] === 'mirrorRole' && typeof value !== 'string') return 'invite grant scope mirrorRole must be a string';
+  // A mirror that names no role matches no channel: a deny-all persona with the invite spent.
+  if ((kinds[0] === 'mirrorRole' && !value) || (kinds[0] === 'mirrorRoles' && ((value as string[]).length === 0 || (value as string[]).some((id) => !id)))) {
+    return 'invite grant scope must name at least one mirrored role';
+  }
+  // Channels are guild-scoped: without a guild, the grant would apply as deny-all.
+  if (kinds[0] === 'channels' && !inv.guildId) return 'invite grant scope channels needs the invite\'s guildId';
   return null;
 }
 

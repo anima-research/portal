@@ -31,7 +31,6 @@ const MALFORMED_GRANTS: Array<[string, Record<string, unknown>, RegExp, { code: 
   ['shape-roles-string', { roles: 'reader' }, /invite roles must be an array of strings/],
   ['shape-roles-mixed', { roles: ['reader', 7] }, /invite roles must be an array of strings/],
   ['shape-caps-string', { caps: 'SEND_MESSAGES' }, /invite caps must be an array of strings/],
-  ['shape-grant-null', { grant: null }, /invite grant must be an object/],
   ['shape-grant-caps-string', { grant: { caps: 'SEND_MESSAGES', scope: { all: true } } }, /invite grant caps must be an array of strings/],
   ['shape-grant-scope-null', { grant: { caps: [...RW], scope: null } }, /invite grant scope must be an object/],
   ['shape-grant-channels-string', { grant: { caps: [...RW], scope: { channels: CHAN_A } } }, /invite grant scope channels must be an array of strings/],
@@ -42,6 +41,21 @@ const MALFORMED_GRANTS: Array<[string, Record<string, unknown>, RegExp, { code: 
   ['shape-scope-empty', { grant: { caps: [...RW], scope: {} } }, /exactly one of channels, mirrorRole, mirrorRoles or all/],
   ['shape-maxUses-string', { maxUses: 'one' }, /invite maxUses must be a non-negative integer/],
   ['shape-uses-string', { uses: 'x' }, /invite uses must be a non-negative integer/],
+  // The integer and non-negative conditions each refuse on their own.
+  ['shape-uses-negative', { uses: -1 }, /invite uses must be a non-negative integer/],
+  ['shape-uses-fraction', { uses: 0.5 }, /invite uses must be a non-negative integer/],
+  ['shape-maxUses-fraction', { maxUses: 2.5 }, /invite maxUses must be a non-negative integer/],
+  // A scope that isn't an object never reaches the `in` checks.
+  ['shape-scope-string', { grant: { caps: [...RW], scope: 'all' } }, /invite grant scope must be an object/],
+  ['shape-scope-number', { grant: { caps: [...RW], scope: 7 } }, /invite grant scope must be an object/],
+  ['shape-scope-array', { grant: { caps: [...RW], scope: [CHAN_A] } }, /invite grant scope must be an object/],
+  // Grants that would apply as deny-all with the invite spent (the #25 symptom).
+  ['shape-guildId-number', { guildId: 7 }, /invite guildId must be a string/],
+  ['shape-mirrorRoles-empty', { grant: { caps: [...RW], scope: { mirrorRoles: [] } } }, /must name at least one mirrored role/],
+  ['shape-mirrorRole-empty', { grant: { caps: [...RW], scope: { mirrorRole: '' } } }, /must name at least one mirrored role/],
+  ['shape-channels-guildless', { guildId: undefined, grant: { caps: [...RW], scope: { channels: [CHAN_A] } } }, /channels needs the invite's guildId/],
+  // A falsy minter would skip the machine-mint recheck.
+  ['shape-mintedBy-empty', { mintedBy: '' }, /invite mintedBy must be a non-empty string/],
   // Augment's mode gate stays first, so a misspelled mode is refused there as not claimable.
   ['shape-mode-typo', { mode: 'augmnet' }, /invite mode must be "mint", "augment" or "both"/, { code: 'FORBIDDEN', message: /not claimable/ }],
   // A machine mint's recheck reads the grant too: the shape check runs first.
@@ -233,23 +247,18 @@ for (const [code, , reason, augmentRefusal] of MALFORMED_GRANTS) {
 for (const [source, field, value] of [
   ['registration', 'desiredName', 42],
   ['registration', 'desiredName', false],
-  ['registration', 'desiredName', null],
   ['registration', 'desiredName', {}],
   ['registration', 'desiredName', []],
   ['registration', 'avatar', 42],
-  ['registration', 'avatar', null],
   ['registration', 'avatar', {}],
   ['registration', 'subscriptions', 42],
-  ['registration', 'subscriptions', null],
   ['registration', 'subscriptions', CHAN_A],
   ['registration', 'subscriptions', [CHAN_A, 42]],
   ['invite', 'namePrefix', 17],
   ['invite', 'namePrefix', false],
-  ['invite', 'namePrefix', null],
   ['invite', 'namePrefix', {}],
   ['invite', 'namePrefix', []],
   ['invite', 'subscriptions', 42],
-  ['invite', 'subscriptions', null],
   ['invite', 'subscriptions', { length: 1 }],
   ['invite', 'subscriptions', CHAN_A],
   ['invite', 'subscriptions', [CHAN_A, 42]],
@@ -290,7 +299,9 @@ for (const [source, field, value] of [
       let thrown: unknown;
       try {
         await (gateway as any).onFrame({
-          id: 'sess-invalid-register', identified: false, touch: () => {},
+          // `open`: the socket can still carry frames (Session.open, which the
+          // late-enrollment guard reads once the gateway's PR #40 is in).
+          id: 'sess-invalid-register', identified: false, open: true, touch: () => {},
           send: (out: unknown) => sent.push(out),
           close: (...args: unknown[]) => closed.push(args),
         }, frame);
@@ -496,5 +507,60 @@ test('multi-role grants normalize role order and duplicates for both naming and 
     assert.equal(t.relay.invites.get('multi-reordered').uses, 2);
   } finally {
     t.cleanup();
+  }
+});
+
+test('optional fields given as null read as absent, as they always have', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({
+      code: 'nulls', guildId: GUILD, mode: null, uses: null, roles: null, caps: null,
+      namePrefix: null, subscriptions: null, mintedBy: null,
+      grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } },
+    });
+    const enrolled = await t.relay.enroll({ invite: 'nulls', desiredName: null, avatar: null, subscriptions: null });
+    assert.ok(!('error' in enrolled), JSON.stringify(enrolled));
+    assert.equal(enrolled.persona.displayName, 'agent');
+    assert.deepEqual(t.caps(enrolled.personaId, CHAN_A), [...RW]);
+
+    // A null grant grants nothing, as an absent one does: a default-deny persona.
+    t.relay.invites.mint({ code: 'null-grant', guildId: GUILD, grant: null });
+    const bare = await t.relay.enroll({ invite: 'null-grant', desiredName: 'bare' });
+    assert.ok(!('error' in bare), JSON.stringify(bare));
+    assert.deepEqual(t.caps(bare.personaId, CHAN_A), []);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('a claim never recreates a removed role that personas still name', async () => {
+  const t = makeRelay();
+  try {
+    const first = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'first' });
+    const [name] = t.relay.permissions.getRoleNames(first.personaId);
+    t.relay.permissions.removeRole(name);
+    assert.deepEqual(t.caps(first.personaId, CHAN_A), [], 'the admin revoked these caps');
+    const before = t.snapshot();
+    const again = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'second' });
+    assert.match(again.error ?? '', /conflicts with removed role/, JSON.stringify(again));
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mirror-aug'), { code: 'INVALID_PARAMS', message: /conflicts with removed role/ });
+    assert.deepEqual(t.snapshot(), before, 'nothing written, and the invite not consumed');
+    assert.deepEqual(t.caps(first.personaId, CHAN_A), [], 'the revoked caps stay revoked');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('the enrollment log names an unlabelled invite without its bearer code', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const r = makeRelay();
+  try {
+    const enrolled = await r.relay.enroll({ invite: 'mirror-mint', desiredName: 'logged' });
+    assert.ok(!('error' in enrolled), JSON.stringify(enrolled));
+    assert.ok(lines.some((l) => l.includes(`enrolled persona "${enrolled.personaId}"`)), lines.join('\n'));
+    assert.ok(!lines.some((l) => l.includes('mirror-mint')), lines.join('\n'));
+  } finally {
+    r.cleanup();
   }
 });
