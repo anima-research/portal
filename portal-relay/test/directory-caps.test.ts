@@ -297,7 +297,8 @@ test('canSubscribe mirrors the subscribe_channel VIEW_CHANNEL gate', () => {
 test('gateway drops identify/register subscriptions the canSubscribe hook refuses', async () => {
   const PORT = 8811;
   const hooks: GatewayHooks = {
-    authenticate: (token, personaId) => (token === 'secret' ? personaId : null),
+    // The minted credentials authenticate, as the relay's enroll stores them before returning.
+    authenticate: (token, personaId) => (token === 'secret' || (token === 'tok' && personaId === 'minted') ? personaId : null),
     canSubscribe: (_personaId, channelId) => channelId === 'allowed',
     buildReady: async (session: Session): Promise<ReadyData> => ({
       sessionId: session.id,

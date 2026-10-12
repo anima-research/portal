@@ -6,6 +6,10 @@
  * Multiple sessions of one persona share that stream (fan-out); a session that
  * briefly drops can `resume` from its last seq. Long gaps fall back to a fresh
  * identify + history backfill (handled a layer up, in portal-mcpl).
+ *
+ * seq is monotonic within one stream. A stream released after its resume
+ * window, like one lost to a relay restart, starts again at 0 at the persona's
+ * next identify or register, and that `ready` carries the new baseline.
  */
 import { WebSocketServer, type WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
@@ -31,7 +35,9 @@ export interface GatewayHooks {
   /**
    * Self-registration. Mint a new persona from an invite template. Returns the
    * minted credentials on success or `{ error }` to reject. Absent → the relay
-   * has no invites configured and registration is disabled.
+   * has no invites configured and registration is disabled. The gateway checks
+   * the returned credentials with `authenticate` before promoting the socket,
+   * as identify would, so a revoke that lands while this awaits isn't undone.
    */
   enroll?(data: RegisterData): Promise<RegisteredData | { error: string }>;
   /**
@@ -50,9 +56,20 @@ interface PersonaStream {
   buffer: Array<{ seq: number; event: PortalEvent }>;
 }
 
+interface ResumeSession {
+  personaId: string;
+  /** Absent while a socket using this resume key is live. */
+  expiresAt?: number;
+}
+
 const BUFFER_CAP = 1000;
+const RESUME_RETENTION_MS = 5 * 60_000;
 
 export interface GatewayOptions {
+  /** How long a disconnected session may resume (default 5 minutes).
+   *  Replay is also limited by the 1000-event buffer. Live sessions never age
+   *  out; events arriving while offline do not extend this deadline. */
+  resumeRetentionMs?: number;
   /**
    * Sink for session-lifecycle lines (identify / resume / register / close /
    * heartbeat reap). Defaults to stderr. These are the only record of whether a
@@ -78,6 +95,8 @@ const REJECT_LOG_CAP = 3;
 
 export class Session {
   readonly id: string;
+  /** The original ready.sessionId, retained across successful resumes. */
+  resumeId: string;
   personaId = '';
   subscriptions = new Set<string>();
   identified = false;
@@ -97,10 +116,17 @@ export class Session {
     private gateway: Gateway,
   ) {
     this.id = `sess_${randomUUID()}`;
+    this.resumeId = this.id;
+  }
+
+  /** Whether the socket can still carry frames. A socket the server or the
+   *  client has begun closing is CLOSING until ws emits 'close'. */
+  get open(): boolean {
+    return this.ws.readyState === this.ws.OPEN;
   }
 
   send(frame: ServerFrame): void {
-    if (this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify(frame));
+    if (this.open) this.ws.send(JSON.stringify(frame));
   }
 
   close(code = 1000, reason = ''): void {
@@ -130,11 +156,14 @@ export class Gateway {
   private sessions = new Map<string, Session>();
   private byPersona = new Map<string, Set<Session>>();
   private streams = new Map<string, PersonaStream>();
-  /** Retains sessionId → personaId for a window so resume can find the stream. */
-  private sessionPersona = new Map<string, string>();
+  /** Resume keys: the sessionId a client got in `ready` → its persona. Kept
+   *  while a socket using the key is live, and for resumeRetentionMs after the
+   *  last such socket closes (expiresAt). */
+  private sessionPersona = new Map<string, ResumeSession>();
   private heartbeatTimer?: ReturnType<typeof setInterval>;
 
   private log: (line: string) => void;
+  private resumeRetentionMs: number;
 
   constructor(
     private hooks: GatewayHooks,
@@ -142,6 +171,10 @@ export class Gateway {
     opts: GatewayOptions = {},
   ) {
     this.log = opts.log ?? ((line) => console.error(line));
+    this.resumeRetentionMs = opts.resumeRetentionMs ?? RESUME_RETENTION_MS;
+    if (!Number.isFinite(this.resumeRetentionMs) || this.resumeRetentionMs < 0) {
+      throw new RangeError('resumeRetentionMs must be a finite nonnegative number');
+    }
   }
 
   /** `live=<sessions>/<personas>` — appended to lifecycle lines so a reconnect
@@ -221,6 +254,13 @@ export class Gateway {
   }
 
   private async onFrame(session: Session, frame: ClientFrame): Promise<void> {
+    // ws still emits 'message' for frames received while a socket is CLOSING
+    // (until 'close'), and nothing the gateway sends there reaches the
+    // client. Such a frame is ignored: no handshake promotes the socket, and
+    // no rpc that arrives once a revoke has begun closing it is handled. An
+    // rpc admitted before then completes, as a request admitted before any
+    // revocation does.
+    if (!session.open) return;
     session.touch();
     switch (frame.op) {
       case 'identify':
@@ -283,9 +323,10 @@ export class Gateway {
       this.sessionLog(`${via}-failed`, session, `ready-ms=${Date.now() - t0} error="${logSafe((err as Error).message, 160)}"`);
       return;
     }
-    if (session.disconnected) {
-      // The client left while ready was being built; `send` would drop the
-      // frame silently. Say so rather than record a success nobody received.
+    if (!session.open) {
+      // The socket closed, or began closing, while ready was being built;
+      // `send` would drop the frame silently. Say so rather than record a
+      // success nobody received.
       this.sessionLog(`${via}-abandoned`, session, `ready-ms=${Date.now() - t0}`);
       return;
     }
@@ -307,9 +348,30 @@ export class Gateway {
       return;
     }
     const res = await this.hooks.enroll(d);
+    // Enrollment hooks may await external work. A closed or closing socket
+    // can't carry the result, and another identify/register may have won
+    // while we waited. Neither may be promoted into a new live session here.
+    // The hook may already have minted a persona and spent an invite use, so
+    // the discard line names what it dropped: the minted persona, or the
+    // hook's error.
+    if (session.identified || !session.open) {
+      const why = !session.open ? 'socket closed' : 'already identified';
+      const what = 'error' in res ? `error="${logSafe(res.error, 160)}"` : `minted=${logSafe(res.personaId)}`;
+      this.sessionLog('register-abandoned', session, `reason="${why}" ${what}`);
+      return;
+    }
     if ('error' in res) {
       this.sessionLog('register-rejected', session, `reason="${logSafe(res.error, 160)}"`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: res.error } });
+      session.close(4003, 'register failed');
+      return;
+    }
+    // Promotion is an identify by another door, so it takes the same check:
+    // the hook may have awaited while the minted credentials were revoked,
+    // and a session is only promoted with credentials that authenticate now.
+    if (!this.hooks.authenticate(res.token, res.personaId)) {
+      this.sessionLog('register-rejected', session, `reason="credentials no longer valid" minted=${logSafe(res.personaId)}`);
+      session.send({ op: 'invalid_session', d: { resumable: false, reason: 'credentials no longer valid' } });
       session.close(4003, 'register failed');
       return;
     }
@@ -337,10 +399,27 @@ export class Gateway {
   }
 
   private onResume(session: Session, sessionId: string, fromSeq: number): void {
-    const personaId = this.sessionPersona.get(sessionId);
+    // A handshake frame on a socket that already identified is ignored, as
+    // identify and register ignore theirs: one socket, one persona.
+    if (session.identified) return;
+    // A resume carries the last seq the client saw, a nonnegative integer,
+    // and any other seq is refused. A missing or non-numeric one would make
+    // the gap check and the replay filter both compare false, resuming the
+    // socket with nothing replayed. A refused seq is client text, so it
+    // isn't logged.
+    if (!Number.isSafeInteger(fromSeq) || fromSeq < 0) {
+      this.rejectLog('resume-rejected', session, 'reason="bad seq"');
+      session.send({ op: 'invalid_session', d: { resumable: false, reason: 'bad seq' } });
+      return;
+    }
+    this.pruneResumeState(Date.now());
+    const personaId = this.sessionPersona.get(sessionId)?.personaId;
     const stream = personaId ? this.streams.get(personaId) : undefined;
     if (!personaId || !stream) {
-      this.rejectLog('resume-rejected', session, `reason="unknown session" from-seq=${logSafe(fromSeq, 16)}`);
+      // The eight UUID characters after `sess_`, as resume-expired logs them,
+      // kept to the id alphabet: it's client text, and goes in unquoted.
+      const key = String(sessionId).slice(5, 13).replace(/[^0-9a-f-]/gi, '?');
+      this.rejectLog('resume-rejected', session, `reason="unknown session" key=${key} from-seq=${fromSeq}`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'unknown session' } });
       return;
     }
@@ -352,13 +431,17 @@ export class Gateway {
     const gap = oldest !== undefined ? fromSeq < oldest - 1 : fromSeq < stream.seq;
     if (gap) {
       this.emit(
-        `[portal-relay] session resume-rejected persona=${logSafe(personaId)} sess=${session.id.slice(5, 13)} reason="resume window exceeded" from-seq=${logSafe(fromSeq, 16)} stream-seq=${stream.seq} ${this.live()}`,
+        `[portal-relay] session resume-rejected persona=${logSafe(personaId)} sess=${session.id.slice(5, 13)} reason="resume window exceeded" from-seq=${fromSeq} stream-seq=${stream.seq} ${this.live()}`,
       );
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'resume window exceeded' } });
       return;
     }
     session.personaId = personaId;
     session.identified = true;
+    // The resumed frame supplies no replacement sessionId. Keep accepting
+    // the key the client received in ready, rather than leaking one key per
+    // reconnect or expiring a key that is still in active use.
+    session.resumeId = sessionId;
     this.register(session);
     const missed = stream.buffer.filter((e) => e.seq > fromSeq);
     for (const e of missed) session.send({ op: 'dispatch', seq: e.seq, d: e.event });
@@ -369,7 +452,7 @@ export class Gateway {
 
   private register(session: Session): void {
     this.sessions.set(session.id, session);
-    this.sessionPersona.set(session.id, session.personaId);
+    this.sessionPersona.set(session.resumeId, { personaId: session.personaId });
     let set = this.byPersona.get(session.personaId);
     if (!set) this.byPersona.set(session.personaId, (set = new Set()));
     set.add(session);
@@ -379,7 +462,13 @@ export class Gateway {
     if (session.disconnected) return;
     session.disconnected = true;
     this.sessions.delete(session.id);
-    this.byPersona.get(session.personaId)?.delete(session);
+    const live = this.byPersona.get(session.personaId);
+    live?.delete(session);
+    if (live?.size === 0) this.byPersona.delete(session.personaId);
+    const retained = this.sessionPersona.get(session.resumeId);
+    if (retained && ![...(live ?? [])].some((s) => s.resumeId === session.resumeId)) {
+      retained.expiresAt = Date.now() + this.resumeRetentionMs;
+    }
     const extra = [
       session.lastError ? `error="${logSafe(session.lastError)}"` : '',
       session.rejections ? `rejections=${session.rejections}` : '',
@@ -392,16 +481,43 @@ export class Gateway {
       `${why}${extra ? ' ' + extra : ''} age-s=${Math.round((Date.now() - session.connectedAt) / 1000)}`,
     );
     this.hooks.onClose?.(session);
-    // Keep sessionPersona for resume; it's pruned by buffer turnover.
+    // The heartbeat sweep releases expired resume keys and unused streams.
   }
 
   private reapStale(): void {
-    const cutoff = Date.now() - this.heartbeatIntervalMs * 2;
+    const now = Date.now();
+    this.pruneResumeState(now);
+    const cutoff = now - this.heartbeatIntervalMs * 2;
     for (const s of this.sessions.values()) {
       if (s.lastSeen < cutoff && !s.reaped) {
         s.reaped = true; // the socket stays in `sessions` until its close event
         this.sessionLog('heartbeat-timeout', s, `idle-s=${Math.round((Date.now() - s.lastSeen) / 1000)}`);
         s.close(4000, 'heartbeat timeout');
+      }
+    }
+  }
+
+  /** Expire disconnected keys, then release streams nobody can resume.
+   *  Dispatch does not refresh retention: a busy guild must not keep an
+   *  absent persona's replay buffer alive forever. */
+  private pruneResumeState(now: number): void {
+    const retainedPersonas = new Set<string>();
+    for (const [id, retained] of this.sessionPersona) {
+      if (retained.expiresAt !== undefined && retained.expiresAt <= now) {
+        this.sessionPersona.delete(id);
+        // An expired key is then refused as "unknown session", like a key a
+        // restart lost. The refusal names the key it was given, and this line
+        // the key that expired, so an operator can tell the two apart.
+        this.emit(
+          `[portal-relay] session resume-expired persona=${logSafe(retained.personaId)} key=${id.slice(5, 13)} ${this.live()}`,
+        );
+      } else {
+        retainedPersonas.add(retained.personaId);
+      }
+    }
+    for (const personaId of this.streams.keys()) {
+      if (!retainedPersonas.has(personaId) && !this.byPersona.has(personaId)) {
+        this.streams.delete(personaId);
       }
     }
   }
@@ -415,8 +531,10 @@ export class Gateway {
 
   /** Append an event to a persona's stream and fan out to its live sessions. */
   dispatch(personaId: string, event: PortalEvent): void {
-    const stream = this.streams.get(personaId) ?? { seq: 0, buffer: [] };
-    this.streams.set(personaId, stream);
+    const stream = this.streams.get(personaId);
+    // Only identify/register establishes a stream. An offline identity update
+    // or a late voice event must not recreate state after retention expires.
+    if (!stream) return;
     const seq = ++stream.seq;
     stream.buffer.push({ seq, event });
     if (stream.buffer.length > BUFFER_CAP) stream.buffer.shift();
@@ -443,8 +561,9 @@ export class Gateway {
 
   /**
    * Personas with a retained event stream — identified at least once since
-   * boot, live or not. Structural/rights events dispatch to these (buffered
-   * for resume) so a briefly-dropped single-session agent doesn't miss a
+   * boot and still live or within the resume window (a stream is released at
+   * the first sweep after its window ends). Structural/rights events
+   * dispatch to these (buffered for resume) so a briefly-dropped agent doesn't miss a
    * channel_create/channel_delete/capabilities_update; messages deliberately
    * do NOT (offline message catch-up rides durable read-state instead).
    */
@@ -456,10 +575,15 @@ export class Gateway {
     return this.streams.has(personaId);
   }
 
-  /** Drop a persona's stream + buffer (identity removed — not token rotation,
-   *  which keeps the stream so re-authed sessions can resume). */
+  /** Drop a persona's stream, buffer and every resume key: identity removed,
+   *  or token revoked (not self-rotation, which keeps sessions and keys).
+   *  Close its sessions first (closePersona): a socket left open would stop
+   *  receiving dispatches, since dispatch needs the stream. */
   dropStream(personaId: string): void {
     this.streams.delete(personaId);
+    for (const [id, retained] of this.sessionPersona) {
+      if (retained.personaId === personaId) this.sessionPersona.delete(id);
+    }
   }
 
   sessionsOf(personaId: string): Session[] {

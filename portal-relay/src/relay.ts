@@ -363,7 +363,8 @@ export class Relay implements GatewayHooks {
   private onPermissionChange(c: PermissionChange): void {
     // Stream-retained, not live-session — a change during a brief drop must
     // land in the resume buffer (see streamPersonas). No stream ⇒ the persona
-    // never identified since boot; its next identify rehydrates everything.
+    // has no live or resumable session (never identified since boot, or its
+    // resume window ended); its next identify rehydrates everything.
     if (!this.gateway.hasStream(c.personaId)) return;
     let channels: ChannelMeta[];
     if (c.scope === 'channel' && c.channelId) {
@@ -556,9 +557,9 @@ export class Relay implements GatewayHooks {
    * Force-push the full channel set (with current caps) to one persona's
    * stream (/resync). Upserts fix missing channels and stale caps; it cannot
    * remove stale extras the client invented — a fresh identify does that.
-   * No-op for personas with no retained stream (never identified since boot):
-   * dispatch() would CREATE a stream, silently flipping them into the
-   * stream-retained fan-out set.
+   * No-op for personas with no retained stream (no live or resumable session):
+   * dispatch() has nowhere to put the channels, and the persona's next identify
+   * sends a fresh set. The count says nothing was pushed.
    */
   resyncPersona(personaId: string): number {
     if (!this.gateway.hasStream(personaId)) return 0;
@@ -1040,6 +1041,9 @@ export class Relay implements GatewayHooks {
     if (!cur) throw rpcError('NOT_FOUND', 'no such persona');
     this.identity.upsert({ ...cur, token: hashToken(generateToken()) });
     this.gateway.closePersona(personaId);
+    // Resume authenticates by key, not token, so a kept key would let the
+    // revoked holder back in. Drop the keys and stream, as identity removal does.
+    this.gateway.dropStream(personaId);
   }
 
   /** Slug a display name + short random suffix into a unique persona id. */

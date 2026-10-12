@@ -98,6 +98,9 @@ test('register: enroll mints creds, then ready; disabled when no enroll hook', a
   // (a) enroll hook present → register returns `registered` then `ready`.
   const withEnroll: GatewayHooks = {
     ...hooks(),
+    // The minted credentials authenticate, as the relay's enroll stores them before returning.
+    authenticate: (token, personaId) =>
+      token === 'secret' || (token === 'tok-1' && personaId === 'minted-1') ? personaId : null,
     enroll: async (d) => {
       if (d.invite !== 'good') return { error: 'invite unknown' };
       return {
@@ -330,6 +333,10 @@ test('session lifecycle is logged: identify timing, auth reject, resume, close, 
     ws4.send(JSON.stringify({ op: 'identify', d: { protocolVersion: 4, token: 'secret', personaId: 'p2' } }));
     assert.equal(await closed, 1011);
     assert.ok(has(/session identify-failed persona=p2 .*ready-ms=\d+ error="discord unavailable"/), lines.join('\n'));
+
+    // Wait for the server-side close log too: the client close above can
+    // arrive first, and that late line belongs to gw, not the throwing sink.
+    await until(/session close persona=p2 .*code=1011/);
 
     // a throwing log sink neither kills the session nor skips the 1011 close
     const sinkLines = lines.length;
