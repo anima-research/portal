@@ -1,0 +1,72 @@
+name: Client CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # In a pull request, the newest run to start cancels the one in progress:
+  # usually a newer push superseding an older one, though re-running an older
+  # run cancels the current one too. Runs for distinct main commits have
+  # groups of their own, so they never cancel each other.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The two packages are separate jobs, so a failure in one never skips the
+  # other's checks.
+  protocol:
+    name: Protocol strict install, build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: portal-protocol/package-lock.json
+
+      - name: Install, build & test protocol
+        working-directory: portal-protocol
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+  client:
+    name: Client strict install, build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: portal-client/package-lock.json
+
+      # The client's imports resolve to the published protocol release its
+      # own lockfile pins, which npm ci installs into node_modules, not to
+      # ../portal-protocol's sources. So a protocol change reaches this check
+      # when the client's lockfile moves to the release that carries it, and
+      # consumers, who resolve the client's range themselves, may get a later
+      # release than the one checked here. The client's tsconfig still
+      # references ../portal-protocol as a project, so the checkout must
+      # include it.
+      - name: Install, build & test client
+        working-directory: portal-client
+        run: |
+          npm ci
+          npm run build
+          npm test

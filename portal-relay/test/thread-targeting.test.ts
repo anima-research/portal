@@ -135,11 +135,12 @@ test('send_message with a threadId that is not a thread under channelId is NOT_F
   try {
     await assert.rejects(
       rpc('send_message', { channelId: PARENT, threadId: OTHER_CHANNEL, content: 'nope' }),
-      /channel not found/,
+      // The refusal names the thread and the channel, so the caller knows which half to fix.
+      new RegExp(`thread ${OTHER_CHANNEL} is not a thread of channel ${PARENT}`),
     );
     await assert.rejects(
       rpc('send_message', { channelId: OTHER_CHANNEL, threadId: THREAD, content: 'nope' }),
-      /channel not found/,
+      new RegExp(`thread ${THREAD} is not a thread of channel ${OTHER_CHANNEL}`),
     );
     assert.equal(sent.length, 0);
   } finally {
@@ -183,7 +184,7 @@ test('fetch_history with a mismatched threadId is NOT_FOUND', async () => {
   try {
     await assert.rejects(
       rpc('fetch_history', { channelId: PARENT, threadId: OTHER_CHANNEL }),
-      /channel not found/,
+      new RegExp(`thread ${OTHER_CHANNEL} is not a thread of channel ${PARENT}`),
     );
   } finally {
     cleanup();

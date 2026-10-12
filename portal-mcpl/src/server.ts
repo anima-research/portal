@@ -846,9 +846,14 @@ export class PortalMcplServer {
 
     const lines = [`[catch-up] ${fresh.length} message(s) addressed to you while you were away:`];
     for (const p of fresh) {
-      lines.push(`— ${this.channelLabel(p.message.channelId)}: ${render(p.message)}`);
+      // A message in a thread names it: a reply goes there only with threadId.
+      const thread = p.message.threadId ? ` [thread ${p.message.threadId}]` : '';
+      lines.push(`— ${this.channelLabel(p.message.channelId)}: ${render(p.message)}${thread}`);
     }
     lines.push('[use fetch_history / fetch_around for context, then mark_read]');
+    if (fresh.some((p) => p.message.threadId)) {
+      lines.push('[to reply in a thread, call send_message with the channel as channelId and the thread as threadId]');
+    }
     const latest = fresh[fresh.length - 1].message;
     conn
       .sendRequest(method.PUSH_EVENT, {

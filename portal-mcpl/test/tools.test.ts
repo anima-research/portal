@@ -22,6 +22,13 @@ test('fetch_history exposes before/after/threadId cursors', () => {
   assert.ok('before' in props && 'after' in props && 'threadId' in props);
 });
 
+test('send_message offers threadId, and its description names both ways to post in a thread', () => {
+  const t = byName.get('send_message')!;
+  assert.ok('threadId' in t.inputSchema.properties, 'threadId is in the schema the model sees');
+  assert.match(t.description, /pass its id as threadId with its parent as channelId/);
+  assert.match(t.description, /pass the thread channel id directly as channelId/);
+});
+
 test('fetch_around requires channelId + messageId', () => {
   const t = byName.get('fetch_around')!;
   assert.deepEqual(t.inputSchema.required, ['channelId', 'messageId']);

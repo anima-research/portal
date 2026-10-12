@@ -175,9 +175,14 @@ export class PortalCcChannelServer {
         lastChannel = label;
       }
       const why = p.reasons.length ? ` (${p.reasons.join(',')})` : '';
-      lines.push(`» ${render(p.message)}${why}`);
+      // A message in a thread names it: a reply goes there only with threadId.
+      const thread = p.message.threadId ? ` [thread ${p.message.threadId}]` : '';
+      lines.push(`» ${render(p.message)}${why}${thread}`);
     }
     lines.push('\n[use fetch_history / fetch_around to read surrounding context, then mark_read]');
+    if (fresh.some((p) => p.message.threadId)) {
+      lines.push('[to reply in a thread, call send_message with the channel as channelId and the thread as threadId]');
+    }
 
     const latest = fresh[fresh.length - 1].message;
     const meta: Record<string, string> = {

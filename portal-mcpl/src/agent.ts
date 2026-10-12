@@ -161,6 +161,32 @@ export class PortalAgent {
         args = { ...args, channelId: parsed.id }; // `portal:<id>` → bare id
       }
     }
+    // threadId goes through the same chokepoint. Absent or null means no
+    // thread. Anything else must name one, in a form channelId accepts, or
+    // the call is refused here, before anything is sent or read: a value that
+    // named no thread used to be dropped, and the post landed in the parent.
+    // A threadId equal to channelId names the thread itself, which channelId
+    // alone already addresses.
+    if (args.threadId === null) {
+      args = { ...args, threadId: undefined };
+    } else if (args.threadId !== undefined) {
+      if (typeof args.threadId !== 'string' || !args.threadId.trim()) {
+        throw new Error(
+          `threadId must name a thread (its id or portal:<id>), or be null for none; got ${shortJson(args.threadId)}. ` +
+            'Nothing was sent or read.',
+        );
+      }
+      const parsed = parseChannelRef(args.threadId);
+      let threadId: string;
+      if (parsed?.kind !== 'id') {
+        const resolved = this.resolveChannelRef(args.threadId);
+        if (!resolved.ok) throw new Error(`threadId: ${resolved.message}`);
+        threadId = resolved.id;
+      } else {
+        threadId = parsed.id; // `portal:<id>` → bare id
+      }
+      args = { ...args, threadId: threadId === args.channelId ? undefined : threadId };
+    }
     switch (name) {
       case 'send_message': {
         // Discord caps content at 2000 chars — split long messages into
@@ -171,6 +197,9 @@ export class PortalAgent {
         for (let i = 0; i < chunks.length; i++) {
           const result = await this.client.sendMessage({
             channelId: str(args.channelId),
+            // Every chunk goes to the same place: a thread under channelId
+            // when one is named, else channelId itself.
+            threadId: optStr(args.threadId),
             content: chunks[i],
             ...(i === 0
               ? {
@@ -335,4 +364,14 @@ function str(v: unknown): string {
 }
 function optStr(v: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined;
+}
+/** A caller's value for an error message, bounded so a huge one isn't echoed whole. */
+function shortJson(v: unknown): string {
+  let s: string;
+  try {
+    s = JSON.stringify(v) ?? String(v);
+  } catch {
+    s = String(typeof v);
+  }
+  return s.length > 60 ? `${s.slice(0, 60)}…` : s;
 }

@@ -3,10 +3,15 @@
  * tools, adapted for the bridge: persona @-addressing, threads as first-class
  * targets, visible/invisible reactions, and read-state tools.
  */
+import { withToolClass } from './tool-classes.js';
+
 export interface ToolDefinition {
   name: string;
   description: string;
   inputSchema: { type: 'object'; properties: Record<string, unknown>; required?: string[] };
+  /** MCP extension metadata. Carries `mcpl/class` (MCPL RFC-008); other keys
+   *  must be merged alongside it, never replaced. */
+  _meta?: Record<string, unknown>;
 }
 
 const FILES_PROP = {
@@ -48,16 +53,18 @@ const PORTAL_CHANNEL_ID_DESC =
   'case-insensitive, no fuzzy matching; an ambiguous name is an error listing ' +
   'the qualified labels. Threads and categories are addressable by id only.';
 
-export const toolDefinitions: ToolDefinition[] = [
+const definitions: ToolDefinition[] = [
   {
     name: 'send_message',
     description:
       'Post a message to a channel or thread as your persona (via webhook). ' +
-      'Pass a thread channel id directly to post in a thread.',
+      'To post in a thread, pass its id as threadId with its parent as channelId, ' +
+      'or pass the thread channel id directly as channelId.',
     inputSchema: {
       type: 'object',
       properties: {
         channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC },
+        threadId: { type: 'string', description: 'Target a thread under channelId' },
         content: { type: 'string', description: 'Message content (optional if files attached)' },
         files: FILES_PROP,
         replyToId: { type: 'string', description: 'Relay message id to reply to (rendered as a quoted link)' },
@@ -402,3 +409,10 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
 ];
+
+/**
+ * The served tool surface. Every definition carries its MCPL RFC-008 class in
+ * `_meta` (see tool-classes.ts). Both tools/list paths — the MCPL server and the
+ * Claude Code channel — serve these objects via `PortalAgent.tools`.
+ */
+export const toolDefinitions: ToolDefinition[] = definitions.map(withToolClass);

@@ -1193,7 +1193,7 @@ export class Relay implements GatewayHooks {
       case 'fetch_history': {
         const p = params as RpcParams<'fetch_history'>;
         const target = await this.resolveContainer(p.channelId, p.threadId);
-        if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+        if (!target) throw containerNotFound(p.channelId, p.threadId);
         this.requireCap(personaId, target.parentChannelId, 'READ_HISTORY');
         const before = this.cursorToSnowflake(p.before);
         const after = this.cursorToSnowflake(p.after);
@@ -1372,7 +1372,7 @@ export class Relay implements GatewayHooks {
         // Typing is the shared bot's indicator, fired wherever the caller can
         // name — gate it exactly like send_message (issue #27).
         const target = await this.resolveContainer(p.channelId, p.threadId);
-        if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+        if (!target) throw containerNotFound(p.channelId, p.threadId);
         this.requireCap(
           personaId,
           target.parentChannelId,
@@ -1458,7 +1458,7 @@ export class Relay implements GatewayHooks {
   ): Promise<{ messageId: string }> {
     const cfg = this.identity.get(personaId)!;
     const target = await this.resolveContainer(p.channelId, p.threadId);
-    if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+    if (!target) throw containerNotFound(p.channelId, p.threadId);
     // Capabilities live on the parent channel; a thread never carries its own
     // grant rows, so checking the raw passed id (which may BE a thread id)
     // refuses personas whose parent-channel rights are complete.
@@ -2074,6 +2074,15 @@ function sameStringSet(a: unknown, b: string[]): boolean {
   if (!isStringArray(a)) return false;
   const values = new Set(a);
   return values.size === new Set(b).size && b.every((value) => values.has(value));
+}
+
+/** resolveContainer's refusal. With a threadId it names the thread and the
+ *  channel, so a caller knows which half to fix: the thread isn't a thread,
+ *  or isn't one of that channel's. */
+function containerNotFound(channelId: string, threadId?: string): Error & { code: string } {
+  return threadId
+    ? rpcError('NOT_FOUND', `thread ${threadId} is not a thread of channel ${channelId}`)
+    : rpcError('NOT_FOUND', 'channel not found');
 }
 
 function rpcError(code: string, message: string): Error & { code: string } {

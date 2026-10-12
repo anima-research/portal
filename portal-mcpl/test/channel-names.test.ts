@@ -186,6 +186,83 @@ test('a qualified label reaches the client as a resolved id; ids and the composi
   assert.deepEqual(sent.map((s) => s.channelId), Array(4).fill('100000000000000003'));
 });
 
+test('send_message names a thread under channelId on every chunk, and only when given', async () => {
+  const { agent, sent } = agentWithCache();
+  // Over chunkText's 1900-character limit, so it goes out as two chunks.
+  await agent.handleToolCall('send_message', {
+    channelId: '100000000000000003',
+    threadId: '200000000000000001',
+    content: 'x'.repeat(2500),
+  });
+  await agent.handleToolCall('send_message', { channelId: '100000000000000003', content: 'hi' });
+  assert.deepEqual(
+    sent.map((s) => [s.channelId, (s as { threadId?: string }).threadId]),
+    [
+      ['100000000000000003', '200000000000000001'],
+      ['100000000000000003', '200000000000000001'],
+      ['100000000000000003', undefined],
+    ],
+  );
+});
+
+test('a one-chunk send_message carries its threadId, whatever form channelId takes', async () => {
+  const { agent, sent } = agentWithCache();
+  const thread = '200000000000000001';
+  // The chokepoint rebuilds args for a label or portal: channelId; threadId must survive it.
+  for (const channelId of ['100000000000000003', '#lena_dev (Connectome)', 'portal:100000000000000003']) {
+    await agent.handleToolCall('send_message', { channelId, threadId: thread, content: 'one chunk' });
+  }
+  assert.deepEqual(
+    sent.map((s) => [s.channelId, (s as { threadId?: string }).threadId]),
+    Array(3).fill(['100000000000000003', thread]),
+  );
+});
+
+test('threadId is addressed through the chokepoint: portal:<id> is the bare id, null is none, and channelId itself is the thread', async () => {
+  const { agent, sent } = agentWithCache();
+  await agent.handleToolCall('send_message', { channelId: '100000000000000003', threadId: 'portal:200000000000000001', content: 'a' });
+  await agent.handleToolCall('send_message', { channelId: '100000000000000003', threadId: null, content: 'b' });
+  // The thread passed as channelId and again as threadId posts into that thread, as channelId alone does.
+  await agent.handleToolCall('send_message', { channelId: '200000000000000001', threadId: '200000000000000001', content: 'c' });
+  assert.deepEqual(
+    sent.map((s) => [s.channelId, (s as { threadId?: string }).threadId]),
+    [
+      ['100000000000000003', '200000000000000001'],
+      ['100000000000000003', undefined],
+      ['200000000000000001', undefined],
+    ],
+  );
+});
+
+test('a threadId that names no thread is refused before anything is sent or read', async () => {
+  const { agent, sent, client } = agentWithCache();
+  const fetched: unknown[] = [];
+  (client as unknown as { fetchHistory: unknown }).fetchHistory = async (p: unknown) => {
+    fetched.push(p);
+    return { messages: [] };
+  };
+  for (const threadId of [42, '', '   ', { id: 'x' }, false]) {
+    for (const [tool, extra] of [
+      ['send_message', { content: 'hi' }],
+      ['fetch_history', {}],
+      ['fetch_around', { messageId: '300000000000000001' }],
+    ] as const) {
+      await assert.rejects(
+        agent.handleToolCall(tool, { channelId: '100000000000000003', threadId, ...extra }),
+        /threadId must name a thread .*Nothing was sent or read\./,
+        `${tool} with threadId ${JSON.stringify(threadId)}`,
+      );
+    }
+  }
+  // A name that isn't a known channel is refused by the resolver, naming threadId.
+  await assert.rejects(
+    agent.handleToolCall('send_message', { channelId: '100000000000000003', threadId: '#no-such-thread', content: 'hi' }),
+    /^Error: threadId: /,
+  );
+  assert.deepEqual(sent, []);
+  assert.deepEqual(fetched, []);
+});
+
 test('an ambiguous or unknown name errors and NOTHING is sent', async () => {
   const { agent, sent } = agentWithCache();
   await assert.rejects(

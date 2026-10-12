@@ -12,3 +12,5 @@ export { AgentState } from './agent-state.js';
 export type { PendingPing, ChannelUnread } from './agent-state.js';
 export { toolDefinitions } from './tools.js';
 export type { ToolDefinition } from './tools.js';
+export { TOOL_CLASSES, UNCLASSED, TOOL_CLASS_VOCABULARY, withToolClass } from './tool-classes.js';
+export type { ToolClass } from './tool-classes.js';
