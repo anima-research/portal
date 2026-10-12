@@ -299,8 +299,9 @@ for (const [source, field, value] of [
       let thrown: unknown;
       try {
         await (gateway as any).onFrame({
-          // `open`: the socket can still carry frames (Session.open, which the
-          // late-enrollment guard reads once the gateway's PR #40 is in).
+          // `open`: the socket can still carry frames (Session.open). The
+          // gateway handles no frame from a socket that can't, and checks
+          // again once enrollment returns, before it replies.
           id: 'sess-invalid-register', identified: false, open: true, touch: () => {},
           send: (out: unknown) => sent.push(out),
           close: (...args: unknown[]) => closed.push(args),
