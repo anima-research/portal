@@ -1998,9 +1998,13 @@ function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirror
 }
 
 /** How logs name an invite: its label, or the start of its code. The code is a
- *  bearer credential, so a log line never carries it whole. */
+ *  bearer credential, so a log line never carries it whole: an unlabelled
+ *  invite is shown by a prefix of at most half its code, capped at the 12
+ *  characters the mint audit shows, which for a generated `inv_` code find it
+ *  in the invites file. */
 function inviteName(inv: InviteTemplate, code: string): string {
-  return inv.label || `${String(code).slice(0, 4)}…`;
+  const text = String(code);
+  return inv.label || `${text.slice(0, Math.min(12, Math.floor(text.length / 2)))}…`;
 }
 
 function isStringArray(value: unknown): value is string[] {

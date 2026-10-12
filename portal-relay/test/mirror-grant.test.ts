@@ -565,3 +565,26 @@ test('the enrollment log names an unlabelled invite without its bearer code', as
     r.cleanup();
   }
 });
+
+test('the enrollment log shows at most half an unlabelled code, and 12 characters of a generated one', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const r = makeRelay();
+  try {
+    // A hand-supplied code can be short (mint-invite.mjs takes --code), and
+    // one with a claim left is still a live credential. A generated code is
+    // `inv_` and 24 characters, so its first four tell no two apart.
+    const generated = 'inv_a1B2c3D4e5F6g7H8i9J0k1L2';
+    for (const [code, shown] of [['p43x', 'p4…'], [generated, 'inv_a1B2c3D4…']] as const) {
+      r.relay.invites.mint({ code, guildId: GUILD, maxUses: 2, grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } } });
+      const enrolled = await r.relay.enroll({ invite: code, desiredName: `logged-${code.length}` });
+      assert.ok(!('error' in enrolled), JSON.stringify(enrolled));
+      const line = lines.find((l) => l.includes(`enrolled persona "${enrolled.personaId}"`));
+      assert.ok(line, lines.join('\n'));
+      assert.ok(line.includes(`via invite (${shown})`), line);
+      assert.ok(!lines.some((l) => l.includes(code)), lines.join('\n'));
+    }
+  } finally {
+    r.cleanup();
+  }
+});
