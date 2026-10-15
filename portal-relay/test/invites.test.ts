@@ -93,7 +93,7 @@ test('a reload names each invite no claim can use, without its whole code', () =
     const path = tmpFile({
       invites: [
         { code: 'inv_secretcode123', caps: ['VIEW_CHANNEL'], maxUses: 'two' },
-        { code: 'labelled-code', label: 'onboarding', roles: ['r'], grant: { caps: ['VIEW_CHANNEL'], scope: { all: true } } },
+        { code: 'labelled-code', label: 'onboarding', roles: 'r' },
         { code: 'fine', caps: ['VIEW_CHANNEL'] },
       ],
     });
@@ -104,17 +104,8 @@ test('a reload names each invite no claim can use, without its whole code', () =
   }
   assert.deepEqual(logged, [
     '[portal-relay] invite "inv_secr…" can\'t be claimed: invite maxUses must be a non-negative integer',
-    '[portal-relay] invite "onboarding" can\'t be claimed: invite gives both roles and grant; it must give one of them',
+    '[portal-relay] invite "onboarding" can\'t be claimed: invite roles must be an array of strings',
   ]);
-});
-
-test('an invite gives roles or a grant, not both', () => {
-  const grant = { caps: ['VIEW_CHANNEL'], scope: { all: true as const } };
-  assert.equal(inviteShapeError({ code: 'a', roles: ['r'], grant } as never), 'invite gives both roles and grant; it must give one of them');
-  assert.equal(inviteShapeError({ code: 'b', roles: ['r'] } as never), null);
-  assert.equal(inviteShapeError({ code: 'c', grant } as never), null);
-  // Null reads as absent, as for every optional field.
-  assert.equal(inviteShapeError({ code: 'd', roles: null, grant } as never), null);
 });
 
 test('a code prefix is at most half the code and at most 12 characters', () => {

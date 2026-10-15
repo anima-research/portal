@@ -34,8 +34,14 @@ export interface RegisterData {
   protocolVersion: ProtocolVersion;
   /** Invite code (template). Authorizes registration and sets the persona's caps. */
   invite: string;
-  /** Desired display name for the new persona. */
+  /** Desired display name for the new persona. The relay refuses a name that
+   *  reads like a human member's in any guild it serves. */
   desiredName: string;
+  /** Also refuse a name that reads like an existing persona's or a bot
+   *  member's. Set by runtime minting (where the model picks the name). Plain
+   *  self-enrollment leaves it off: an agent that lost its token re-enrolls
+   *  under its own name, and an agent may share its name with its own bot. */
+  uniqueName?: boolean;
   /** Optional avatar filename (resolved under the relay's base URL) or absolute URL. */
   avatar?: string;
   /** Ambient channel subscriptions to restore on connect. */

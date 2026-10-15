@@ -23,6 +23,7 @@ import type {
   ChannelUnread,
   PendingPing,
   PortalMessage,
+  ThreadMissed,
 } from '@animalabs/portal-protocol';
 
 /** Compact ambient tally for one channel — counts + a peek, never bodies. */
@@ -30,10 +31,26 @@ interface Tally {
   threadId?: string;
   messages: number;
   characters: number;
+  /** createdAt of the oldest tallied message (see ChannelMissed.firstAt). */
+  firstAt?: string;
   lastAt: string;
   lastMessageId: string;
   lastPreview: string;
+  /** Threads under the channel with tallied replies (most recent THREADS_CAP).
+   *  A thread reply counts toward the channel (it shares the channel's
+   *  watermark) but isn't in the channel's own history, so a reader needs to
+   *  know which threads to fetch. */
+  threads?: Record<string, { messages: number; firstAt?: string; lastAt: string }>;
+  threadsTruncated?: boolean;
+  /** True when `threads` is complete — the tally was created by a relay that
+   *  tracks threads, or (loaded from an older one) had no thread activity.
+   *  A tally from an older relay with thread replies can't list them. */
+  tracksThreads?: boolean;
 }
+
+/** Threads tracked per channel tally; past this the oldest drop and the
+ *  tally says its thread list is incomplete. */
+const THREADS_CAP = 50;
 
 interface Inbox {
   /** channelId → highest createdAt the persona has marked read. */
@@ -105,6 +122,9 @@ export class ReadStateStore {
     if (t) {
       t.messages += 1;
       t.characters += len;
+      // Only ever LOWERED: a tally saved by an older relay has no firstAt, and
+      // its first message here is not where its unread began — leave unknown.
+      if (t.firstAt && message.createdAt < t.firstAt) t.firstAt = message.createdAt;
       t.lastAt = message.createdAt;
       t.lastMessageId = message.id;
       t.lastPreview = this.preview(message);
@@ -114,12 +134,18 @@ export class ReadStateStore {
         threadId: message.threadId,
         messages: 1,
         characters: len,
+        firstAt: message.createdAt,
         lastAt: message.createdAt,
         lastMessageId: message.id,
         lastPreview: this.preview(message),
+        tracksThreads: true,
       };
       this.evictChannels(ib);
     }
+    // The tally may already be gone: a new one for a long-quiet channel is the
+    // oldest, and evictChannels can drop it on the spot.
+    const kept = ib.tallies[channelId];
+    if (kept && message.threadId) this.tallyThread(kept, message.threadId, message.createdAt);
 
     // Pending ping (full message), deduped by id.
     if (addressedToMe && !ib.pings.some((p) => p.message.id === message.id)) {
@@ -131,17 +157,43 @@ export class ReadStateStore {
 
   /** Advance a channel's watermark, dropping pings/tally at or under the cutoff.
    *  `upto` (ISO) limits how far; omitted ⇒ read to the channel's latest. */
-  markRead(personaId: string, channelId: string, upto?: string): void {
+  markRead(
+    personaId: string,
+    channelId: string,
+    upto?: string,
+    opts: { count?: number; since?: string; keepPings?: boolean } = {},
+  ): void {
     const ib = this.inboxes.get(personaId);
     if (!ib) return;
     const cutoff = upto ?? ib.tallies[channelId]?.lastAt ?? ib.watermarks[channelId];
     if (!cutoff) return;
     const prev = ib.watermarks[channelId];
     if (!prev || cutoff > prev) ib.watermarks[channelId] = cutoff;
-    // Bodies aren't stored, so a partial mark can't subtract precisely — clear
-    // the tally and let the remainder re-accumulate from the new watermark.
-    delete ib.tallies[channelId];
-    ib.pings = ib.pings.filter((p) => p.message.channelId !== channelId || p.at > cutoff);
+    const t = ib.tallies[channelId];
+    if (t && t.lastAt > cutoff) {
+      // A PARTIAL mark: unread remains above the cutoff, and the tally is how
+      // list_unread finds this channel at all — deleting it would hide the
+      // rest until new traffic arrived. Bodies aren't stored, so the remaining
+      // count comes from the caller's `count` — applied only when this mark
+      // moved the watermark from exactly where the caller counted from (else a
+      // repeat, or an overlap with another session's mark, would subtract the
+      // same messages twice). Otherwise the count stays: overstated, never hidden.
+      const before = t.messages;
+      const moved = !prev || cutoff > prev;
+      const fromHere = (opts.since ?? undefined) === (prev ?? undefined);
+      const covered = moved && fromHere ? Math.max(0, Math.floor(opts.count ?? 0)) : 0;
+      const left = Math.max(1, before - covered);
+      t.characters = before > 0 ? Math.round((t.characters * left) / before) : t.characters;
+      t.messages = left;
+      if (t.threads) {
+        for (const [id, th] of Object.entries(t.threads)) if (th.lastAt <= cutoff) delete t.threads[id];
+      }
+    } else {
+      delete ib.tallies[channelId];
+    }
+    if (!opts.keepPings) {
+      ib.pings = ib.pings.filter((p) => p.message.channelId !== channelId || p.at > cutoff);
+    }
     this.scheduleFlush();
   }
 
@@ -170,7 +222,7 @@ export class ReadStateStore {
     const ib = this.inboxes.get(personaId);
     const t = ib?.tallies[channelId];
     if (!t) {
-      return { channelId, messages: 0, characters: 0, since: ib?.watermarks[channelId] };
+      return { channelId, messages: 0, characters: 0, since: ib?.watermarks[channelId], threads: [] };
     }
     return {
       channelId,
@@ -181,6 +233,19 @@ export class ReadStateStore {
       lastAt: t.lastAt,
       lastMessageId: t.lastMessageId,
       lastPreview: t.lastPreview,
+      ...(t.firstAt ? { firstAt: t.firstAt } : {}),
+      // A list (empty when no thread has replies) whenever it is complete. Its
+      // absence tells the reader the thread replies can't be enumerated — an
+      // older relay, or a tally it saved with thread replies already in it.
+      ...(t.tracksThreads ? { threads: Object.entries(t.threads ?? {}).map(
+        ([threadId, th]): ThreadMissed => ({
+          threadId,
+          messages: th.messages,
+          ...(th.firstAt ? { firstAt: th.firstAt } : {}),
+          lastAt: th.lastAt,
+        }),
+      ) } : {}),
+      ...(t.threadsTruncated ? { threadsTruncated: true } : {}),
     };
   }
 
@@ -190,6 +255,25 @@ export class ReadStateStore {
   }
 
   // ── Internals ──
+
+  private tallyThread(t: Tally, threadId: string, at: string): void {
+    const threads = (t.threads ??= {});
+    const th = threads[threadId];
+    if (th) {
+      th.messages += 1;
+      if (!th.firstAt || at < th.firstAt) th.firstAt = at;
+      th.lastAt = at;
+      return;
+    }
+    threads[threadId] = { messages: 1, firstAt: at, lastAt: at };
+    const ids = Object.keys(threads);
+    if (ids.length <= THREADS_CAP) return;
+    ids
+      .sort((a, b) => (threads[a].lastAt < threads[b].lastAt ? -1 : 1))
+      .slice(0, ids.length - THREADS_CAP)
+      .forEach((id) => delete threads[id]);
+    t.threadsTruncated = true;
+  }
 
   private evictChannels(ib: Inbox): void {
     const ids = Object.keys(ib.tallies);
@@ -238,6 +322,14 @@ export class ReadStateStore {
     if (!this.path) return;
     try {
       const raw = JSON.parse(readFileSync(this.path, 'utf8')) as Record<string, Inbox>;
+      // Tallies saved by a relay that didn't track threads: one with no thread
+      // activity has a complete (empty) thread list from here on; one that had
+      // thread replies can't list them, and says so by omitting `threads`.
+      for (const ib of Object.values(raw)) {
+        for (const t of Object.values(ib.tallies ?? {})) {
+          if (t.tracksThreads === undefined && !t.threadId) t.tracksThreads = true;
+        }
+      }
       this.inboxes = new Map(
         Object.entries(raw).map(([id, ib]) => [
           id,

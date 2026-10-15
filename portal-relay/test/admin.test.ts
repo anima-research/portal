@@ -13,6 +13,7 @@ import { deriveAdminGuilds } from '../src/admin/oauth.js';
 import { SessionStore } from '../src/admin/sessions.js';
 import { AuditLog } from '../src/admin/audit.js';
 import { canManageGuild, canAuthorRoles } from '../src/admin/authz.js';
+import type { ChannelLabel } from '../src/admin/names.js';
 
 const ADMINISTRATOR = '8';
 const MANAGE_GUILD = '32';
@@ -877,5 +878,126 @@ test('integration: tampered oauth state is rejected', async () => {
   } finally {
     await server.close();
     cleanup();
+  }
+});
+
+// ── Names: the panel shows names, not ids ──
+
+/** Deps where p1 holds ad-hoc grants on an archived thread, a deleted channel
+ *  and (hand-edited) another guild's channel, and the catalog has roles that
+ *  mirror Discord roles in G1 and G2. */
+function namesDeps(superadmins: string[]) {
+  const ctx = setupDeps(superadmins);
+  const labels: Record<string, ChannelLabel> = {
+    c1: { id: 'c1', name: 'general', type: 'text', guildId: 'G1' },
+    th1: { id: 'th1', name: 'design-notes', type: 'thread', guildId: 'G1', parentId: 'c1', parentName: 'general', archived: true },
+    x2: { id: 'x2', name: 'g2-private', type: 'text', guildId: 'G2' },
+  };
+  ctx.deps.resolveChannels = async (ids) =>
+    new Map(ids.map((id) => [id, labels[id] ?? { id, name: null, missing: true as const }]));
+  ctx.deps.discordRole = (rid) =>
+    rid === 'role1' ? { name: 'Mods', guildId: 'G1' } : rid === 'role2' ? { name: 'G2 Staff', guildId: 'G2' } : null;
+  ctx.deps.listAllGuilds = () => [
+    { id: 'G1', name: 'Guild One', memberCount: 1, allowed: true },
+    { id: 'G2', name: 'Guild Two', memberCount: 1, allowed: true },
+  ];
+  ctx.permissions.setChannel('p1', 'G1', 'th1', ['VIEW_CHANNEL']);
+  ctx.permissions.setChannel('p1', 'G1', 'gone1', ['VIEW_CHANNEL']);
+  ctx.permissions.setChannel('p1', 'G1', 'x2', ['VIEW_CHANNEL']);
+  ctx.permissions.setRole('mirror-g1', { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'role1' }, guildId: 'G1' });
+  ctx.permissions.setRole('mirror-g2', { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'role2' }, guildId: 'G2' });
+  ctx.permissions.setRole('chans-g2', { caps: ['VIEW_CHANNEL'], scope: { channels: ['x2'] }, guildId: 'G2' });
+  ctx.permissions.addPersonaRoles('p1', ['mirror-g2']);
+  ctx.invites.mint({ code: 'in-mirror', label: 'mirror', guildId: 'G1', uses: 0, grant: { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'role1' } } } as any);
+  ctx.deps.audit.append({ actor: { id: 'a', name: 'A', kind: 'admin' }, action: 'persona.grant.set', target: 'p1', guildId: 'G1', ok: true, after: { channelId: 'th1' } });
+  return ctx;
+}
+
+test('integration: guild-admin views carry names — and only their own guild\'s', async () => {
+  const ctx = namesDeps([]);
+  const server = new AdminServer(ctx.deps, fakeDiscordFetch([{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const session = await login(base, []);
+    const auth = { headers: { cookie: `portal_admin_session=${session}` } };
+
+    // Persona drawer: the archived thread is named with its parent. A deleted
+    // channel and another guild's channel read the same — unavailable, no name.
+    const d = await (await fetch(`${base}/admin/g/G1/personas/p1`, auth)).json();
+    assert.equal(d.names.channels.th1.name, 'design-notes');
+    assert.equal(d.names.channels.th1.parentName, 'general');
+    assert.equal(d.names.channels.th1.archived, true);
+    assert.deepEqual(d.names.channels.gone1, { id: 'gone1', name: null, unavailable: true });
+    assert.deepEqual(d.names.channels.x2, { id: 'x2', name: null, unavailable: true });
+
+    // Roles tab (asks with ?names=1): this guild's mirror role is named; G2's
+    // roles aren't even looked at. Pickers (no flag) get no names.
+    const r = await (await fetch(`${base}/admin/g/G1/roles?names=1`, auth)).json();
+    assert.deepEqual(r.names.discordRoles, { role1: { name: 'Mods', guildId: 'G1' } });
+    assert.deepEqual(r.names.channels, {});
+    assert.deepEqual(r.names.guilds, { G1: 'Guild One' });
+    const plain = await (await fetch(`${base}/admin/g/G1/roles`, auth)).json();
+    assert.equal(plain.names, undefined);
+
+    // Invites: the mirrored role is named.
+    const inv = await (await fetch(`${base}/admin/g/G1/invites`, auth)).json();
+    assert.equal(inv.names.discordRoles.role1.name, 'Mods');
+
+    // Audit: persona targets and detail channels are named.
+    const a = await (await fetch(`${base}/admin/g/G1/audit`, auth)).json();
+    assert.equal(a.names.personas.p1, 'Persona One');
+    assert.equal(a.names.channels.th1.name, 'design-notes');
+  } finally {
+    await server.close();
+    ctx.cleanup();
+  }
+});
+
+test('integration: super-admin identity detail names grants, role scopes and guilds everywhere', async () => {
+  const ctx = namesDeps(['admin1']);
+  const server = new AdminServer(ctx.deps, fakeDiscordFetch([]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const session = await login(base, []);
+    const auth = { headers: { cookie: `portal_admin_session=${session}` } };
+    const d = await (await fetch(`${base}/admin/personas/p1`, auth)).json();
+    assert.equal(d.names.channels.th1.name, 'design-notes');
+    assert.equal(d.names.channels.x2.name, 'g2-private', 'super-admin view is not clipped');
+    assert.equal(d.names.channels.gone1.missing, true);
+    assert.equal(d.names.discordRoles.role2.name, 'G2 Staff');
+    assert.equal(d.names.guilds.G1, 'Guild One');
+    assert.equal(d.names.guilds.G2, 'Guild Two');
+
+    const r = await (await fetch(`${base}/admin/g/G1/roles?names=1`, auth)).json();
+    assert.equal(r.names.discordRoles.role2.name, 'G2 Staff');
+    assert.equal(r.names.channels.x2.name, 'g2-private');
+    assert.equal(r.names.guilds.G2, 'Guild Two');
+  } finally {
+    await server.close();
+    ctx.cleanup();
+  }
+});
+
+test('integration: clearing a grant the persona does not hold is 404 and is not audited', async () => {
+  const ctx = namesDeps([]);
+  const server = new AdminServer(ctx.deps, fakeDiscordFetch([{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const session = await login(base, []);
+    const me = await (await fetch(`${base}/admin/me`, { headers: { cookie: `portal_admin_session=${session}` } })).json();
+    const hdr = { cookie: `portal_admin_session=${session}`, 'x-csrf-token': me.csrf };
+    const before = ctx.deps.audit.read({ guildId: 'G1' }).length;
+    const bogus = await fetch(`${base}/admin/g/G1/personas/p1/grants?channelId=999999999999999999`, { method: 'DELETE', headers: hdr });
+    assert.equal(bogus.status, 404);
+    assert.equal(ctx.deps.audit.read({ guildId: 'G1' }).length, before, 'no audit record for a no-op');
+    const real = await fetch(`${base}/admin/g/G1/personas/p1/grants?channelId=th1`, { method: 'DELETE', headers: hdr });
+    assert.equal(real.status, 200);
+    assert.equal((await real.json()).guildPolicy.channels?.th1, undefined);
+  } finally {
+    await server.close();
+    ctx.cleanup();
   }
 });

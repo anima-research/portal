@@ -56,6 +56,28 @@ export interface ChannelMissed {
   lastMessageId?: RelayMessageId;
   /** "author: text" preview of the most recent missed message. */
   lastPreview?: string;
+  /** createdAt of the OLDEST missed message — where the tally started. With
+   *  no `since` (the persona never marked this channel read), this is the
+   *  lower bound of what it missed: older history was never unread. */
+  firstAt?: string;
+  /** Threads under this channel with missed replies (their messages are part
+   *  of `messages`, but a read of the channel's own history doesn't include
+   *  them — fetch each with fetch_history's `threadId`). Always present from a
+   *  relay that tracks threads (empty when none); absent from an older relay. */
+  threads?: ThreadMissed[];
+  /** More threads had missed replies than the relay tracks per channel; the
+   *  `threads` list is incomplete. */
+  threadsTruncated?: boolean;
+}
+
+/** One thread's share of a channel's missed tally. */
+export interface ThreadMissed {
+  threadId: ThreadId;
+  messages: number;
+  /** createdAt of the thread's oldest missed message. */
+  firstAt?: string;
+  /** createdAt of the thread's most recent missed message. */
+  lastAt: string;
 }
 
 // ── RPC param/result shapes ──
@@ -73,6 +95,18 @@ export interface MarkReadParams {
   threadId?: ThreadId;
   /** Mark read only up to this createdAt (ISO-8601). Omit to mark read to now. */
   uptoCreatedAt?: string;
+  /** With `uptoCreatedAt` short of the latest unread: how many of the unread
+   *  messages this mark covers, so the relay keeps an accurate count of what
+   *  is left (it stores no bodies to count from). Without it, a partial mark
+   *  keeps the previous count. */
+  count?: number;
+  /** The watermark `count` was counted from. The relay subtracts `count` only
+   *  while its own watermark is still exactly this — so a repeated mark, or one
+   *  overlapping another session's, never charges the same messages twice. */
+  since?: string;
+  /** Leave pending pings in place: advance the watermark for ambient traffic
+   *  without acknowledging addressed messages the agent hasn't handled. */
+  keepPings?: boolean;
 }
 
 export interface ChannelMissedParams {

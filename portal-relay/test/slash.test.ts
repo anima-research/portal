@@ -11,7 +11,7 @@ import type { Capability } from '@animalabs/portal-protocol';
 import { IdentityStore } from '../src/identity.js';
 import { PermissionsStore } from '../src/permissions.js';
 import { InviteStore } from '../src/invites.js';
-import { SlashHandler, LEVEL_CAPS, type SlashInvocation } from '../src/slash.js';
+import { SlashHandler, LEVEL_CAPS, slashTarget, type SlashInvocation } from '../src/slash.js';
 
 const GUILD = 'g1';
 const CHAN = 'chan-1';
@@ -99,14 +99,14 @@ test('authorization: Manage-Server, superadmin, or guild delegate pass; others a
 test('/add defaults to full and reports effective caps; level=read narrows', () => {
   const t = makeHandler();
   try {
-    const reply = t.handler.handle(t.inv('add', { identity: 'evander-1' }));
+    const reply = t.handler.handle(t.inv('add', { persona: 'evander-1' }));
     assert.match(reply, /Granted \*\*Evander\*\*.*full access/);
     assert.deepEqual(
       [...t.permissions.resolve('evander-1', GUILD, CHAN)].sort(),
       [...LEVEL_CAPS.full].sort(),
     );
 
-    t.handler.handle(t.inv('add', { identity: 'evander-1', level: 'read' }));
+    t.handler.handle(t.inv('add', { persona: 'evander-1', level: 'read' }));
     assert.deepEqual(
       [...t.permissions.resolve('evander-1', GUILD, CHAN)].sort(),
       [...LEVEL_CAPS.read].sort(),
@@ -119,7 +119,7 @@ test('/add defaults to full and reports effective caps; level=read narrows', () 
 test('/add rejects unknown identities', () => {
   const t = makeHandler();
   try {
-    assert.match(t.handler.handle(t.inv('add', { identity: 'nobody' })), /No such identity/);
+    assert.match(t.handler.handle(t.inv('add', { persona: 'nobody' })), /No such persona/);
   } finally {
     t.cleanup();
   }
@@ -129,12 +129,12 @@ test('/remove clears the direct grant; warns when access persists via a role', (
   const t = makeHandler();
   try {
     // rhys: inline grant only → clean removal.
-    const clean = t.handler.handle(t.inv('remove', { identity: 'rhys-1' }));
+    const clean = t.handler.handle(t.inv('remove', { persona: 'rhys-1' }));
     assert.match(clean, /No remaining access/);
     assert.equal(t.permissions.resolve('rhys-1', GUILD, CHAN).size, 0);
 
     // ash: role-based access → clearChannel can't take it, reply must say so.
-    const warned = t.handler.handle(t.inv('remove', { identity: 'ash-1' }));
+    const warned = t.handler.handle(t.inv('remove', { persona: 'ash-1' }));
     assert.match(warned, /still\s+have/);
     assert.match(warned, /`chan-role`/);
   } finally {
@@ -157,14 +157,14 @@ test('/list shows access holders with their sources', () => {
 test('/add-role and /remove-role mutate the persona role list', () => {
   const t = makeHandler();
   try {
-    assert.match(t.handler.handle(t.inv('add-role', { identity: 'evander-1', role: 'guild-role' })), /now holds `guild-role`/);
+    assert.match(t.handler.handle(t.inv('add-role', { persona: 'evander-1', role: 'guild-role' })), /now holds `guild-role`/);
     assert.deepEqual(t.permissions.getRoleNames('evander-1'), ['guild-role']);
 
-    assert.match(t.handler.handle(t.inv('remove-role', { identity: 'evander-1', role: 'guild-role' })), /Removed `guild-role`/);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'guild-role' })), /Removed `guild-role`/);
     assert.deepEqual(t.permissions.getRoleNames('evander-1'), []);
 
-    assert.match(t.handler.handle(t.inv('remove-role', { identity: 'evander-1', role: 'guild-role' })), /doesn’t hold/);
-    assert.match(t.handler.handle(t.inv('add-role', { identity: 'evander-1', role: 'nope' })), /No such access role/);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'guild-role' })), /doesn’t hold/);
+    assert.match(t.handler.handle(t.inv('add-role', { persona: 'evander-1', role: 'nope' })), /No such access role/);
   } finally {
     t.cleanup();
   }
@@ -183,6 +183,15 @@ test('/invite mints a single-use invite carrying the given roles', () => {
     const rec = t.audits.find((r) => r.action === 'slash.invite');
     assert.equal(rec?.target, 'inv_TE…');
     assert.ok(!JSON.stringify(t.audits).includes('inv_TESTCODE'), 'no record carries the whole code');
+    // The channel it was run in rides along as a direct grant (default: write).
+    assert.match(reply, /plus write access to #general/);
+    assert.deepEqual(minted.grant, { caps: LEVEL_CAPS.write, scope: { channels: [CHAN] } });
+    assert.equal(minted.guildId, GUILD);
+
+    t.invites.revoke('inv_TESTCODE');
+    const ro = t.handler.handle(t.inv('invite', { role: 'guild-role', level: 'read' }));
+    assert.match(ro, /plus read access/);
+    assert.deepEqual(t.invites.get('inv_TESTCODE')!.grant!.caps, LEVEL_CAPS.read);
 
     assert.match(t.handler.handle(t.inv('invite', { role: 'nope' })), /No such access role/);
   } finally {
@@ -194,7 +203,7 @@ test('/ban fully revokes in this guild; cross-guild roles survive untouched (and
   const t = makeHandler();
   try {
     t.permissions.addPersonaRoles('ash-1', ['g2-role']);
-    const reply = t.handler.handle(t.inv('ban', { identity: 'ash-1' }));
+    const reply = t.handler.handle(t.inv('ban', { persona: 'ash-1' }));
     assert.match(reply, /Removed guild role.*`chan-role`/);
     assert.match(reply, /No remaining access in this guild/);
     // The g2 role is outside this admin's authority — kept, but inert here.
@@ -203,7 +212,7 @@ test('/ban fully revokes in this guild; cross-guild roles survive untouched (and
     assert.deepEqual([...t.permissions.resolveForRoles(['g2-role'], 'g2', 'any-g2-chan')], ['VIEW_CHANNEL']);
 
     // rhys (inline only): after ban, nothing resolves anywhere in the guild.
-    const clean = t.handler.handle(t.inv('ban', { identity: 'rhys-1' }));
+    const clean = t.handler.handle(t.inv('ban', { persona: 'rhys-1' }));
     assert.match(clean, /No remaining access in this guild/);
     assert.equal(t.permissions.resolve('rhys-1', GUILD, CHAN).size, 0);
     assert.equal(t.permissions.resolve('rhys-1', GUILD, OTHER_CHAN).size, 0);
@@ -216,7 +225,7 @@ test('guild containment: cross-guild roles are superadmin-only in /add-role, /re
   const t = makeHandler();
   try {
     // A guild-A Manage-Server holder must not assign another guild's roles.
-    assert.match(t.handler.handle(t.inv('add-role', { identity: 'evander-1', role: 'g2-role' })), /scoped to another guild/);
+    assert.match(t.handler.handle(t.inv('add-role', { persona: 'evander-1', role: 'g2-role' })), /scoped to another guild/);
     assert.deepEqual(t.permissions.getRoleNames('evander-1'), []);
 
     // Nor mint invites carrying them.
@@ -226,12 +235,12 @@ test('guild containment: cross-guild roles are superadmin-only in /add-role, /re
 
     // Nor strip them (removal changes access outside this guild).
     t.permissions.addPersonaRoles('ash-1', ['g2-role']);
-    assert.match(t.handler.handle(t.inv('remove-role', { identity: 'ash-1', role: 'g2-role' })), /only a portal superadmin/);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'ash-1', role: 'g2-role' })), /only a portal superadmin/);
     assert.deepEqual(t.permissions.getRoleNames('ash-1'), ['chan-role', 'g2-role']);
 
     // Superadmins are exempt on all three.
-    assert.match(t.handler.handle(t.inv('add-role', { identity: 'evander-1', role: 'g2-role' }, SUPER)), /now holds `g2-role`/);
-    assert.match(t.handler.handle(t.inv('remove-role', { identity: 'ash-1', role: 'g2-role' }, SUPER)), /Removed `g2-role`/);
+    assert.match(t.handler.handle(t.inv('add-role', { persona: 'evander-1', role: 'g2-role' }, SUPER)), /now holds `g2-role`/);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'ash-1', role: 'g2-role' }, SUPER)), /Removed `g2-role`/);
     assert.match(t.handler.handle(t.inv('invite', { role: 'g2-role' }, SUPER)), /`inv_TESTCODE`/);
   } finally {
     t.cleanup();
@@ -241,11 +250,11 @@ test('guild containment: cross-guild roles are superadmin-only in /add-role, /re
 test('/caps explains effective capabilities and their sources', () => {
   const t = makeHandler();
   try {
-    const reply = t.handler.handle(t.inv('caps', { identity: 'ash-1' }));
+    const reply = t.handler.handle(t.inv('caps', { persona: 'ash-1' }));
     assert.match(reply, /Effective: read/);
     assert.match(reply, /Via: roles: `chan-role`/);
 
-    const none = t.handler.handle(t.inv('caps', { identity: 'evander-1' }));
+    const none = t.handler.handle(t.inv('caps', { persona: 'evander-1' }));
     assert.match(none, /nothing \(no access\)/);
   } finally {
     t.cleanup();
@@ -255,7 +264,7 @@ test('/caps explains effective capabilities and their sources', () => {
 test('/resync passes through to the relay and reports the push count', () => {
   const t = makeHandler();
   try {
-    const reply = t.handler.handle(t.inv('resync', { identity: 'rhys-1' }));
+    const reply = t.handler.handle(t.inv('resync', { persona: 'rhys-1' }));
     assert.match(reply, /Re-pushed 7 channels/);
     assert.deepEqual(t.resyncs, ['rhys-1']);
   } finally {
@@ -263,10 +272,10 @@ test('/resync passes through to the relay and reports the push count', () => {
   }
 });
 
-test('autocomplete narrows identity targets per command', () => {
+test('autocomplete narrows persona targets per command', () => {
   const t = makeHandler();
   try {
-    const req = (command: string, option = 'identity', partial = '', options = {}) => ({
+    const req = (command: string, option = 'persona', partial = '', options = {}) => ({
       command, guildId: GUILD, channelId: CHAN, invoker: ADMIN, option, partial, options,
     });
     // remove/caps: channel-access holders only (ash via role, rhys via grant).
@@ -282,7 +291,7 @@ test('autocomplete narrows identity targets per command', () => {
     // add: everyone (the target usually lacks access).
     assert.equal(t.handler.autocomplete(req('add')).length, 3);
     // Prefix filter matches id and display name, case-insensitive.
-    assert.deepEqual(t.handler.autocomplete(req('add', 'identity', 'EVA')).map((c) => c.value), ['evander-1']);
+    assert.deepEqual(t.handler.autocomplete(req('add', 'persona', 'EVA')).map((c) => c.value), ['evander-1']);
   } finally {
     t.cleanup();
   }
@@ -299,7 +308,7 @@ test('autocomplete narrows roles to the guild, and to held roles for remove-role
     }
 
     const held = t.handler.autocomplete({
-      command: 'remove-role', guildId: GUILD, channelId: CHAN, invoker: ADMIN, option: 'role', partial: '', options: { identity: 'ash-1' },
+      command: 'remove-role', guildId: GUILD, channelId: CHAN, invoker: ADMIN, option: 'role', partial: '', options: { persona: 'ash-1' },
     });
     assert.deepEqual(held.map((c) => c.value), ['chan-role']);
   } finally {
@@ -310,9 +319,9 @@ test('autocomplete narrows roles to the guild, and to held roles for remove-role
 test('autocomplete is gated: unauthorized invokers enumerate nothing', () => {
   const t = makeHandler();
   try {
-    for (const option of ['identity', 'role']) {
+    for (const option of ['persona', 'role']) {
       const choices = t.handler.autocomplete({
-        command: option === 'identity' ? 'remove' : 'add-role',
+        command: option === 'persona' ? 'remove' : 'add-role',
         guildId: GUILD, channelId: CHAN, invoker: RANDO, option, partial: '', options: {},
       });
       assert.deepEqual(choices, []);
@@ -325,11 +334,53 @@ test('autocomplete is gated: unauthorized invokers enumerate nothing', () => {
 test('denied invocations do not mutate anything', () => {
   const t = makeHandler();
   try {
-    t.handler.handle(t.inv('ban', { identity: 'ash-1' }, RANDO));
+    t.handler.handle(t.inv('ban', { persona: 'ash-1' }, RANDO));
     assert.deepEqual(t.permissions.getRoleNames('ash-1'), ['chan-role']);
-    t.handler.handle(t.inv('add', { identity: 'evander-1' }, RANDO));
+    t.handler.handle(t.inv('add', { persona: 'evander-1' }, RANDO));
     assert.equal(t.permissions.resolve('evander-1', GUILD, CHAN).size, 0);
   } finally {
     t.cleanup();
+  }
+});
+
+test('run in a thread, a slash command acts on the thread\'s parent channel', () => {
+  assert.deepEqual(
+    slashTarget({ channelId: 'th1', name: 'design', isThread: true, parentId: CHAN, parentName: 'general' }),
+    { channelId: CHAN, channelName: 'general', thread: { id: 'th1', name: 'design' } },
+  );
+  assert.deepEqual(slashTarget({ channelId: CHAN, name: 'general', isThread: false }), { channelId: CHAN, channelName: 'general' });
+
+  // /invite from a thread: the grant lands on the parent, where Portal checks
+  // a thread's access — and the reply says so.
+  const t = makeHandler();
+  try {
+    const inThread: SlashInvocation = {
+      ...t.inv('invite', { role: 'guild-role' }),
+      ...slashTarget({ channelId: 'th1', name: 'design', isThread: true, parentId: CHAN, parentName: 'general' }),
+    };
+    const reply = t.handler.handle(inThread);
+    assert.deepEqual(t.invites.get('inv_TESTCODE')!.grant!.scope, { channels: [CHAN] });
+    assert.match(reply, /write access to #general \(the channel thread "design" is in/);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("every slash command fits Discord's limits (a violation fails the whole registration)", async () => {
+  const { SLASH_COMMANDS } = await import('../src/slash.js');
+  const NAME = /^[-_\p{Ll}\p{N}]{1,32}$/u;
+  for (const cmd of SLASH_COMMANDS) {
+    assert.match(cmd.name, NAME, `command name ${cmd.name}`);
+    assert.ok(cmd.description.length >= 1 && cmd.description.length <= 100, `/${cmd.name} description is ${cmd.description.length} chars`);
+    const options = cmd.options ?? [];
+    assert.ok(options.length <= 25, `/${cmd.name} has ${options.length} options`);
+    let seenOptional = false;
+    for (const o of options) {
+      assert.match(o.name, NAME, `/${cmd.name} option ${o.name}`);
+      assert.ok(o.description.length >= 1 && o.description.length <= 100, `/${cmd.name} ${o.name}: description is ${o.description.length} chars`);
+      if (o.required) assert.ok(!seenOptional, `/${cmd.name}: required option ${o.name} after an optional one`);
+      else seenOptional = true;
+      for (const c of (o as { choices?: string[] }).choices ?? []) assert.ok(c.length >= 1 && c.length <= 100, `/${cmd.name} ${o.name} choice ${c}`);
+    }
   }
 });

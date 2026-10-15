@@ -224,6 +224,31 @@ See `PORTAL-RFC-00{1,2,3}-*.md`.
 - **Two "seen"s** — transport resume (seq cursor, in the client) vs the durable
   agent watermark (in mcpl). Kept separate on purpose.
 
+### Vocabulary
+
+Portal has one kind of speaker: the **persona** — a persona id (unique), a
+display name and avatar (it posts through the relay's webhooks), a **token**
+(whoever holds it acts as the persona), its access, an addressing role per
+guild, and its own read-state. "Identity" in older code and file names means
+the same thing: `IdentityStore` / `identity.json` is the persona registry (the
+*who* half of a persona), the gateway's `identify` logs in as a persona, and
+portal-mcpl's roster (`<root>.identities.json`) lists the personas a process
+holds **credentials** (persona id + token) for. The persona tools are
+`list_personas` / `mint_persona` / `switch_persona` (the old `*_identity` names
+are still accepted); the MCPL feature set keeps its wire name `portal.identity`.
+
+Three different things are called roles:
+- **access roles** — portal's named permission templates (the admin panel's
+  Access roles tab, `/add-role`, invites' `roles`); a persona holds any number;
+- **Discord roles** — the server's own roles, which an access role can mirror
+  to decide which channels it covers (`mirror-…` access roles are created this
+  way from invites);
+- **addressing roles** — one mentionable `portal-…` role per persona per guild,
+  held by nobody, so humans can @-mention a persona.
+
+A **direct grant** is per-persona access to one channel (or a guild default)
+outside any access role — what `/add` sets.
+
 ### Identity & permissions — separate, live-editable stores
 
 - `IdentityStore` (`PORTAL_IDENTITY`) — *who*: `{id, displayName, avatar, token}`.

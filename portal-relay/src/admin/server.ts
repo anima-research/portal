@@ -18,6 +18,7 @@ import { codePrefix, type InviteStore } from '../invites.js';
 import type { PermissionsStore } from '../permissions.js';
 import type { AuditLog } from './audit.js';
 import { canManageGuild } from './authz.js';
+import { clipToGuild, type ChannelLabel, type NameMaps, type RoleLabel } from './names.js';
 import { authorizeUrl, completeOAuth, type FetchLike } from './oauth.js';
 import { SessionStore, type AdminSession } from './sessions.js';
 
@@ -48,8 +49,15 @@ export interface AdminDeps {
   };
   /** A guild's Discord roles (for `mirrorRole` pickers). */
   listRoles(guildId: string): Array<{ id: string; guildId: string; name: string; pooled: boolean }>;
-  /** A guild's channels (for `channels`-scope pickers). */
-  listChannels(guildId: string): Array<{ id: string; name?: string; type?: string }>;
+  /** A guild's channels (for `channels`-scope pickers). Threads carry their parent. */
+  listChannels(guildId: string): Array<{ id: string; name?: string; type?: string; parentId?: string }>;
+  /** Names for channel ids, including ones the gateway cache doesn't hold
+   *  (archived threads, deleted channels). Optional: without it, names come
+   *  from the allowed guilds' channel lists only. */
+  resolveChannels?(ids: string[]): Promise<Map<string, ChannelLabel>>;
+  /** A Discord role id's name + guild (any joined guild). Optional: without
+   *  it, names come from the allowed guilds' role lists. */
+  discordRole?(roleId: string): RoleLabel | null;
   /** True if the channel belongs to the guild (for clipping grants to G). */
   channelInGuild(guildId: string, channelId: string): boolean;
   /** Drop a persona's live sessions (revoke/force-rotate). */
@@ -354,39 +362,62 @@ export class AdminServer {
 
   // ── Guild-scoped reads ──
 
-  private onGuildRead(res: ServerResponse, session: AdminSession, guildId: string, resource: string, url: URL): void {
+  private async onGuildRead(res: ServerResponse, session: AdminSession, guildId: string, resource: string, url: URL): Promise<void> {
     const page = parsePage(url);
     switch (resource) {
-      case 'invites':
-        return sendJson(res, 200, paginate(this.invitesFor(guildId), page, 'invites'));
-      case 'roles':
+      case 'invites': {
+        const body = paginate(this.invitesFor(guildId), page, 'invites');
+        const scopes = (body.invites as any[]).map((inv) => inv?.grant?.scope);
+        return sendJson(res, 200, { ...body, names: await this.scopeNames(scopes, guildId) });
+      }
+      case 'roles': {
+        const catalog = this.deps.permissions.allRoles();
+        // Names only when the Roles tab asks (`?names=1`) — pickers load this
+        // endpoint too and don't show scopes. The catalog is global; a
+        // guild-admin gets names for this guild's roles only (others stay ids).
+        let names: NameMaps | undefined;
+        if (url.searchParams.get('names') === '1') {
+          const clip = session.isSuper ? undefined : guildId;
+          const roles = (Object.values(catalog) as Array<{ scope?: unknown; guildId?: string }>)
+            .filter((r) => !clip || r.guildId === clip);
+          names = await this.scopeNames(roles.map((r) => r.scope), clip);
+          names.guilds = this.guildNames(roles.map((r) => r.guildId), clip);
+        }
         return sendJson(res, 200, {
-          catalog: this.deps.permissions.allRoles(),
+          catalog,
           discordRoles: this.deps.listRoles(guildId),
           // Whether this admin may edit the catalog (super-admin only, §5.3).
           canAuthor: session.isSuper,
+          ...(names ? { names } : {}),
         });
+      }
       case 'personas':
         return sendJson(res, 200, paginate(this.personasFor(guildId, page.q), page, 'personas'));
       case 'channels':
         return sendJson(res, 200, { channels: this.deps.listChannels(guildId) });
-      case 'audit':
-        return sendJson(res, 200, { records: this.audit.read({ guildId, limit: page.limit }) });
+      case 'audit': {
+        const records = this.audit.read({ guildId, limit: page.limit });
+        return sendJson(res, 200, { records, names: await this.auditNames(records, guildId) });
+      }
       default:
         return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'no such resource' } });
     }
   }
 
-  /** Drawer detail for one persona in a guild: roles + the G-scoped policy block. */
-  private onPersonaDetail(res: ServerResponse, guildId: string, personaId: string): void {
+  /** Drawer detail for one persona in a guild: roles + the G-scoped policy
+   *  block, with names for the channels its ad-hoc grants target. */
+  private async onPersonaDetail(res: ServerResponse, guildId: string, personaId: string): Promise<void> {
     const p = this.deps.identity.get(personaId);
     if (!p) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
     const entry = this.deps.permissions.getEntry(personaId);
+    const guildPolicy = entry?.policy?.guilds?.[guildId] ?? null;
+    const labels = await this.channelLabels(Object.keys(guildPolicy?.channels ?? {}));
     sendJson(res, 200, {
       id: p.id,
       displayName: p.displayName,
       roles: entry?.roles ?? [],
-      guildPolicy: entry?.policy?.guilds?.[guildId] ?? null,
+      guildPolicy,
+      names: { channels: clipToGuild(labels, guildId) } satisfies NameMaps,
     });
   }
 
@@ -410,6 +441,7 @@ export class AdminServer {
       out.push({
         id: p.id,
         displayName: p.displayName,
+        avatarUrl: this.deps.identity.avatarUrl(p),
         roles: entry?.roles ?? [],
         hasOverride: !!entry?.policy?.guilds?.[guildId],
       });
@@ -523,6 +555,13 @@ export class AdminServer {
 
   private clearGrant(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, channelId: string | null): void {
     if (!this.deps.identity.get(personaId)) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
+    // Only a grant that exists can be cleared — and only then audited. (An
+    // arbitrary id would otherwise land in the audit log, where the panel
+    // looks its name up on Discord.)
+    const held = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId]?.channels ?? {};
+    if (channelId && !Object.prototype.hasOwnProperty.call(held, channelId)) {
+      return sendJson(res, 404, err('NOT_FOUND', 'no grant on that channel for this persona in this guild'));
+    }
     if (channelId) this.deps.permissions.clearChannel(personaId, guildId, channelId);
     else this.deps.permissions.setGuildDefault(personaId, guildId, [] as any);
     const guildPolicy = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId] ?? null;
@@ -718,6 +757,15 @@ export class AdminServer {
       // Resolve role names to their definitions so the UI can show *what* access
       // each role confers (caps + scope + the guild it's bound to).
       const roles = (entry?.roles ?? []).map((name) => ({ name, ...this.deps.permissions.getRole(name) }));
+      // Names for everything the drawer shows: ad-hoc grant channels in every
+      // guild, role scopes, and guild names (super-admin view: unclipped).
+      const policyGuilds = entry?.policy?.guilds ?? {};
+      const grantChannels = Object.values(policyGuilds).flatMap((g) => Object.keys(g?.channels ?? {}));
+      const names = await this.scopeNames(roles.map((r) => (r as { scope?: unknown }).scope), undefined, grantChannels);
+      names.guilds = this.guildNames([
+        ...Object.keys(policyGuilds),
+        ...roles.map((r) => (r as { guildId?: string }).guildId),
+      ]);
       return sendJson(res, 200, {
         id: p.id,
         displayName: p.displayName,
@@ -728,6 +776,7 @@ export class AdminServer {
         policy: entry?.policy ?? null,
         // Guilds (named) where this persona can act, and how.
         guilds: this.guildsWithAccess(id).map((gid) => ({ id: gid, name: this.guildName(gid) })),
+        names,
       });
     }
     // POST /admin/personas/:id/token — rotate/revoke (CSRF-checked).
@@ -802,6 +851,99 @@ export class AdminServer {
     if (!existsSync(full)) return sendJson(res, 404, err('NOT_FOUND', 'no such avatar'));
     res.writeHead(200, { 'content-type': IMG_CT[extname(file).toLowerCase()] ?? 'application/octet-stream', 'cache-control': 'public, max-age=300' });
     res.end(readFileSync(full));
+  }
+
+  // ── Names for ids (the panel shows names; ids only in tooltips) ──
+
+  /** Channel labels — via the resolver when wired (names archived threads and
+   *  deleted channels), else from the allowed guilds' channel lists. */
+  private async channelLabels(ids: Iterable<string>): Promise<Map<string, ChannelLabel>> {
+    const list = [...new Set([...ids].filter((id) => typeof id === 'string' && id))];
+    if (!list.length) return new Map();
+    if (this.deps.resolveChannels) return this.deps.resolveChannels(list);
+    const known = new Map<string, ChannelLabel>();
+    for (const g of this.deps.listGuilds()) {
+      for (const c of this.deps.listChannels(g.id)) {
+        known.set(c.id, { id: c.id, name: c.name ?? null, type: c.type as ChannelLabel['type'], guildId: g.id, ...(c.parentId ? { parentId: c.parentId } : {}) });
+      }
+    }
+    const out = new Map<string, ChannelLabel>();
+    for (const id of list) {
+      const l = known.get(id);
+      if (!l) { out.set(id, { id, name: null }); continue; }
+      out.set(id, l.parentId ? { ...l, parentName: known.get(l.parentId)?.name ?? null } : l);
+    }
+    return out;
+  }
+
+  /** Discord role names; with `clip`, only roles of that guild are named. */
+  private roleLabels(ids: Iterable<string | undefined>, clip?: string): Record<string, RoleLabel> {
+    const out: Record<string, RoleLabel> = {};
+    for (const id of new Set(ids)) {
+      if (!id) continue;
+      let l = this.deps.discordRole?.(id) ?? null;
+      if (!l && !this.deps.discordRole) {
+        for (const g of this.deps.listGuilds()) {
+          const r = this.deps.listRoles(g.id).find((x) => x.id === id);
+          if (r) { l = { name: r.name, guildId: r.guildId }; break; }
+        }
+      }
+      if (l && (!clip || l.guildId === clip)) out[id] = l;
+    }
+    return out;
+  }
+
+  /** Guild names from the bot's view (joined guilds); with `clip`, only that guild. */
+  private guildNames(ids: Iterable<string | undefined>, clip?: string): Record<string, string> {
+    const byId = new Map(this.deps.listAllGuilds().map((g) => [g.id, g.name] as const));
+    for (const g of this.deps.listGuilds()) if (!byId.has(g.id)) byId.set(g.id, g.name);
+    const out: Record<string, string> = {};
+    for (const id of new Set(ids)) {
+      if (!id || (clip && id !== clip)) continue;
+      const n = byId.get(id);
+      if (n) out[id] = n;
+    }
+    return out;
+  }
+
+  /** Names for the channels + Discord roles that grant/role scopes reference
+   *  (plus any extra channel ids). With `clip`, other guilds' stay unnamed. */
+  private async scopeNames(scopes: unknown[], clip?: string, extraChannels: string[] = []): Promise<NameMaps> {
+    const channels = new Set<string>(extraChannels);
+    const roles = new Set<string>();
+    for (const sc of scopes) {
+      if (!sc || typeof sc !== 'object') continue;
+      const s = sc as { channels?: unknown; mirrorRole?: unknown; mirrorRoles?: unknown };
+      if (Array.isArray(s.channels)) for (const c of s.channels) if (typeof c === 'string') channels.add(c);
+      if (typeof s.mirrorRole === 'string') roles.add(s.mirrorRole);
+      if (Array.isArray(s.mirrorRoles)) for (const r of s.mirrorRoles) if (typeof r === 'string') roles.add(r);
+    }
+    const labels = await this.channelLabels(channels);
+    return {
+      channels: clip ? clipToGuild(labels, clip) : Object.fromEntries(labels),
+      discordRoles: this.roleLabels(roles, clip),
+    };
+  }
+
+  /** Names for an audit page: persona targets, and channels in record details. */
+  private async auditNames(records: Array<Record<string, any>>, guildId: string): Promise<NameMaps> {
+    const personas: Record<string, string> = {};
+    const channels = new Set<string>();
+    for (const r of records) {
+      if (typeof r.target === 'string') {
+        const p = this.deps.identity.get(r.target);
+        if (p) personas[p.id] = p.displayName;
+      }
+      for (const k of ['detail', 'after', 'before']) {
+        const cid = r[k]?.channelId;
+        if (typeof cid === 'string') channels.add(cid);
+      }
+    }
+    return {
+      personas,
+      channels: clipToGuild(await this.channelLabels(channels), guildId),
+      guilds: this.guildNames(records.map((r) => r.target), guildId),
+    };
   }
 
   /** Guild ids a persona can possibly act in (across the bot's known guilds). */

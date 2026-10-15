@@ -18,6 +18,9 @@ export interface EnrollOptions {
   invite: string;
   /** Desired display name for the new persona. */
   desiredName: string;
+  /** Refuse the name if it reads like an existing persona's or a bot
+   *  member's, not only a human member's (see RegisterData.uniqueName). */
+  uniqueName?: boolean;
   /** Optional avatar filename/URL. */
   avatar?: string;
   /** Timeout for the enroll handshake (default 15000ms). */
@@ -70,6 +73,7 @@ export function enroll(opts: EnrollOptions): Promise<PortalCredentials> {
               protocolVersion: PORTAL_PROTOCOL_VERSION,
               invite: opts.invite,
               desiredName: opts.desiredName,
+              ...(opts.uniqueName ? { uniqueName: true } : {}),
               ...(opts.avatar ? { avatar: opts.avatar } : {}),
             },
           }),

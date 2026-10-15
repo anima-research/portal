@@ -184,8 +184,6 @@ export function inviteShapeError(inv: InviteTemplate): string | null {
     return 'invite uses must be a non-negative integer';
   }
   if (inv.roles != null && !isStringArray(inv.roles)) return 'invite roles must be an array of strings';
-  // The two are exclusive: a claim reads roles and would drop the grant unread.
-  if (inv.roles != null && inv.grant != null) return 'invite gives both roles and grant; it must give one of them';
   if (inv.caps != null && !isStringArray(inv.caps)) return 'invite caps must be an array of strings';
   // A guild the strict comparisons downstream could never match would leave
   // the persona with an inert grant and the invite spent.

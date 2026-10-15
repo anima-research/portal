@@ -17,6 +17,7 @@ import {
   MessageFlags,
   ApplicationCommandOptionType,
   AttachmentBuilder,
+  Routes,
   type Interaction,
   type Guild,
   type GuildMember,
@@ -34,10 +35,11 @@ import {
 import { existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { Capability } from '@animalabs/portal-protocol';
+import { nameKeys } from './name-policy.js';
 import { capsFromPerms } from './permissions.js';
 import type { RoleOps } from './role-pool.js';
 import type { WebhookOps, WebhookSendOpts } from './webhook-pool.js';
-import { SLASH_COMMANDS, type AutocompleteRequest, type SlashChoice, type SlashInvocation } from './slash.js';
+import { SLASH_COMMANDS, slashTarget, type AutocompleteRequest, type SlashChoice, type SlashInvocation } from './slash.js';
 
 export interface ChannelMeta {
   id: string;
@@ -536,6 +538,25 @@ export class DiscordBot implements WebhookOps, RoleOps {
 
   // ── Queries ──
 
+  /**
+   * Whether any cached member of `guildId` has a name (username, global
+   * display name, or server nickname) that reads like one of `keys` — humans
+   * always, bots only when `bots`. Reads the member cache, which holds the
+   * full roster only with the GuildMembers intent; without it this sees the
+   * members the bot has met, so the check is best-effort.
+   */
+  memberNameMatches(guildId: string, keys: ReadonlySet<string>, opts: { bots: boolean }): boolean {
+    const guild = this.client.guilds.cache.get(guildId);
+    if (!guild) return false;
+    for (const m of guild.members.cache.values()) {
+      if (m.user.bot && !opts.bots) continue;
+      for (const n of [m.user.username, m.user.globalName, m.nickname]) {
+        if (n && nameKeys(n).some((k) => keys.has(k))) return true;
+      }
+    }
+    return false;
+  }
+
   listGuilds(): Array<{ id: string; name: string; memberCount: number }> {
     return [...this.client.guilds.cache.values()]
       .filter((g) => this.guildAllowed(g.id))
@@ -751,6 +772,63 @@ export class DiscordBot implements WebhookOps, RoleOps {
     return c && 'guildId' in c ? this.metaOf(c as GuildBasedChannel) : null;
   }
 
+  /**
+   * Channel meta straight from Discord REST, leaving the gateway cache alone —
+   * for naming channels the cache doesn't hold (archived threads, deleted
+   * channels) in the admin panel. `channels.fetch` would add an archived
+   * thread to the guild + parent caches even with `cache:false`, after which
+   * it shows up in channel lists; the raw route doesn't. 'deleted' = Discord
+   * says unknown (404); 'hidden' = the bot may not see it (403) or it isn't a
+   * guild channel. Throws on anything else so a transient failure isn't
+   * remembered as gone.
+   */
+  async fetchChannelMetaUncached(channelId: string): Promise<ChannelMeta | 'deleted' | 'hidden'> {
+    if (!/^\d{5,25}$/.test(channelId)) return 'deleted';
+    let raw: any;
+    try {
+      raw = await this.client.rest.get(Routes.channel(channelId));
+    } catch (e) {
+      const status = (e as { status?: number }).status;
+      if (status === 404) return 'deleted';
+      if (status === 403) return 'hidden';
+      throw e;
+    }
+    if (!raw || typeof raw !== 'object' || !raw.guild_id) return 'hidden';
+    const type = mapChannelType(raw.type);
+    const isThread = type === 'thread';
+    return {
+      id: String(raw.id),
+      name: typeof raw.name === 'string' ? raw.name : null,
+      type,
+      parentId: isThread && raw.parent_id ? String(raw.parent_id) : undefined,
+      guildId: String(raw.guild_id),
+      archived: isThread ? !!raw.thread_metadata?.archived : undefined,
+      isThread,
+    };
+  }
+
+  /** Where a slash command acts — a thread's parent channel (see slashTarget). */
+  private slashTargetOf(channel: Interaction['channel'], channelId: string): ReturnType<typeof slashTarget> {
+    const isThread = !!channel && channel.isThread();
+    const thread = isThread ? (channel as AnyThreadChannel) : null;
+    return slashTarget({
+      channelId,
+      name: channel && 'name' in channel ? channel.name : null,
+      isThread,
+      parentId: thread?.parentId ?? null,
+      parentName: thread?.parent?.name ?? null,
+    });
+  }
+
+  /** A Discord role's name + guild, from the gateway cache of any joined guild. */
+  roleLabel(roleId: string): { name: string; guildId: string } | null {
+    for (const g of this.client.guilds.cache.values()) {
+      const r = g.roles.cache.get(roleId);
+      if (r) return { name: r.name, guildId: g.id };
+    }
+    return null;
+  }
+
   async createTextChannel(guildId: string, name: string, categoryId?: string): Promise<ChannelMeta> {
     const guild = await this.client.guilds.fetch(guildId);
     const channel = await guild.channels.create({
@@ -903,7 +981,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       const choices = handler({
         command: interaction.commandName,
         guildId: interaction.guildId,
-        channelId: interaction.channelId,
+        channelId: this.slashTargetOf(interaction.channel, interaction.channelId).channelId,
         invoker: {
           id: interaction.user.id,
           name: interaction.user.username,
@@ -923,9 +1001,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       for (const o of interaction.options.data) {
         if (o.value !== undefined) options[o.name] = String(o.value);
       }
-      const channel = interaction.channel;
-      const channelName =
-        channel && 'name' in channel && channel.name ? channel.name : interaction.channelId;
+      const target = this.slashTargetOf(interaction.channel, interaction.channelId);
       // Defer BEFORE running the handler: /list-style commands can walk
       // personas × mirror caches, and the raw-reply window is only 3s —
       // deferring first (the await yields, letting the ACK go out) buys 15
@@ -934,8 +1010,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       const content = handler({
         command: interaction.commandName,
         guildId: interaction.guildId,
-        channelId: interaction.channelId,
-        channelName,
+        ...target,
         invoker: {
           id: interaction.user.id,
           name: interaction.user.username,

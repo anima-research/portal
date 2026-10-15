@@ -19,20 +19,26 @@ portal-admin/
 point being to beat Discord's 50-bot limit). Top-level tabs are *resources*, with
 the guild as a persistent **scope** in the header — not a gate you pass first.
 
-- **Personas** *(guild-scoped)* — who can act in the selected guild. Dense table
-  (name · id · roles · override?) with search + pagination. Click a row → a
-  right-side **drawer**: assign/revoke roles (the primary mechanism), claim an
-  invite, and an *Advanced* disclosure for ad-hoc per-guild grants. A
-  "Grant access by id" action reaches a persona that has no access yet.
+- **Personas** — the one place for a persona (portal's only kind of speaker).
+  The table (avatar · name · id · access roles · direct grants?) lists the
+  personas with access in the selected guild; super-admins can switch it to
+  **All personas** (with each one's guild count). Click a row → a right-side
+  **drawer**:
+  - *Access in <guild>* — assign/revoke access roles (the primary mechanism),
+    claim an invite for the persona, and its direct grants in this guild;
+  - *(super-admin)* Profile picture, *Access in every guild* (where it can act,
+    what each access role confers, its direct grants everywhere) and **Token**
+    (rotate / revoke) — a token authenticates a persona everywhere, so it is
+    not a per-guild action.
+
+  "Grant access by id" reaches a persona that has no access yet. (The former
+  *Identities* tab was the same personas, globally; it is folded in here.)
 - **Invites** *(guild-scoped)* — mint (roles or a channel/mirror scope + `mode`),
   list, revoke. Search + pagination.
-- **Roles** *(read guild-scoped, authoring global/super-admin)* — the named
+- **Access roles** *(read guild-scoped, authoring global/super-admin)* — the named
   access-role catalog. It is **global** (shared across guilds); only super-admins
   may create/delete.
 - **Audit** *(guild-scoped)* — every mutation, newest first.
-- **Identities** *(super-admin only, GLOBAL)* — the canonical persona registry
-  across all guilds. **Token lifecycle (rotate / revoke) lives here only** — a
-  token authenticates a persona everywhere, so it is not a per-guild action.
 
 **Scope control:** if you administer exactly one guild it's shown as a fixed
 label; otherwise it's a selector. Super-admins also get an "other guild id…"
@@ -86,13 +92,14 @@ read from `GET /admin/me`.
 ## Who can do what
 
 - **Guild-admins** (Discord `ADMINISTRATOR` / `MANAGE_GUILD` / owner of a guild):
-  manage invites, persona roles, and ad-hoc per-guild grants — scoped to guilds
+  manage invites, personas' access roles, and per-guild direct grants — scoped to guilds
   they administer. They express access by mirroring their own Discord roles or
   picking channels. A guild-admin's tool for "remove an agent from my guild" is
   revoking its guild-scoped roles/grants.
 - **Super-admins** (in `PORTAL_SUPERADMINS`): all of the above in **any** guild,
-  plus authoring the global access-role catalog (Roles tab) and the **Identities**
-  tab — the global persona registry and **token lifecycle** (rotate/revoke).
+  plus authoring the global access-role catalog (Access roles tab) and, on
+  Personas, the *All personas* view, profile pictures and **token lifecycle**
+  (rotate/revoke).
 
 ## API contract (what the SPA expects)
 

@@ -112,16 +112,18 @@ export interface InviteTemplate {
   /** Human label for the invite (e.g. "claude-code"). Optional. */
   label?: string;
   /**
-   * Access-role names granted to the new persona (RFC-004, preferred). Mutually
-   * exclusive with `grant`. Resolution is live, so `mirrorRole` roles track
-   * Discord visibility over time.
+   * Access-role names granted to the new persona (RFC-004, preferred).
+   * Resolution is live, so `mirrorRole` roles track Discord visibility over
+   * time. May be combined with `grant`: the persona then holds the union.
    */
   roles?: string[];
   /**
-   * Inline scoped grant (RFC-004). Mutually exclusive with `roles`. A
-   * mirror scope here is materialized at enroll/claim time into a shared
-   * content-addressed access role (`mirror-<hash>`), so it resolves live and
-   * tracks Discord visibility over time — including channels created later.
+   * Inline scoped grant (RFC-004), applied IN ADDITION to `roles` when both
+   * are present (`/invite` uses this to pin access to the channel it was run
+   * in, whatever the roles say). A mirror scope here is materialized at
+   * enroll/claim time into a shared content-addressed access role
+   * (`mirror-<hash>`), so it resolves live and tracks Discord visibility over
+   * time — including channels created later.
    */
   grant?: { caps: Capability[]; scope: Scope };
   /** Guild the inline `grant`/scope applies to (required for non-`all` scopes). */

@@ -35,6 +35,8 @@ import { RolePool } from './role-pool.js';
 import { WebhookPool } from './webhook-pool.js';
 import { AdminServer, type AdminDeps } from './admin/server.js';
 import { AuditLog } from './admin/audit.js';
+import { ChannelNameResolver } from './admin/names.js';
+import { nameKeys } from './name-policy.js';
 import { SlashHandler } from './slash.js';
 import { VoiceBot, VoiceJoinError, type VoiceTranscript } from './voice-bot.js';
 import { VoiceSpeakError, type SpeakReceipt } from './voice-output.js';
@@ -142,6 +144,12 @@ export class Relay implements GatewayHooks {
     // admin module stays decoupled from discord.js and is unit-testable.
     if (config.admin) {
       this.audit = new AuditLog(config.admin.auditPath);
+      // Names for ids the gateway cache can't name (archived threads, deleted
+      // channels) — REST-backed, memoised, never touches the bot's cache.
+      const channelNames = new ChannelNameResolver({
+        cached: (id) => this.bot.channelMetaFromCache(id),
+        fetch: (id) => this.bot.fetchChannelMetaUncached(id),
+      });
       const deps: AdminDeps = {
         config: config.admin,
         identity: this.identity,
@@ -162,7 +170,10 @@ export class Relay implements GatewayHooks {
             id: c.id,
             name: c.name ?? undefined,
             type: c.type,
+            ...(c.parentId ? { parentId: c.parentId } : {}),
           })),
+        resolveChannels: (ids) => channelNames.resolve(ids),
+        discordRole: (roleId) => this.bot.roleLabel(roleId),
         channelInGuild: (gid, cid) => this.bot.channelForPerms(cid)?.guildId === gid,
         closePersona: (personaId) => this.gateway.closePersona(personaId),
         applyClaim: (personaId, code) => this.applyInviteAugment(personaId, code),
@@ -656,6 +667,11 @@ export class Relay implements GatewayHooks {
     // Derive the full registration result before materialization can create a
     // catalog role and activate existing references to it.
     const displayName = (d.desiredName || 'agent').slice(0, 80).trim() || 'agent';
+    const clash = this.nameClash(displayName, d.uniqueName === true);
+    if (clash) {
+      console.error(`[portal-relay] enroll refused (${checked.label ?? 'invite'}): ${clash}`);
+      return { error: clash };
+    }
     const personaId = this.mintPersonaId(checked.namePrefix ?? displayName);
     const token = generateToken(); // plaintext, returned to the agent
     const identity: PersonaIdentity = {
@@ -676,8 +692,8 @@ export class Relay implements GatewayHooks {
     if ('error' in prepared) return prepared;
 
     this.identity.upsert(identity);
-    if ('roles' in prepared) this.permissions.setPersonaRoles(personaId, prepared.roles);
-    else this.permissions.setPersonaPolicy(personaId, prepared.policy);
+    if (prepared.roles.length) this.permissions.setPersonaRoles(personaId, prepared.roles);
+    if (prepared.policy) this.permissions.setPersonaPolicy(personaId, prepared.policy);
     this.invites.consume(d.invite);
 
     // Carry the invite's default subscriptions through to this session.
@@ -688,13 +704,55 @@ export class Relay implements GatewayHooks {
   }
 
   /**
-   * Prepare the new persona's permissions before creating its identity (RFC-004).
-   * Prefers access roles, then an inline scoped grant, then deprecated blanket
-   * caps. Mirror preparation may create a shared catalog role; malformed or
-   * conflicting mirrors return an error before any store mutation.
+   * Why `name` can't be a new persona's display name, or null if it can. Names
+   * compare by nameKey (case, accents, invisible characters, separators and
+   * look-alike letters folded). Always refused: a name that reads like a HUMAN
+   * member's in any guild the relay serves — that is impersonation of a
+   * person. With `unique` (runtime minting, where a model picks the name and
+   * channel text can steer it), also an existing persona's or a bot member's.
+   * Plain self-enrollment doesn't ask for that: an agent that lost its token
+   * re-enrolls under its own name, and an agent may share its name with its
+   * own bot. The message never says which member or guild matched.
    */
-  private prepareInviteGrant(inv: InviteTemplate): { roles: string[] } | { policy: PersonaPolicy } | { error: string } {
-    if (inv.roles?.length) return { roles: inv.roles };
+  private nameClash(name: string, unique: boolean): string | null {
+    const keys = new Set(nameKeys(name));
+    if (!keys.size) return null;
+    const guilds = this.bot.listGuilds().map((g) => g.id);
+    // The human-name check reads the member cache; membersComplete() also
+    // kicks a (throttled) re-warm when it's short. A runtime mint (`unique`)
+    // waits for a complete roster rather than pass on a partial one; plain
+    // enrollment — an agent recovering its own persona — goes ahead
+    // best-effort rather than be locked out by a slow warm.
+    const incomplete = guilds.filter((gid) => !this.bot.membersComplete(gid));
+    if (incomplete.length) {
+      if (unique) return `can't check name "${name}" right now — the member list is still loading; try again in a minute`;
+      console.error(`[portal-relay] enroll name check is best-effort: member list incomplete in ${incomplete.length} guild(s)`);
+    }
+    if (guilds.some((gid) => this.bot.memberNameMatches(gid, keys, { bots: false }))) {
+      return `name "${name}" reads like a server member's name — choose a different name`;
+    }
+    if (!unique) return null;
+    if (this.identity.all().some((p) => nameKeys(p.displayName).some((k) => keys.has(k)))) {
+      return `name "${name}" reads like an existing persona's name — choose a different name`;
+    }
+    if (guilds.some((gid) => this.bot.memberNameMatches(gid, keys, { bots: true }))) {
+      return `name "${name}" reads like a server member's name — choose a different name`;
+    }
+    return null;
+  }
+
+  /**
+   * Prepare the new persona's permissions before creating its identity (RFC-004):
+   * access roles (live resolution) AND/OR an inline scoped grant. Both apply
+   * when both are present, and the persona holds the union (resolve() unions
+   * roles with inline policy). The deprecated blanket `caps` is honoured as
+   * scope:{all} with a warning. Mirror preparation may create a shared catalog
+   * role; malformed or conflicting mirrors return an error before any store
+   * mutation. An invite granting nothing beyond its roles yields a
+   * default-deny policy.
+   */
+  private prepareInviteGrant(inv: InviteTemplate): { roles: string[]; policy?: PersonaPolicy } | { error: string } {
+    const roles = inv.roles ?? [];
     let grant = inv.grant;
     if (!grant && inv.caps?.length) {
       console.error(
@@ -703,12 +761,12 @@ export class Relay implements GatewayHooks {
       );
       grant = { caps: inv.caps, scope: { all: true } };
     }
-    if (!grant) return { policy: { default: [] } }; // nothing granted → deny
+    if (!grant) return { roles, policy: { default: [] } }; // nothing granted → deny
     if (isMirrorScope(grant.scope)) {
       const role = this.materializeMirrorGrant(inv.guildId, grant.scope, grant.caps);
-      return typeof role === 'string' ? { roles: [role] } : role;
+      return typeof role === 'string' ? { roles: [...new Set([...roles, role])] } : role;
     }
-    return { policy: this.scopeToPolicy(inv.guildId, grant.scope, grant.caps) };
+    return { roles, policy: this.scopeToPolicy(inv.guildId, grant.scope, grant.caps) };
   }
 
   /**
@@ -988,21 +1046,29 @@ export class Relay implements GatewayHooks {
     if (malformed) throw rpcError('INVALID_PARAMS', malformed);
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) throw rpcError('FORBIDDEN', staleMint);
-    if (checked.roles?.length) {
-      this.permissions.addPersonaRoles(personaId, checked.roles);
-    } else {
-      const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
-      if (grant && isMirrorScope(grant.scope)) {
-        // Validate/materialize before changing the persona or consuming a use,
-        // with the same rejection reasons as enrollment.
-        const role = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
-        if (typeof role !== 'string') throw rpcError('INVALID_PARAMS', role.error);
-        this.permissions.addPersonaRoles(personaId, [role]);
-      } else if (grant) {
-        const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
-        const base = this.permissions.getPolicy(personaId) ?? { default: [] };
-        this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
-      }
+    // Roles AND grant: an /invite carries roles plus a direct grant on the
+    // channel it was run in, and an augment must apply both. Validate ALL of
+    // it before changing anything: a rejection must leave the persona as it
+    // was and the invite unconsumed — otherwise a rejected claim still grants
+    // its roles, and can be repeated past maxUses. So a mirror grant is
+    // materialized first, with the same rejection reasons as enrollment.
+    const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
+    let mirrorRole: string | undefined;
+    if (grant && isMirrorScope(grant.scope)) {
+      // Same live-role materialization as enroll; a silent snapshot here is
+      // strictly worse because an augmented persona has no reason to suspect
+      // its shiny new scope is already fossilizing.
+      const role = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
+      if (typeof role !== 'string') throw rpcError('INVALID_PARAMS', role.error);
+      mirrorRole = role;
+    }
+    if (checked.roles?.length) this.permissions.addPersonaRoles(personaId, checked.roles);
+    if (mirrorRole) {
+      this.permissions.addPersonaRoles(personaId, [mirrorRole]);
+    } else if (grant) {
+      const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
+      const base = this.permissions.getPolicy(personaId) ?? { default: [] };
+      this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
     }
     this.invites.consume(code);
     return { roles: this.permissions.getRoleNames(personaId) };
@@ -1405,7 +1471,11 @@ export class Relay implements GatewayHooks {
         };
       case 'mark_read': {
         const p = params as RpcParams<'mark_read'>;
-        this.readState.markRead(personaId, p.channelId, p.uptoCreatedAt);
+        this.readState.markRead(personaId, p.channelId, p.uptoCreatedAt, {
+          ...(typeof p.count === 'number' ? { count: p.count } : {}),
+          ...(typeof p.since === 'string' ? { since: p.since } : {}),
+          ...(p.keepPings === true ? { keepPings: true } : {}),
+        });
         return {};
       }
       case 'channel_missed': {

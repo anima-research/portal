@@ -1,7 +1,7 @@
 /* Portal Admin SPA — vanilla JS, no dependencies, no build step.
  *
- * Resource-first IA: top-level tabs (Personas / Invites / Roles / Audit, plus
- * Identities for super-admins) with a persistent guild scope in the header.
+ * Resource-first IA: top-level tabs (Personas / Invites / Access roles / Audit,
+ * plus Guilds for super-admins) with a persistent guild scope in the header.
  * Dense tables + a right-side detail drawer for editing one row at a time.
  *
  * Pure API client: every authorization decision is server-side. The CSRF token
@@ -51,8 +51,9 @@ const LIMIT = 50;
 
 const state = {
   me: null,        // { user, isSuper, guilds, csrf }
-  guildId: null,   // selected guild id (null for Identities / no guild)
+  guildId: null,   // selected guild id (null when no guild is selectable)
   tab: 'personas',
+  personaScope: 'guild', // super-admins: 'guild' (access here) or 'all' personas
   q: '',           // current search query for the active list
   offset: 0,       // current page offset for the active list
   cache: {},       // per-guild { roles, channels } caches
@@ -157,7 +158,7 @@ async function boot() {
 
   $('#user-name').textContent = (me.user && me.user.name) || 'admin';
   $('#super-badge').classList.toggle('hidden', !me.isSuper);
-  // Super-admin-only tabs (Identities, Guilds).
+  // Super-admin-only tabs (Guilds).
   for (const t of document.querySelectorAll('.tab-super')) t.classList.toggle('hidden', !me.isSuper);
 
   // Scope the switcher to guilds the bot is actually in (named) — not every
@@ -220,6 +221,10 @@ function setupScope(me, guilds) {
       }
       state.guildId = v;
       state.q = ''; state.offset = 0;
+      // Drawers were built for the previous guild (its pickers, its ids) and
+      // submit against the current one — close them rather than let a form
+      // opened in one guild write into another.
+      closeDrawer();
       render();
     });
   }
@@ -270,7 +275,10 @@ const GUILD_TABS = new Set(['personas', 'invites', 'roles', 'audit']);
 
 async function render() {
   const view = $('#view');
-  if (GUILD_TABS.has(state.tab) && !state.guildId) {
+  // Super-admins reach the global persona list (profile, token) without a
+  // guild — e.g. before the relay has joined any.
+  const globalPersonas = state.tab === 'personas' && state.me && state.me.isSuper;
+  if (GUILD_TABS.has(state.tab) && !state.guildId && !globalPersonas) {
     clear(view);
     view.appendChild(el('div', { class: 'empty' }, [
       el('p', { text: 'Select a guild to manage.' }),
@@ -285,7 +293,6 @@ async function render() {
     else if (state.tab === 'invites') await renderInvites(view);
     else if (state.tab === 'roles') await renderRoles(view);
     else if (state.tab === 'audit') await renderAudit(view);
-    else if (state.tab === 'identities') await renderIdentities(view);
     else if (state.tab === 'guilds') await renderGuilds(view);
   } catch (e) {
     clear(view);
@@ -333,76 +340,107 @@ function table(headers, rows) {
 
 function rowClick(tr) { tr.classList.add('clickable'); return tr; }
 
-// ── Personas (guild-scoped) ────────────────────────────────────────────────────
+// ── Personas ─────────────────────────────────────────────────────────────────
+// One place for a persona — the only kind of speaker portal has. The list is
+// scoped to the selected guild (personas with access there); super-admins can
+// widen it to every persona. The drawer shows what an admin of this guild may
+// change, and — for super-admins — the persona's profile, its access in every
+// guild, and its token.
 
 async function renderPersonas(view) {
-  const meta = await guildMeta();
-  const data = await api('GET', G() + '/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset }));
+  const isSuper = !!(state.me && state.me.isSuper);
+  const all = isSuper && (state.personaScope === 'all' || !state.guildId);
+  const meta = state.guildId ? await guildMeta() : null;
+  const data = all
+    ? await api('GET', '/admin/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset }))
+    : await api('GET', G() + '/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset }));
   clear(view);
 
-  const grantById = el('button', { class: 'btn btn-sm btn-primary', text: '+ Grant access by id' });
-  grantById.addEventListener('click', () => {
-    const id = (prompt('Persona id to grant access to (must already exist):') || '').trim();
-    if (id) openPersonaDrawer(id, meta);
-  });
-  view.appendChild(toolbar('Search personas with access here…', [grantById]));
+  const actions = [];
+  if (isSuper && state.guildId) {
+    const scope = el('select', { class: 'scope-select', title: 'Which personas to list' }, [
+      el('option', { value: 'guild', text: 'With access in ' + currentGuildName() }),
+      el('option', { value: 'all', text: 'All personas' }),
+    ]);
+    scope.value = all ? 'all' : 'guild';
+    scope.addEventListener('change', () => { state.personaScope = scope.value; state.q = ''; state.offset = 0; render(); });
+    actions.push(scope);
+  }
+  if (!all) {
+    const grantById = el('button', { class: 'btn btn-sm btn-primary', text: '+ Grant access by id' });
+    grantById.addEventListener('click', () => {
+      const id = (prompt('Persona id to grant access to (must already exist):') || '').trim();
+      if (id) openPersonaDrawer(id, meta);
+    });
+    actions.push(grantById);
+  }
+  view.appendChild(toolbar(all ? 'Search all personas…' : 'Search personas with access here…', actions));
 
   const rows = (data.personas || []).map((p) => rowClick(el('tr', { onclick: () => openPersonaDrawer(p.id, meta) }, [
+    el('td', { class: 'col-narrow' }, [avatarThumb(p.avatarUrl, p.displayName || p.id)]),
     el('td', { text: p.displayName || p.id }),
     el('td', {}, [el('code', { text: p.id })]),
     el('td', { class: 'cell-roles', text: (p.roles || []).join(', ') || '—' }),
-    el('td', {}, [p.hasOverride ? el('span', { class: 'badge badge-warn', text: 'override' }) : el('span', { class: 'muted', text: '—' })]),
+    all
+      ? el('td', { class: 'col-narrow', text: String(p.guildCount != null ? p.guildCount : '—') })
+      : el('td', {}, [p.hasOverride ? el('span', { class: 'badge badge-warn', text: 'direct grants' }) : el('span', { class: 'muted', text: '—' })]),
   ])));
   view.appendChild(table([
-    { label: 'Name' }, { label: 'Id' }, { label: 'Roles' }, { label: 'Override', cls: 'col-narrow' },
+    { label: '', cls: 'col-narrow' }, { label: 'Name' }, { label: 'Id' }, { label: 'Access roles' },
+    all ? { label: 'Guilds', cls: 'col-narrow' } : { label: 'Direct grants', cls: 'col-narrow' },
   ], rows));
   view.appendChild(pager(data));
-  view.appendChild(el('p', { class: 'hint muted', text: 'This list is scoped to personas with access in this guild. To add one that has none yet, use “Grant access by id”, or mint an invite for an agent to claim.' }));
+  view.appendChild(el('p', { class: 'hint muted', text: all
+    ? 'Every persona the relay knows. Open one to see its access in every guild, its profile picture and its token.'
+    : 'Personas with access in this guild. To add one that has none yet, use “Grant access by id”' +
+      (isSuper ? ', switch to All personas,' : '') + ' or mint an invite for an agent to claim.' }));
 }
 
 async function openPersonaDrawer(id, meta) {
-  let detail;
-  try { detail = await api('GET', G() + '/personas/' + encodeURIComponent(id)); }
-  catch (e) {
-    if (e.status === 404) detail = { id, displayName: id, roles: [], guildPolicy: null };
-    else { banner('Load failed: ' + e.message, 'err'); return; }
+  const isSuper = !!(state.me && state.me.isSuper);
+  // What an admin of this guild may see and change…
+  let local = null;
+  if (state.guildId) {
+    try { local = await api('GET', G() + '/personas/' + encodeURIComponent(id)); }
+    catch (e) {
+      if (e.status !== 404) { banner('Load failed: ' + e.message, 'err'); return; }
+      if (!isSuper) local = { id, displayName: id, roles: [], guildPolicy: null }; // grant by id
+    }
   }
+  // …and, for super-admins, the persona everywhere.
+  let global = null;
+  if (isSuper) {
+    try { global = await api('GET', '/admin/personas/' + encodeURIComponent(id)); }
+    catch (e) { banner('Load failed: ' + e.message, 'err'); return; }
+  }
+  const displayName = (global && global.displayName) || (local && local.displayName) || id;
   const body = el('div', { class: 'drawer-sections' });
 
-  // 1. Roles — the primary access mechanism.
-  const roleTags = el('div', { class: 'tags' });
-  function drawRoles(roles) {
-    clear(roleTags);
-    (roles || []).forEach((r) => roleTags.appendChild(el('span', { class: 'tag' }, [
-      r, el('span', { class: 'x', text: '✕', title: 'revoke', onclick: () => revokeRole(id, r, drawRoles) }),
-    ])));
-    if (!roles || !roles.length) roleTags.appendChild(el('span', { class: 'muted', text: 'no roles' }));
+  // "Access in every guild" is rebuilt after any change made in this drawer,
+  // so the two sections never disagree.
+  const everywhere = el('div', {});
+  let refreshSeq = 0; // only the latest refresh may draw: replies can land out of order
+  const refreshEverywhere = async () => {
+    if (!isSuper) return;
+    const seq = ++refreshSeq;
+    try {
+      const fresh = await api('GET', '/admin/personas/' + encodeURIComponent(id));
+      if (seq !== refreshSeq) return;
+      clear(everywhere);
+      everywhere.appendChild(everywhereSection(fresh));
+    } catch { /* keep what is shown; the next open refreshes */ }
+  };
+  if (global) body.appendChild(profileSection(id, global));
+  if (state.guildId && meta && (local || global)) {
+    body.appendChild(guildAccessSection(id, local || { id, roles: (global && global.roles || []).map((r) => r.name), guildPolicy: null }, meta, refreshEverywhere));
   }
-  drawRoles(detail.roles);
-  const roleNames = Object.keys(meta.catalog || {});
-  const addRole = el('select', {}, [el('option', { value: '', text: '+ add role…' })].concat(
-    roleNames.map((n) => el('option', { value: n, text: n }))));
-  addRole.addEventListener('change', async () => {
-    if (!addRole.value) return;
-    try { const r = await api('POST', G() + '/personas/' + encodeURIComponent(id) + '/roles', { role: addRole.value }); drawRoles(r.roles); banner('Role assigned'); addRole.value = ''; }
-    catch (e) { banner('Assign failed: ' + e.message, 'err'); }
-  });
-  body.appendChild(section('Roles', [el('div', { class: 'inline' }, [roleTags, addRole])]));
+  if (global) {
+    everywhere.appendChild(everywhereSection(global));
+    body.appendChild(everywhere);
+    body.appendChild(tokenSection(id));
+  }
 
-  // 2. Claim invite.
-  const claimCode = el('input', { type: 'text', placeholder: 'invite code' });
-  const claimBtn = el('button', { class: 'btn btn-sm', text: 'Claim' });
-  claimBtn.addEventListener('click', async () => {
-    if (!claimCode.value.trim()) return banner('Enter an invite code.', 'err');
-    try { const r = await api('POST', G() + '/personas/' + encodeURIComponent(id) + '/claim', { code: claimCode.value.trim() }); drawRoles(r.roles); banner('Augmented'); claimCode.value = ''; }
-    catch (e) { banner('Claim failed: ' + e.message, 'err'); }
-  });
-  body.appendChild(section('Claim invite', [el('div', { class: 'inline' }, [claimCode, claimBtn])]));
-
-  // 3. Advanced — ad-hoc grants, clipped to this guild.
-  body.appendChild(grantEditor(id, detail.guildPolicy, meta.channels));
-
-  openDrawer((detail.displayName || id), body);
+  openDrawer(displayName, body);
   $('#drawer-title').appendChild(el('span', { class: 'muted mono', text: ' ' + id }));
 }
 
@@ -410,31 +448,142 @@ function section(title, children) {
   return el('section', { class: 'drawer-section' }, [el('h3', { text: title }), el('div', {}, children)]);
 }
 
-function grantEditor(id, policy0, channels) {
-  const det = el('details', { class: 'advanced' }, [el('summary', { text: 'Advanced · ad-hoc grant (this guild only)' })]);
+/** Super-admin: the persona's profile picture (global — it shows everywhere). */
+function profileSection(id, d) {
+  const avImg = avatarThumb(d.avatarUrl, d.displayName || id, 'avatar-preview');
+  const avInput = el('input', { type: 'text', value: d.avatar || '', placeholder: 'https://…/avatar.png' });
+  const saveAv = el('button', { class: 'btn btn-sm btn-primary', text: 'Save' });
+  saveAv.addEventListener('click', async () => {
+    try {
+      const r = await api('PUT', '/admin/personas/' + encodeURIComponent(id) + '/avatar', { avatar: avInput.value.trim() });
+      avInput.value = r.avatar || '';
+      if (r.avatarUrl) { avImg.src = r.avatarUrl; avImg.classList.remove('hidden'); } else { avImg.removeAttribute('src'); avImg.classList.add('hidden'); }
+      banner('Avatar updated — applies to the persona’s next message.');
+    } catch (e) { banner('Avatar update failed: ' + e.message, 'err'); }
+  });
+  const clearAv = el('button', { class: 'btn btn-sm', text: 'Clear', onclick: () => { avInput.value = ''; saveAv.click(); } });
+  return section('Profile picture', [
+    el('div', { class: 'avatar-row' }, [avImg, el('div', { class: 'avatar-edit' }, [avInput, el('div', { class: 'inline' }, [saveAv, clearAv])])]),
+    avatarCropper(id, avImg, avInput),
+    el('p', { class: 'muted', text: 'Paste an image URL above, or upload + crop a file. Discord fetches it on the next message; past messages keep their old picture.' }),
+  ]);
+}
+
+/** Access in the selected guild: access roles, claiming an invite, direct grants. */
+function guildAccessSection(id, detail, meta, onChange = () => {}) {
+  const roleTags = el('div', { class: 'tags' });
+  function drawRoles(roles) {
+    clear(roleTags);
+    (roles || []).forEach((r) => roleTags.appendChild(el('span', { class: 'tag' }, [
+      r, el('span', { class: 'x', text: '✕', title: 'revoke', onclick: () => revokeRole(id, r, drawRoles, onChange) }),
+    ])));
+    if (!roles || !roles.length) roleTags.appendChild(el('span', { class: 'muted', text: 'no access roles' }));
+  }
+  drawRoles(detail.roles);
+  const roleNames = Object.keys(meta.catalog || {});
+  const addRole = el('select', {}, [el('option', { value: '', text: '+ add access role…' })].concat(
+    roleNames.map((n) => el('option', { value: n, text: n }))));
+  addRole.addEventListener('change', async () => {
+    if (!addRole.value) return;
+    try { const r = await api('POST', G() + '/personas/' + encodeURIComponent(id) + '/roles', { role: addRole.value }); drawRoles(r.roles); banner('Access role assigned'); addRole.value = ''; onChange(); }
+    catch (e) { banner('Assign failed: ' + e.message, 'err'); }
+  });
+
+  const claimCode = el('input', { type: 'text', placeholder: 'invite code' });
+  const claimBtn = el('button', { class: 'btn btn-sm', text: 'Claim' });
+  claimBtn.addEventListener('click', async () => {
+    if (!claimCode.value.trim()) return banner('Enter an invite code.', 'err');
+    try { const r = await api('POST', G() + '/personas/' + encodeURIComponent(id) + '/claim', { code: claimCode.value.trim() }); drawRoles(r.roles); banner('Invite applied'); claimCode.value = ''; onChange(); }
+    catch (e) { banner('Claim failed: ' + e.message, 'err'); }
+  });
+
+  return el('section', { class: 'drawer-section' }, [
+    el('h3', { text: 'Access in ' + currentGuildName() }),
+    el('div', { class: 'field' }, [el('label', { text: 'Access roles' }), el('div', { class: 'inline' }, [roleTags, addRole])]),
+    el('div', { class: 'field' }, [el('label', { text: 'Claim an invite for it' }), el('div', { class: 'inline' }, [claimCode, claimBtn])]),
+    grantEditor(id, detail.guildPolicy, meta.channels, withChannelList(detail.names, meta.channels), onChange),
+  ]);
+}
+
+/** Super-admin: where the persona can act, what each access role confers, and
+ *  its direct grants in every guild (read-only — edit them per guild). */
+function everywhereSection(d) {
+  const guilds = d.guilds || [];
+  const names = d.names || {};
+  names.guilds = Object.assign({}, names.guilds);
+  guilds.forEach((g) => { if (g.name && !names.guilds[g.id]) names.guilds[g.id] = g.name; });
+
+  const kids = [];
+  kids.push(el('div', { class: 'field' }, [el('label', { text: 'Guilds it can act in' }),
+    guilds.length
+      ? el('ul', { class: 'plain' }, guilds.map((g) => el('li', {}, [g.name || g.id, el('span', { class: 'muted mono', text: ' ' + g.id })])))
+      : el('p', { class: 'muted', text: 'None.' })]));
+
+  const roles = d.roles || [];
+  kids.push(el('div', { class: 'field' }, [el('label', { text: 'Access roles' }),
+    roles.length
+      ? el('ul', { class: 'plain' }, roles.map((r) => el('li', {}, [
+          el('strong', { text: r.name }),
+          r.scope ? el('span', { class: 'muted', title: scopeIds(r.scope), text: ' — ' + scopeSummary(r.scope, names) + (r.guildId ? ' in ' + guildText(r.guildId, names) : '') }) : null,
+          el('div', { class: 'cell-roles', text: capsSummary(r.caps) }),
+        ])))
+      : el('p', { class: 'muted', text: 'None.' })]));
+
+  const pol = d.policy;
+  const polGuilds = pol && pol.guilds ? Object.entries(pol.guilds) : [];
+  if ((pol && pol.default && pol.default.length) || polGuilds.length) {
+    const grantKids = [];
+    if (pol.default && pol.default.length) grantKids.push(el('div', { class: 'cell-roles', text: 'everywhere: ' + capsSummary(pol.default) }));
+    for (const [gid, gp] of polGuilds) {
+      const lines = [];
+      if (gp.default && gp.default.length) lines.push(el('div', { class: 'cell-roles', text: 'whole guild: ' + capsSummary(gp.default) }));
+      const rows = Object.entries(gp.channels || {}).sort((a, b) => byName(chanText(a[0], names), chanText(b[0], names)));
+      for (const [cid, caps] of rows) lines.push(el('div', { class: 'grant-line' }, [chanNode(cid, names), el('span', { class: 'muted', text: ' — ' + capsSummary(caps) })]));
+      grantKids.push(el('div', { class: 'grant-guild' }, [el('strong', { text: guildText(gid, names), title: gid }), ...lines]));
+    }
+    kids.push(el('div', { class: 'field' }, [el('label', { text: 'Direct grants' }), ...grantKids]));
+  }
+  return section('Access in every guild', kids);
+}
+
+/** Super-admin: the token authenticates the persona everywhere, so its
+ *  lifecycle isn't a per-guild action. */
+function tokenSection(id) {
+  const rotate = el('button', { class: 'btn btn-sm', text: 'Rotate token' });
+  rotate.addEventListener('click', () => tokenAction(id, 'rotate'));
+  const revoke = el('button', { class: 'btn btn-sm btn-danger', text: 'Revoke token' });
+  revoke.addEventListener('click', () => tokenAction(id, 'revoke'));
+  return section('Token', [
+    el('p', { class: 'muted', text: 'The token is how an agent logs in as this persona, in every guild. Rotate issues a new one (shown once); revoke invalidates it and drops live sessions.' }),
+    el('div', { class: 'inline' }, [rotate, revoke]),
+  ]);
+}
+
+function grantEditor(id, policy0, channels, names, onChange = () => {}) {
+  const det = el('details', { class: 'advanced' }, [el('summary', { text: 'Direct grants (this guild only)' })]);
   const body = el('div', {});
   function draw(policy) {
     clear(body);
     const gd = (policy && policy.default) || [];
     const chans = (policy && policy.channels) || {};
-    const keys = Object.keys(chans);
+    const keys = Object.keys(chans).sort((a, b) => byName(chanText(a, names), chanText(b, names)));
     const rows = [];
-    if (gd.length) rows.push(el('tr', {}, [el('td', { text: 'guild-default' }), el('td', { class: 'cell-roles', text: capsSummary(gd) }), el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'clear', onclick: () => clearGrant(id, null, draw) })])]));
+    if (gd.length) rows.push(el('tr', {}, [el('td', { text: 'guild-default' }), el('td', { class: 'cell-roles', text: capsSummary(gd) }), el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'clear', onclick: () => clearGrant(id, null, draw, onChange) })])]));
     for (const cid of keys) rows.push(el('tr', {}, [
-      el('td', {}, [el('code', { text: channelName(channels, cid) })]),
+      el('td', {}, [chanNode(cid, names)]),
       el('td', { class: 'cell-roles', text: capsSummary(chans[cid] || []) }),
-      el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'clear', onclick: () => clearGrant(id, cid, draw) })]),
+      el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'clear', onclick: () => clearGrant(id, cid, draw, onChange) })]),
     ]));
     body.appendChild(table([{ label: 'Target' }, { label: 'Caps' }, { label: '', cls: 'col-narrow' }], rows));
 
     const target = el('select', {}, [el('option', { value: '', text: 'guild-default' })].concat(
-      (channels || []).map((c) => el('option', { value: c.id, text: '#' + (c.name || c.id) }))));
+      channelOptions(channels).map((o) => el('option', { value: o.value, text: o.text }))));
     const caps = capsCheckboxes();
     const setBtn = el('button', { class: 'btn btn-sm btn-primary', text: 'Set grant' });
     setBtn.addEventListener('click', async () => {
       const reqBody = { caps: caps.values() };
       if (target.value) reqBody.channelId = target.value;
-      try { const r = await api('PUT', G() + '/personas/' + encodeURIComponent(id) + '/grants', reqBody); draw(r.guildPolicy); banner('Grant updated'); }
+      try { const r = await api('PUT', G() + '/personas/' + encodeURIComponent(id) + '/grants', reqBody); draw(r.guildPolicy); banner('Grant updated'); onChange(); }
       catch (e) { banner('Grant failed: ' + e.message, 'err'); }
     });
     body.appendChild(el('div', { class: 'field' }, [el('label', { text: 'Target' }), target]));
@@ -446,14 +595,14 @@ function grantEditor(id, policy0, channels) {
   return det;
 }
 
-async function clearGrant(id, channelId, draw) {
+async function clearGrant(id, channelId, draw, onChange = () => {}) {
   let path = G() + '/personas/' + encodeURIComponent(id) + '/grants';
   if (channelId) path += '?channelId=' + encodeURIComponent(channelId);
-  try { const r = await api('DELETE', path); draw(r.guildPolicy); banner('Grant cleared'); }
+  try { const r = await api('DELETE', path); draw(r.guildPolicy); banner('Grant cleared'); onChange(); }
   catch (e) { banner('Clear failed: ' + e.message, 'err'); }
 }
-async function revokeRole(id, role, drawRoles) {
-  try { const r = await api('DELETE', G() + '/personas/' + encodeURIComponent(id) + '/roles/' + encodeURIComponent(role)); drawRoles(r.roles); banner('Role revoked'); }
+async function revokeRole(id, role, drawRoles, onChange = () => {}) {
+  try { const r = await api('DELETE', G() + '/personas/' + encodeURIComponent(id) + '/roles/' + encodeURIComponent(role)); drawRoles(r.roles); banner('Access role revoked'); onChange(); }
   catch (e) { banner('Revoke failed: ' + e.message, 'err'); }
 }
 
@@ -462,6 +611,7 @@ async function revokeRole(id, role, drawRoles) {
 async function renderInvites(view) {
   const meta = await guildMeta();
   const data = await api('GET', G() + '/invites' + qs({ q: state.q, limit: LIMIT, offset: state.offset }));
+  const names = withChannelList(data.names, meta.channels, meta.discordRoles);
   clear(view);
 
   const mintBtn = el('button', { class: 'btn btn-sm btn-primary', text: '+ Mint invite' });
@@ -474,7 +624,7 @@ async function renderInvites(view) {
     el('td', {}, [el('span', { class: 'badge', text: inv.mode || 'mint' })]),
     el('td', { text: (inv.uses || 0) + '/' + (inv.maxUses != null ? inv.maxUses : '∞') }),
     el('td', { text: inv.expiresAt ? new Date(inv.expiresAt).toLocaleDateString() : 'never' }),
-    el('td', { class: 'cell-roles', text: grantSummary(inv) }),
+    el('td', { class: 'cell-roles', text: grantSummary(inv, names), title: scopeIds(inv.grant && inv.grant.scope) || undefined }),
     el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'Revoke', onclick: (e) => { e.stopPropagation(); revokeInvite(inv.code); } })]),
   ]));
   view.appendChild(table([
@@ -495,7 +645,7 @@ function openMintDrawer(meta) {
     el('option', { value: 'mirrorRole', text: 'Scope: mirror a Discord role' }),
   ]);
   const roleSel = multiSelect(Object.keys(meta.catalog || {}), 'No access roles defined.');
-  const chanSel = multiSelect((meta.channels || []).map((c) => ({ value: c.id, text: '#' + (c.name || c.id) })), 'No channels.');
+  const chanSel = multiSelect(channelOptions(meta.channels), 'No channels.');
   const mirrorSel = el('select', {}, [...(meta.discordRoles || [])].sort((a, b) => (a.name || '').localeCompare(b.name || '')).map((r) => el('option', { value: r.id, text: r.name + (r.pooled ? ' (pool)' : '') })));
   const caps = capsCheckboxes();
   const scopeArea = el('div', {});
@@ -546,17 +696,17 @@ async function revokeInvite(code) {
   catch (e) { banner('Revoke failed: ' + e.message, 'err'); }
 }
 
-function scopeSummary(scope) {
+function scopeSummary(scope, names) {
   if (!scope) return '—';
   if (scope.all) return 'all channels';
-  if (scope.channels) return 'channels[' + scope.channels.length + ']';
-  if (scope.mirrorRoles) return 'mirror[' + scope.mirrorRoles.length + ' roles]';
-  if (scope.mirrorRole) return 'mirror role ' + scope.mirrorRole;
+  if (Array.isArray(scope.channels)) return listSummary(scope.channels.map((c) => chanText(c, names)), 'no channels');
+  if (Array.isArray(scope.mirrorRoles)) return 'mirrors ' + listSummary(scope.mirrorRoles.map((r) => roleText(r, names)), 'no roles');
+  if (typeof scope.mirrorRole === 'string') return 'mirrors ' + roleText(scope.mirrorRole, names);
   return '?';
 }
-function grantSummary(inv) {
+function grantSummary(inv, names) {
   if (inv.roles && inv.roles.length) return 'roles: ' + inv.roles.join(', ');
-  if (inv.grant) return 'grant{' + scopeSummary(inv.grant.scope) + '} ' + capsSummary(inv.grant.caps);
+  if (inv.grant) return scopeSummary(inv.grant.scope, names) + ' — ' + capsSummary(inv.grant.caps);
   if (inv.caps && inv.caps.length) return 'blanket(deprecated): ' + capsSummary(inv.caps);
   return 'deny';
 }
@@ -564,30 +714,32 @@ function grantSummary(inv) {
 // ── Roles (guild-scoped read, global authoring) ─────────────────────────────────
 
 async function renderRoles(view) {
-  const { catalog, discordRoles, canAuthor } = await api('GET', G() + '/roles');
+  const meta = await guildMeta();
+  const { catalog, discordRoles, canAuthor, names: rawNames } = await api('GET', G() + '/roles' + qs({ names: '1' }));
+  const names = withChannelList(rawNames, meta.channels, discordRoles);
   clear(view);
 
   const actions = [];
   if (canAuthor) {
-    const add = el('button', { class: 'btn btn-sm btn-primary', text: '+ Define role' });
-    add.addEventListener('click', () => openRoleDrawer(discordRoles));
+    const add = el('button', { class: 'btn btn-sm btn-primary', text: '+ Define access role' });
+    add.addEventListener('click', () => openRoleDrawer(discordRoles, meta.channels));
     actions.push(add);
   }
-  view.appendChild(toolbar('Filter roles…', actions));
+  view.appendChild(toolbar('Filter access roles…', actions));
 
-  const names = Object.keys(catalog || {}).filter((n) => !state.q || n.toLowerCase().includes(state.q.toLowerCase()));
-  const rows = names.map((n) => {
+  const roleNames = Object.keys(catalog || {}).filter((n) => !state.q || n.toLowerCase().includes(state.q.toLowerCase()));
+  const rows = roleNames.map((n) => {
     const r = catalog[n];
     const cells = [
       el('td', {}, [el('code', { text: n })]),
       el('td', { class: 'cell-roles', text: (r.caps || []).join(', ') }),
-      el('td', { text: scopeSummary(r.scope) }),
-      el('td', {}, [el('code', { text: r.guildId || '—' })]),
+      el('td', { class: 'cell-roles', text: scopeSummary(r.scope, names), title: scopeIds(r.scope) }),
+      el('td', {}, [r.guildId ? el('span', { text: guildText(r.guildId, names), title: r.guildId }) : el('span', { class: 'muted', text: '—' })]),
     ];
     if (canAuthor) cells.push(el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'Delete', onclick: () => deleteRole(n) })]));
     return el('tr', {}, cells);
   });
-  const headers = [{ label: 'Name' }, { label: 'Caps' }, { label: 'Scope', cls: 'col-narrow' }, { label: 'Guild' }];
+  const headers = [{ label: 'Name' }, { label: 'Caps' }, { label: 'Scope' }, { label: 'Guild' }];
   if (canAuthor) headers.push({ label: '', cls: 'col-narrow' });
   view.appendChild(table(headers, rows));
   view.appendChild(el('p', { class: 'hint muted', text: canAuthor
@@ -595,20 +747,33 @@ async function renderRoles(view) {
     : 'The role catalog is global and authored by operators. Express access by minting invites that mirror your Discord roles or pick channels.' }));
 }
 
-function openRoleDrawer(discordRoles) {
+function openRoleDrawer(discordRoles, channels) {
+  // The guild this drawer was opened for — its pickers list this guild's
+  // channels and roles, so the role must be saved to it whatever happens to
+  // the scope switcher meanwhile.
+  const gid = state.guildId;
   const name = el('input', { type: 'text', placeholder: 'role name' });
   const caps = capsCheckboxes();
-  const guildId = el('input', { type: 'text', placeholder: 'guild id (required for mirror)', value: state.guildId || '' });
+  // Roles are guild-scoped (the API requires guildId): a role is defined in the
+  // guild being viewed, from that guild's channels and Discord roles. To define
+  // one for another guild, switch the guild scope first.
   const kind = el('select', {}, [
     el('option', { value: 'all', text: 'all channels' }),
-    el('option', { value: 'channels', text: 'channels (comma ids)' }),
+    el('option', { value: 'channels', text: 'channels' }),
     el('option', { value: 'mirrorRole', text: 'mirror Discord role' }),
-    el('option', { value: 'mirrorRoles', text: 'mirror several roles (comma ids)' }),
+    el('option', { value: 'mirrorRoles', text: 'mirror several Discord roles' }),
   ]);
-  const scopeInput = el('input', { type: 'text', placeholder: 'channel/role ids, comma-separated' });
-  const mirrorSel = el('select', {}, [...(discordRoles || [])].sort((a, b) => (a.name || '').localeCompare(b.name || '')).map((r) => el('option', { value: r.id, text: r.name })));
+  const roleOpts = [...(discordRoles || [])].sort((a, b) => (a.name || '').localeCompare(b.name || '')).map((r) => ({ value: r.id, text: r.name }));
+  const mirrorSel = el('select', {}, roleOpts.map((o) => el('option', { value: o.value, text: o.text })));
+  const mirrorMulti = multiSelect(roleOpts, 'No Discord roles.');
+  const chanMulti = multiSelect(channelOptions(channels), 'No channels.');
   const scopeArea = el('div', { class: 'field' });
-  function sync() { clear(scopeArea); if (kind.value === 'mirrorRole') scopeArea.appendChild(mirrorSel); else if (kind.value !== 'all') scopeArea.appendChild(scopeInput); }
+  function sync() {
+    clear(scopeArea);
+    if (kind.value === 'mirrorRole') scopeArea.appendChild(mirrorSel);
+    else if (kind.value === 'mirrorRoles') scopeArea.appendChild(mirrorMulti.node);
+    else if (kind.value === 'channels') scopeArea.appendChild(chanMulti.node);
+  }
   kind.addEventListener('change', sync); sync();
 
   const submit = el('button', { class: 'btn btn-primary', text: 'Create role' });
@@ -616,10 +781,10 @@ function openRoleDrawer(discordRoles) {
     if (!name.value.trim()) return banner('Name required.', 'err');
     let scope;
     if (kind.value === 'all') scope = { all: true };
-    else if (kind.value === 'mirrorRole') scope = { mirrorRole: mirrorSel.value };
-    else { const ids = scopeInput.value.split(',').map((s) => s.trim()).filter(Boolean); scope = kind.value === 'channels' ? { channels: ids } : { mirrorRoles: ids }; }
-    const role = { caps: caps.values(), scope };
-    if (guildId.value.trim()) role.guildId = guildId.value.trim();
+    else if (kind.value === 'mirrorRole') { if (!mirrorSel.value) return banner('Pick a Discord role.', 'err'); scope = { mirrorRole: mirrorSel.value }; }
+    else if (kind.value === 'mirrorRoles') { const ids = mirrorMulti.values(); if (!ids.length) return banner('Pick at least one Discord role.', 'err'); scope = { mirrorRoles: ids }; }
+    else { const ids = chanMulti.values(); if (!ids.length) return banner('Pick at least one channel.', 'err'); scope = { channels: ids }; }
+    const role = { caps: caps.values(), scope, guildId: gid };
     try { await api('POST', '/admin/roles', { name: name.value.trim(), role }); banner('Role created'); invalidateGuildMeta(); closeDrawer(); render(); }
     catch (e) { banner('Create failed: ' + e.message, 'err'); }
   });
@@ -628,7 +793,7 @@ function openRoleDrawer(discordRoles) {
     el('div', { class: 'field' }, [el('label', { text: 'Name' }), name]),
     el('div', { class: 'field' }, [el('label', { text: 'Scope kind' }), kind]),
     scopeArea,
-    el('div', { class: 'field' }, [el('label', { text: 'Guild id' }), guildId]),
+    el('div', { class: 'field' }, [el('label', { text: 'Guild' }), el('div', { title: gid, text: currentGuildName() })]),
     el('div', { class: 'field' }, [el('label', { text: 'Capabilities' }), caps.node]),
     submit,
   ]));
@@ -736,111 +901,21 @@ async function disallowGuild(g, allowedCount) {
 // ── Audit (guild-scoped) ───────────────────────────────────────────────────────
 
 async function renderAudit(view) {
-  const { records } = await api('GET', G() + '/audit' + qs({ limit: 200 }));
+  const meta = await guildMeta();
+  const { records, names: rawNames } = await api('GET', G() + '/audit' + qs({ limit: 200 }));
+  const names = withChannelList(rawNames, meta.channels);
   clear(view);
   view.appendChild(toolbar('Filter audit…', []));
   const q = state.q.toLowerCase();
-  const filtered = (records || []).filter((r) => !q || JSON.stringify(r).toLowerCase().includes(q));
+  const filtered = (records || []).filter((r) => !q || (JSON.stringify(r) + ' ' + auditTargetText(r, names)).toLowerCase().includes(q));
   const rows = filtered.map((r) => el('tr', {}, [
     el('td', { class: 'mono', text: r.ts ? new Date(r.ts).toLocaleString() : '—' }),
     el('td', {}, [(r.actor && r.actor.name) || '?', ' ', el('span', { class: 'muted', text: r.actor ? '(' + r.actor.kind + ')' : '' })]),
     el('td', {}, [el('code', { text: r.action })]),
-    el('td', { class: 'cell-roles', text: r.target || (r.detail ? JSON.stringify(r.detail) : '—') }),
+    el('td', { class: 'cell-roles', title: r.detail ? JSON.stringify(r.detail) : undefined }, auditTarget(r, names)),
     el('td', {}, [el('span', { class: r.ok ? 'badge-ok' : 'badge-no', text: r.ok ? '✓' : '✗' })]),
   ]));
   view.appendChild(table([{ label: 'Time' }, { label: 'Actor' }, { label: 'Action' }, { label: 'Target' }, { label: 'OK', cls: 'col-narrow' }], rows));
-}
-
-// ── Identities (super-admin, GLOBAL) ────────────────────────────────────────────
-
-async function renderIdentities(view) {
-  const data = await api('GET', '/admin/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset }));
-  clear(view);
-  view.appendChild(toolbar('Search all personas…', []));
-  const rows = (data.personas || []).map((p) => rowClick(el('tr', { onclick: () => openIdentityDrawer(p.id) }, [
-    el('td', { class: 'col-narrow' }, [avatarThumb(p.avatarUrl, p.displayName || p.id)]),
-    el('td', { text: p.displayName || p.id }),
-    el('td', {}, [el('code', { text: p.id })]),
-    el('td', { class: 'cell-roles', text: (p.roles || []).join(', ') || '—' }),
-    el('td', { class: 'col-narrow', text: String(p.guildCount != null ? p.guildCount : '—') }),
-  ])));
-  view.appendChild(table([{ label: '', cls: 'col-narrow' }, { label: 'Name' }, { label: 'Id' }, { label: 'Roles' }, { label: 'Guilds', cls: 'col-narrow' }], rows));
-  view.appendChild(pager(data));
-  view.appendChild(el('p', { class: 'hint muted', text: 'Global identity registry. Token lifecycle (rotate / revoke) lives here only — a token authenticates a persona everywhere, so it is not a per-guild action.' }));
-}
-
-async function openIdentityDrawer(id) {
-  let d;
-  try { d = await api('GET', '/admin/personas/' + encodeURIComponent(id)); }
-  catch (e) { banner('Load failed: ' + e.message, 'err'); return; }
-  const body = el('div', { class: 'drawer-sections' });
-
-  // Profile picture (global identity).
-  const avImg = avatarThumb(d.avatarUrl, d.displayName || id, 'avatar-preview');
-  const avInput = el('input', { type: 'text', value: d.avatar || '', placeholder: 'https://…/avatar.png' });
-  const saveAv = el('button', { class: 'btn btn-sm btn-primary', text: 'Save' });
-  saveAv.addEventListener('click', async () => {
-    try {
-      const r = await api('PUT', '/admin/personas/' + encodeURIComponent(id) + '/avatar', { avatar: avInput.value.trim() });
-      avInput.value = r.avatar || '';
-      if (r.avatarUrl) { avImg.src = r.avatarUrl; avImg.classList.remove('hidden'); } else { avImg.removeAttribute('src'); avImg.classList.add('hidden'); }
-      banner('Avatar updated — applies to the persona’s next message.');
-    } catch (e) { banner('Avatar update failed: ' + e.message, 'err'); }
-  });
-  const clearAv = el('button', { class: 'btn btn-sm', text: 'Clear', onclick: () => { avInput.value = ''; saveAv.click(); } });
-  body.appendChild(section('Profile picture', [
-    el('div', { class: 'avatar-row' }, [avImg, el('div', { class: 'avatar-edit' }, [avInput, el('div', { class: 'inline' }, [saveAv, clearAv])])]),
-    avatarCropper(id, avImg, avInput),
-    el('p', { class: 'muted', text: 'Paste an image URL above, or upload + crop a file. Discord fetches it on the next message; past messages keep their old picture.' }),
-  ]));
-
-  const guilds = d.guilds || [];
-  const gname = {}; guilds.forEach((g) => { gname[g.id] = g.name; });
-
-  body.appendChild(section('Access in guilds', [
-    guilds.length
-      ? el('ul', { class: 'plain' }, guilds.map((g) => el('li', {}, [g.name || g.id, el('span', { class: 'muted mono', text: ' ' + g.id })])))
-      : el('p', { class: 'muted', text: 'No guild access.' }),
-  ]));
-
-  // Roles — show what each confers (caps + scope + bound guild).
-  const roles = d.roles || [];
-  body.appendChild(section('Roles', [
-    roles.length
-      ? el('ul', { class: 'plain' }, roles.map((r) => el('li', {}, [
-          el('strong', { text: r.name }),
-          r.scope ? el('span', { class: 'muted', text: ' — ' + scopeSummary(r.scope) + (r.guildId ? ' @ ' + (gname[r.guildId] || r.guildId) : '') }) : null,
-          el('div', { class: 'cell-roles', text: capsSummary(r.caps) }),
-        ])))
-      : el('p', { class: 'muted', text: 'No roles.' }),
-  ]));
-
-  // Ad-hoc per-persona grants (inline policy), if any.
-  const pol = d.policy;
-  const polGuilds = pol && pol.guilds ? Object.entries(pol.guilds) : [];
-  if ((pol && pol.default && pol.default.length) || polGuilds.length) {
-    const kids = [];
-    if (pol.default && pol.default.length) kids.push(el('div', { class: 'cell-roles', text: 'global default: ' + capsSummary(pol.default) }));
-    for (const [gid, gp] of polGuilds) {
-      const lines = [];
-      if (gp.default && gp.default.length) lines.push(el('div', { class: 'cell-roles', text: 'guild default: ' + capsSummary(gp.default) }));
-      for (const [cid, caps] of Object.entries(gp.channels || {})) lines.push(el('div', { class: 'cell-roles' }, [el('code', { text: cid }), ': ' + capsSummary(caps)]));
-      kids.push(el('div', { class: 'grant-guild' }, [el('strong', { text: gname[gid] || gid }), el('span', { class: 'muted mono', text: ' ' + gid }), ...lines]));
-    }
-    body.appendChild(section('Ad-hoc grants', kids));
-  }
-
-  const rotate = el('button', { class: 'btn btn-sm', text: 'Rotate token' });
-  rotate.addEventListener('click', () => tokenAction(id, 'rotate'));
-  const revoke = el('button', { class: 'btn btn-sm btn-danger', text: 'Revoke token' });
-  revoke.addEventListener('click', () => tokenAction(id, 'revoke'));
-  body.appendChild(section('Token', [
-    el('p', { class: 'muted', text: 'Rotate issues a new token (shown once). Revoke invalidates it and drops live sessions.' }),
-    el('div', { class: 'inline' }, [rotate, revoke]),
-  ]));
-
-  openDrawer(d.displayName || id, body);
-  $('#drawer-title').appendChild(el('span', { class: 'muted mono', text: ' ' + id }));
 }
 
 async function tokenAction(id, action) {
@@ -1005,7 +1080,130 @@ function multiSelect(options, emptyText) {
   return { node, values: () => Array.from(node.selectedOptions).map((o) => o.value) };
 }
 
-function channelName(channels, cid) { const c = (channels || []).find((x) => x.id === cid); return c ? '#' + (c.name || cid) : cid; }
+// ── Names ─────────────────────────────────────────────────────────────────────
+// API responses carry `names` maps — {channels, discordRoles, guilds, personas},
+// keyed by id — so the panel shows names and keeps ids in tooltips. Channel
+// labels come from the relay, which also names archived threads and deleted
+// channels (the guild channel list only holds live ones).
+
+/** Fold the guild's live channel list (and Discord roles) under the server's
+ *  name maps; the server's labels win (they carry parent names, flags). */
+function withChannelList(names, channels, discordRoles) {
+  const out = Object.assign({}, names || {});
+  const byId = {};
+  for (const c of channels || []) byId[c.id] = c;
+  const chans = {};
+  for (const c of channels || []) {
+    const p = c.parentId ? byId[c.parentId] : null;
+    chans[c.id] = { id: c.id, name: c.name || null, type: c.type, parentId: c.parentId, parentName: p ? p.name || null : undefined };
+  }
+  out.channels = Object.assign(chans, out.channels || {});
+  const roles = {};
+  for (const r of discordRoles || []) roles[r.id] = { name: r.name, guildId: r.guildId };
+  out.discordRoles = Object.assign(roles, out.discordRoles || {});
+  return out;
+}
+
+/** Plain-text channel name: "#general", "#general › thread", or a stand-in. */
+function chanText(cid, names) {
+  const l = names && names.channels && names.channels[cid];
+  if (!l) return cid;
+  if (l.unavailable) return 'unavailable channel';
+  if (l.hidden) return 'channel hidden from the bot';
+  if (l.missing) return 'deleted channel';
+  if (!l.name) return cid;
+  if (l.type === 'category') return l.name + ' (category)';
+  return '#' + (l.parentName ? l.parentName + ' › ' : '') + l.name;
+}
+
+/** Channel name as a node: name + small status tags; the id lives in the tooltip
+ *  (and is shown only when there is no name to show). */
+function chanNode(cid, names) {
+  const l = (names && names.channels && names.channels[cid]) || null;
+  const kids = [];
+  let title = cid;
+  if (!l || (!l.name && !l.missing && !l.unavailable)) {
+    kids.push(el('code', { text: cid }));
+    if (l && l.pending) kids.push(el('span', { class: 'badge', text: 'name loading — reopen' }));
+  } else {
+    kids.push(el('span', { text: chanText(cid, names) }));
+    if (l.missing || l.unavailable) kids.push(el('span', { class: 'muted mono', text: cid }));
+    if (l.unavailable) title = cid + ' — deleted, hidden from the bot, or in another guild';
+    if (l.archived) kids.push(el('span', { class: 'badge', text: 'archived' }));
+    if (l.type === 'voice') kids.push(el('span', { class: 'badge', text: 'voice' }));
+  }
+  return el('span', { class: 'name-ref', title }, kids);
+}
+
+/** Discord role name ("@Mods"), or the id when unknown. */
+function roleText(rid, names) {
+  const l = names && names.discordRoles && names.discordRoles[rid];
+  if (!l) return rid;
+  return l.name.startsWith('@') ? l.name : '@' + l.name;
+}
+
+function guildText(gid, names) {
+  return (names && names.guilds && names.guilds[gid]) || gid;
+}
+
+/** The scope switcher's label for the selected guild (its name). */
+function currentGuildName() {
+  const opt = Array.from($('#guild-select').options).find((o) => o.value === state.guildId);
+  return (opt && opt.textContent) || $('#guild-static').textContent || state.guildId;
+}
+
+/** "a, b, c +4 more" — keeps table cells readable. */
+function listSummary(items, empty, max = 3) {
+  if (!items.length) return empty || 'none';
+  const head = items.slice(0, max).join(', ');
+  return items.length > max ? head + ' +' + (items.length - max) + ' more' : head;
+}
+
+/** A scope's raw ids, for tooltips. */
+function scopeIds(scope) {
+  if (!scope) return '';
+  const arr = (v) => (Array.isArray(v) ? v : []);
+  return [].concat(arr(scope.channels), arr(scope.mirrorRoles), typeof scope.mirrorRole === 'string' ? [scope.mirrorRole] : []).join(', ');
+}
+
+/** Channel picker options: named, threads under their parent, sorted. */
+function channelOptions(channels) {
+  const names = withChannelList(null, channels);
+  return (channels || [])
+    .map((c) => ({ value: c.id, text: chanText(c.id, names) }))
+    .sort((a, b) => byName(a.text, b.text));
+}
+
+/** Natural order for names ("thread-3" before "thread-11"). */
+function byName(a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }); }
+
+/** Audit "Target" cell: the persona/guild by name, plus the channel acted in. */
+function auditTarget(r, names) {
+  const kids = [];
+  const t = r.target;
+  if (t) {
+    const nm = (names.personas && names.personas[t]) || (names.guilds && names.guilds[t]);
+    kids.push(nm ? el('span', { text: nm, title: t }) : el('span', { text: t }));
+  } else if (r.detail) {
+    // No target (e.g. a denied slash command): the detail is what says what
+    // happened — keep it, minus the channel, which is named below.
+    const rest = Object.assign({}, r.detail);
+    delete rest.channelId;
+    if (Object.keys(rest).length) kids.push(JSON.stringify(rest));
+  }
+  const cid = auditChannel(r);
+  if (cid) kids.push(kids.length ? ' in ' : '', chanNode(cid, names));
+  if (!kids.length) kids.push('—');
+  return kids;
+}
+function auditChannel(r) {
+  return (r.detail && r.detail.channelId) || (r.after && r.after.channelId) || (r.before && r.before.channelId) || null;
+}
+function auditTargetText(r, names) {
+  const t = r.target ? ((names.personas && names.personas[r.target]) || (names.guilds && names.guilds[r.target]) || '') : '';
+  const cid = auditChannel(r);
+  return t + (cid ? ' ' + chanText(cid, names) : '');
+}
 
 function showSecret(token) {
   const modal = $('#secret-modal');

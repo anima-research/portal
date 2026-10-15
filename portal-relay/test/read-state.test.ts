@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { PortalMessage } from '@animalabs/portal-protocol';
@@ -91,4 +91,122 @@ test('persistence round-trips across instances', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── Partial marks, threads, keepPings (#35 review) ──
+
+test('a partial mark keeps the channel listed with what is left (count from the caller)', () => {
+  const rs = new ReadStateStore();
+  const ms = Array.from({ length: 10 }, (_, i) => msg({ channelId: 'c', content: `m${i}` }));
+  for (const m of ms) rs.record('p1', m, false, []);
+  rs.markRead('p1', 'c', ms[3].createdAt, { count: 4 });
+  const u = rs.unread('p1');
+  assert.equal(u.length, 1, 'still listed — the rest is still unread');
+  assert.equal(u[0].count, 6);
+  assert.equal(rs.missed('p1', 'c').since, ms[3].createdAt);
+  // Without a count the previous tally stays (never less than one).
+  rs.markRead('p1', 'c', ms[5].createdAt);
+  assert.equal(rs.unread('p1')[0].count, 6);
+  // A mark through the newest clears it.
+  rs.markRead('p1', 'c', ms[9].createdAt, { count: 4 });
+  assert.deepEqual(rs.unread('p1'), []);
+});
+
+test('thread replies are tallied per thread under their channel', () => {
+  const rs = new ReadStateStore();
+  rs.record('p1', msg({ channelId: 'c', content: 'parent' }), false, []);
+  const t1 = msg({ channelId: 'c', threadId: 't1', content: 'reply' });
+  rs.record('p1', t1, false, []);
+  rs.record('p1', msg({ channelId: 'c', threadId: 't1', content: 'reply 2' }), false, []);
+  const m = rs.missed('p1', 'c');
+  assert.equal(m.messages, 3);
+  assert.deepEqual(m.threads?.map((t) => [t.threadId, t.messages]), [['t1', 2]]);
+  assert.equal(m.threadsTruncated, undefined);
+  // A partial mark past a thread's last reply drops it from the list.
+  const later = msg({ channelId: 'c', content: 'later' });
+  rs.record('p1', later, false, []);
+  rs.markRead('p1', 'c', rs.missed('p1', 'c').threads![0].lastAt, { count: 3 });
+  assert.deepEqual(rs.missed('p1', 'c').threads, [], 'a known-empty list, not an absent one (absent = older relay)');
+  assert.equal(rs.unread('p1')[0].count, 1);
+});
+
+test('the thread list is bounded and says when it is incomplete', () => {
+  const rs = new ReadStateStore();
+  for (let i = 0; i < 60; i++) rs.record('p1', msg({ channelId: 'c', threadId: `t${i}`, content: 'r' }), false, []);
+  const m = rs.missed('p1', 'c');
+  assert.equal(m.threads?.length, 50);
+  assert.equal(m.threadsTruncated, true);
+  assert.ok(m.threads!.some((t) => t.threadId === 't59') && !m.threads!.some((t) => t.threadId === 't0'), 'newest kept');
+});
+
+test('keepPings advances the watermark without acknowledging pending pings', () => {
+  const rs = new ReadStateStore();
+  const p = msg({ channelId: 'c', content: '@me' });
+  rs.record('p1', p, true, ['mention']);
+  rs.record('p1', msg({ channelId: 'c', content: 'after' }), false, []);
+  rs.markRead('p1', 'c', undefined, { keepPings: true });
+  assert.equal(rs.pendingPings('p1').length, 1, 'the ping is still pending');
+  assert.deepEqual(rs.unread('p1'), []);
+  rs.markRead('p1', 'c');
+  assert.equal(rs.pendingPings('p1').length, 0);
+});
+
+test('a thread message whose new tally is evicted on the spot does not throw', () => {
+  const rs = new ReadStateStore({ channelsCap: 1 });
+  rs.record('p1', msg({ channelId: 'busy', content: 'newer' }), false, []);
+  // An OLDER message for another channel: its new tally is the oldest and is
+  // evicted immediately.
+  const old = msg({ channelId: 'quiet', threadId: 't1', content: 'late reply' });
+  const backdated = { ...old, createdAt: new Date(0).toISOString() };
+  assert.doesNotThrow(() => rs.record('p1', backdated, true, ['mention']));
+  assert.equal(rs.pendingPings('p1').length, 1, 'the ping is still stored');
+});
+
+test('a repeated or overlapping partial mark does not subtract the same messages twice', () => {
+  const rs = new ReadStateStore();
+  const ms = Array.from({ length: 10 }, (_, i) => msg({ channelId: 'c', content: `m${i}` }));
+  for (const m of ms) rs.record('p1', m, false, []);
+  // Two sessions fold the same 4-message prefix from the same watermark.
+  rs.markRead('p1', 'c', ms[3].createdAt, { count: 4 });
+  rs.markRead('p1', 'c', ms[3].createdAt, { count: 4 });
+  assert.equal(rs.unread('p1')[0].count, 6);
+  // A mark counted from an older watermark than the relay's (overlap): the
+  // count can't be trusted, so it stays overstated rather than shrink.
+  rs.markRead('p1', 'c', ms[5].createdAt, { count: 6, since: ms[0].createdAt });
+  assert.equal(rs.unread('p1')[0].count, 6);
+  // Counted from exactly where the watermark is: applied.
+  rs.markRead('p1', 'c', ms[7].createdAt, { count: 2, since: ms[5].createdAt });
+  assert.equal(rs.unread('p1')[0].count, 4);
+});
+
+test('channel_missed says where the tally started (the lower bound with no watermark), per channel and thread', () => {
+  const rs = new ReadStateStore();
+  const first = msg({ channelId: 'c', content: 'first' });
+  rs.record('p1', first, false, []);
+  const reply = msg({ channelId: 'c', threadId: 't1', content: 'reply' });
+  rs.record('p1', reply, false, []);
+  rs.record('p1', msg({ channelId: 'c', content: 'later' }), false, []);
+  const m = rs.missed('p1', 'c');
+  assert.equal(m.since, undefined, 'never marked read');
+  assert.equal(m.firstAt, first.createdAt);
+  assert.equal(m.threads?.[0].firstAt, reply.createdAt);
+  assert.deepEqual(rs.missed('p1', 'none').threads, [], 'no tally: still a (known-empty) list');
+});
+
+test('tallies saved by an older relay: no invented lower bound, and threads listed only if known', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'portal-rs-legacy-'));
+  const path = join(dir, 'read-state.json');
+  const legacyTally = (threadId?: string) => ({
+    ...(threadId ? { threadId } : {}), messages: 3, characters: 9,
+    lastAt: '2026-01-01T00:00:03.000Z', lastMessageId: 'm3', lastPreview: 'x',
+  });
+  writeFileSync(path, JSON.stringify({ p1: { watermarks: {}, pings: [], tallies: { quiet: legacyTally(), threaded: legacyTally('t9') } } }));
+  const rs = new ReadStateStore({ path });
+  rs.record('p1', msg({ channelId: 'quiet', content: 'new' }), false, []);
+  const q = rs.missed('p1', 'quiet');
+  assert.equal(q.firstAt, undefined, "the next message isn't where the older unread began");
+  assert.deepEqual(q.threads, [], 'no thread activity before: a complete, empty list');
+  const t = rs.missed('p1', 'threaded');
+  assert.equal(t.threads, undefined, "thread replies from before can't be listed — so the list is omitted");
+  rmSync(dir, { recursive: true, force: true });
 });

@@ -188,3 +188,42 @@ ChapterX then maps its in-memory image/file Buffers directly:
 
 ~half a day: ~8 lines of protocol, the `buildAttachments` branch + two config
 knobs + validation, the client helper, and the live PNG assertion.
+
+---
+
+### Addendum 2026-08-28 — `portal-mcpl` resolves `path`/`url` locally
+
+The wire contract above (bytes-only, relay disk closed) stays. But asking an
+LLM tool call for base64 was a non-starter in practice, so `portal-mcpl`
+(`src/files.ts`) now does the conversion **on the resident's host** before the
+send: `send_message.files` items may be a bare string (local path or http(s)
+URL) or `{path|url|bytes, name?, contentType?, description?}`. Paths are read
+locally (`~` and cwd-relative OK), URLs fetched, name/MIME inferred, the
+per-message budget checked with a legible error, and only `bytes` ever reach
+the relay. Knobs: `PORTAL_FILE_ROOTS` (the directories `path` items may come
+from — see below for the default), `PORTAL_MAX_FILE_BYTES`,
+`PORTAL_ALLOW_URL_FILES=false`, `PORTAL_ALLOW_PRIVATE_URLS=true`. Tests:
+`portal-mcpl/test/files.test.ts`.
+
+Guards (2026-09-21): `url` items refuse hosts that are, or resolve to,
+loopback / private / link-local addresses, re-checked at every redirect hop
+(the fetch runs on the resident's host, so this is the SSRF door); bodies are
+streamed under the remaining budget and cut off at the cap, so a missing or
+lying `Content-Length` can't buffer an unbounded body. `PORTAL_FILE_ROOTS`
+fences the `realpath` of the file, so a symlink inside a root can't reach
+outside it. `bytes` must be strict base64 (Node's lenient decoder would turn a
+mistyped payload into a silently truncated attachment).
+
+Local paths are fenced (2026-10-15). A send that reads the file itself goes
+around whatever the host fences file access with (an MCPL host's tool grants
+and mounts, Claude Code's permission prompts), and any channel message can ask
+for one. With `PORTAL_FILE_ROOTS` unset, `path` items may come from the same
+places the mcpl-bridge reads `$file:` arguments from: the working directory,
+the Claude Code project (`CLAUDE_PROJECT_DIR`) and its per-session
+scratchpads (`/private/tmp/claude-<uid>`, `/tmp/claude-<uid>`) — but a default
+that would be the home directory or `/` is dropped (a process started by
+launchd, or from `~`, would otherwise fence nothing). `PORTAL_FILE_ROOTS=off`
+refuses local paths entirely; any other value replaces the defaults. Whatever
+the roots: the credentials directory, the configured credentials/roster/state
+files (by path and by inode), and `*.creds.json`, `*.identities.json`,
+`*.state.json` (copies included) are never attachable.

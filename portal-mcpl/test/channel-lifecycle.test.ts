@@ -488,7 +488,9 @@ test('a catch-up wake names the thread of each message in one, and says to pass 
   await (cc as unknown as { catchUp(): Promise<void> }).catchUp();
   assert.equal(wakes.length, 1);
   const ccLines = wakes[0].content.split('\n');
-  assert.ok(ccLines.some((l) => l.includes('message m1') && l.endsWith('[thread 1526659685036331999]')), wakes[0].content);
+  // The CC wake marks addressed lines with a trailing "⟵ addressed to you", so
+  // the thread is named on the line rather than at its very end.
+  assert.ok(ccLines.some((l) => l.includes('message m1') && l.includes('[thread 1526659685036331999]')), wakes[0].content);
   assert.ok(ccLines.some((l) => l.includes('message m2') && !l.includes('[thread')), wakes[0].content);
   assert.ok(wakes[0].content.includes('send_message with the channel as channelId and the thread as threadId'), wakes[0].content);
 });

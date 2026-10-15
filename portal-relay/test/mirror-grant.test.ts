@@ -56,8 +56,6 @@ const MALFORMED_GRANTS: Array<[string, Record<string, unknown>, RegExp, { code: 
   ['shape-channels-guildless', { guildId: undefined, grant: { caps: [...RW], scope: { channels: [CHAN_A] } } }, /channels needs the invite's guildId/],
   // A falsy minter would skip the machine-mint recheck.
   ['shape-mintedBy-empty', { mintedBy: '' }, /invite mintedBy must be a non-empty string/],
-  // The two are exclusive, and a claim read roles and dropped the grant.
-  ['shape-roles-and-grant', { roles: ['reader'], grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } } }, /invite gives both roles and grant/],
   // Augment's mode gate stays first, so a misspelled mode is refused there as not claimable.
   ['shape-mode-typo', { mode: 'augmnet' }, /invite mode must be "mint", "augment" or "both"/, { code: 'FORBIDDEN', message: /not claimable/ }],
   // A machine mint's recheck reads the grant too: the shape check runs first.
@@ -118,6 +116,8 @@ function makeRelay(roles: Record<string, unknown> = {}) {
         : undefined,
     meIn: () => ({}),
     listGuilds: () => [{ id: GUILD, name: 'G', memberCount: 2 }],
+    memberNameMatches: () => false,
+    membersComplete: () => true,
     listChannelMetas: () => [],
     isGuildAllowed: (gid: string) => gid === GUILD,
   };
@@ -479,6 +479,26 @@ test('equivalent single/plural mirror scopes and duplicate caps reuse the existi
     assert.deepEqual(t.caps(second.personaId, CHAN_A), [...RW]);
     assert.deepEqual(t.caps(EXISTING, CHAN_A), [...RW]);
     assert.equal(t.relay.invites.get('equivalent').uses, 2);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('a rejected augment changes nothing: no roles granted, invite not consumed', () => {
+  const t = makeRelay();
+  try {
+    // Roles plus a mirror grant missing its guild: the whole claim is invalid.
+    t.relay.invites.mint({
+      code: 'roles-and-bad-mirror', label: 'x', mode: 'augment', maxUses: 1, roles: ['some-role'],
+      grant: { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'r1' } },
+    });
+    t.relay.permissions.setRole('some-role', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: GUILD });
+    const before = t.relay.permissions.getRoleNames(EXISTING);
+    for (let i = 0; i < 2; i++) {
+      assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'roles-and-bad-mirror'), /missing guildId/);
+    }
+    assert.deepEqual(t.relay.permissions.getRoleNames(EXISTING), before, 'no roles granted by a rejected claim');
+    assert.equal(t.relay.invites.get('roles-and-bad-mirror').uses ?? 0, 0, 'no use consumed');
   } finally {
     t.cleanup();
   }
