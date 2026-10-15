@@ -484,6 +484,27 @@ test('equivalent single/plural mirror scopes and duplicate caps reuse the existi
   }
 });
 
+test('an invite with roles and a mirror grant gives both, at enrollment and at a claim', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.permissions.setRole('some-role', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: GUILD });
+    t.relay.invites.mint({
+      code: 'roles-and-mirror', guildId: GUILD, mode: 'both', maxUses: 2, roles: ['some-role'],
+      grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } },
+    });
+    const enrolled = await t.relay.enroll({ invite: 'roles-and-mirror', desiredName: 'both' });
+    assert.ok(!('error' in enrolled), JSON.stringify(enrolled));
+    const names = t.relay.permissions.getRoleNames(enrolled.personaId);
+    const mirror = names.find((n) => n.startsWith('mirror-'));
+    assert.ok(names.includes('some-role') && mirror, JSON.stringify(names));
+    assert.deepEqual(t.caps(enrolled.personaId, CHAN_A), [...RW]);
+    const claimed = t.relay.applyInviteAugment(EXISTING, 'roles-and-mirror');
+    assert.ok(claimed.roles.includes('some-role') && claimed.roles.includes(mirror!), JSON.stringify(claimed.roles));
+  } finally {
+    t.cleanup();
+  }
+});
+
 test('a rejected augment changes nothing: no roles granted, invite not consumed', () => {
   const t = makeRelay();
   try {
