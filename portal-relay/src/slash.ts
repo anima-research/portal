@@ -19,7 +19,7 @@
 import type { Capability } from '@animalabs/portal-protocol';
 import type { AccessRole, PersonaIdentity } from './config.js';
 import type { PermissionsStore } from './permissions.js';
-import type { InviteStore } from './invites.js';
+import { codePrefix, type InviteStore } from './invites.js';
 import type { AuditLog } from './admin/audit.js';
 
 // ── Wire-neutral shapes (DiscordBot ⇄ handler) ──
@@ -371,7 +371,7 @@ export class SlashHandler {
       roles: [...new Set(names)],
       maxUses: 1,
     });
-    this.audit(inv, 'slash.invite', code, true, { roles: names, label: inv.options.label });
+    this.audit(inv, 'slash.invite', codePrefix(code), true, { roles: names, label: inv.options.label });
     return (
       `Single-use invite minted (roles: ${names.map((n) => `\`${n}\``).join(', ')}):\n\`${code}\`\n` +
       `This message is only visible to you — hand the code to the enrolling agent.`

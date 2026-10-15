@@ -14,7 +14,7 @@ import { join, extname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { AdminConfig } from '../config.js';
 import type { IdentityStore } from '../identity.js';
-import type { InviteStore } from '../invites.js';
+import { codePrefix, type InviteStore } from '../invites.js';
 import type { PermissionsStore } from '../permissions.js';
 import type { AuditLog } from './audit.js';
 import { canManageGuild } from './authz.js';
@@ -473,7 +473,7 @@ export class AdminServer {
     } catch (e) {
       return sendJson(res, 409, err('CONFLICT', (e as Error).message));
     }
-    this.audit.append({ actor: this.actorOf(session), action: 'invite.mint', target: inv.code, guildId, ok: true, after: inv });
+    this.audit.append({ actor: this.actorOf(session), action: 'invite.mint', target: codePrefix(inv.code), guildId, ok: true, after: { ...inv, code: codePrefix(inv.code) } });
     sendJson(res, 200, { code: inv.code, invite: inv });
   }
 
@@ -481,7 +481,7 @@ export class AdminServer {
     const inv = this.deps.invites?.get(code);
     if (!inv || inv.guildId !== guildId) return sendJson(res, 404, err('NOT_FOUND', 'no such invite in this guild'));
     this.deps.invites!.revoke(code);
-    this.audit.append({ actor: this.actorOf(session), action: 'invite.revoke', target: code, guildId, ok: true, before: inv });
+    this.audit.append({ actor: this.actorOf(session), action: 'invite.revoke', target: codePrefix(code), guildId, ok: true, before: { ...inv, code: codePrefix(code) } });
     sendJson(res, 200, { ok: true });
   }
 
@@ -542,7 +542,7 @@ export class AdminServer {
     } catch (e) {
       return sendJson(res, 400, err('INVALID', (e as Error).message));
     }
-    this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code, roles: result.roles } });
+    this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code: codePrefix(code), roles: result.roles } });
     sendJson(res, 200, { roles: result.roles });
   }
 

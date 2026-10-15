@@ -56,6 +56,8 @@ const MALFORMED_GRANTS: Array<[string, Record<string, unknown>, RegExp, { code: 
   ['shape-channels-guildless', { guildId: undefined, grant: { caps: [...RW], scope: { channels: [CHAN_A] } } }, /channels needs the invite's guildId/],
   // A falsy minter would skip the machine-mint recheck.
   ['shape-mintedBy-empty', { mintedBy: '' }, /invite mintedBy must be a non-empty string/],
+  // The two are exclusive, and a claim read roles and dropped the grant.
+  ['shape-roles-and-grant', { roles: ['reader'], grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } } }, /invite gives both roles and grant/],
   // Augment's mode gate stays first, so a misspelled mode is refused there as not claimable.
   ['shape-mode-typo', { mode: 'augmnet' }, /invite mode must be "mint", "augment" or "both"/, { code: 'FORBIDDEN', message: /not claimable/ }],
   // A machine mint's recheck reads the grant too: the shape check runs first.
@@ -386,6 +388,8 @@ const mismatches: [string, Record<string, unknown>][] = [
   ['null mirrorCaps', { mirrorCaps: null }],
   ['numeric mirrorCaps', { mirrorCaps: 0 }],
   ['string mirrorCaps', { mirrorCaps: 'false' }],
+  // An invite's scope may name one mirror key, and so may a role it reuses.
+  ['both mirror keys', { scope: { mirrorRole: DISCORD_ROLE, mirrorRoles: [DISCORD_ROLE] } }],
 ];
 
 for (const [dimension, replacement] of mismatches) {
@@ -584,6 +588,26 @@ test('the enrollment log shows at most half an unlabelled code, and 12 character
       assert.ok(line.includes(`via invite (${shown})`), line);
       assert.ok(!lines.some((l) => l.includes(code)), lines.join('\n'));
     }
+  } finally {
+    r.cleanup();
+  }
+});
+
+test('the removed-role refusal names, for the operator, the personas still naming the role', async (t) => {
+  const lines: string[] = [];
+  const r = makeRelay();
+  try {
+    const first = await r.relay.enroll({ invite: 'mirror-mint', desiredName: 'first' });
+    const [name] = r.relay.permissions.getRoleNames(first.personaId);
+    r.relay.permissions.removeRole(name);
+    t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    const again = await r.relay.enroll({ invite: 'mirror-mint', desiredName: 'second' });
+    assert.match(again.error ?? '', /conflicts with removed role/);
+    assert.ok(!(again.error ?? '').includes(first.personaId), 'the claimant is not told who');
+    assert.ok(
+      lines.some((l) => l.includes(`removed role "${name}" is still named by "${first.personaId}" in permissions.json`)),
+      lines.join('\n'),
+    );
   } finally {
     r.cleanup();
   }

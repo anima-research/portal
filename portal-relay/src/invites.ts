@@ -13,6 +13,19 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import type { InviteTemplate, InvitesFile } from './config.js';
 import { WatchedFile } from './file-watch.js';
 
+/** Whether an invite has expired by `nowMs`. No expiresAt (absent or null)
+ *  means no expiry. Any other value must be a timestamp string, and one that
+ *  isn't, or doesn't parse, counts as expired: failing open would leave a
+ *  bearer code claimable forever, the worst default an invite store can have.
+ *  The claim check, the prune and the outstanding-mint count share it. */
+export function inviteExpired(inv: InviteTemplate, nowMs: number): boolean {
+  const expiresAt: unknown = inv.expiresAt;
+  if (expiresAt == null) return false;
+  if (typeof expiresAt !== 'string' || !expiresAt) return true;
+  const at = Date.parse(expiresAt);
+  return !Number.isFinite(at) || at <= nowMs;
+}
+
 export type InviteRejection =
   | 'unknown'
   | 'expired'
@@ -39,14 +52,7 @@ export class InviteStore {
   check(code: string, nowMs: number): InviteTemplate | InviteRejection {
     const inv = this.byCode.get(code);
     if (!inv) return 'unknown';
-    if (inv.expiresAt) {
-      const at = Date.parse(inv.expiresAt);
-      // Fail CLOSED on an unparseable expiry: `NaN <= now` is false, so the
-      // naive comparison silently turned a malformed timestamp into a
-      // never-expiring invite — the most dangerous default a bearer-code
-      // store can have.
-      if (!Number.isFinite(at) || at <= nowMs) return 'expired';
-    }
+    if (inviteExpired(inv, nowMs)) return 'expired';
     if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return 'exhausted';
     return inv;
   }
@@ -95,6 +101,9 @@ export class InviteStore {
       if (!inv.code) throw new Error('invite missing code');
       if (byCode.has(inv.code)) throw new Error(`duplicate invite code ${inv.code}`);
       byCode.set(inv.code, inv);
+      // Tell the operator now, rather than when a claimant is turned away.
+      const malformed = inviteShapeError(inv);
+      if (malformed) console.error(`[portal-relay] invite "${inviteName(inv, inv.code)}" can't be claimed: ${malformed}`);
     }
     this.byCode = byCode;
   }
@@ -117,9 +126,97 @@ export class InviteStore {
   private pruneExpired(): void {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     for (const [code, inv] of this.byCode) {
-      if (!inv?.expiresAt) continue;
-      const at = Date.parse(inv.expiresAt);
-      if (!Number.isFinite(at) || at <= cutoff) this.byCode.delete(code);
+      if (inv && inviteExpired(inv, cutoff)) this.byCode.delete(code);
     }
   }
+}
+
+/** How logs name an invite: its label, or the start of its code. The code is a
+ *  bearer credential, so a log line never carries it whole: an unlabelled
+ *  invite is shown by a prefix of at most half its code, capped at the 12
+ *  characters the mint audit shows, which for a generated `inv_` code find it
+ *  in the invites file. */
+export function inviteName(inv: InviteTemplate, code: string): string {
+  return inv.label || codePrefix(code);
+}
+
+/** The start of an invite code, for a log line or an audit record: at most
+ *  half the code, and at most the 12 characters that find a generated `inv_`
+ *  code in the invites file. A live code is a bearer credential, so neither
+ *  carries it whole. */
+export function codePrefix(code: unknown): string {
+  const text = String(code);
+  return `${text.slice(0, Math.min(12, Math.floor(text.length / 2)))}…`;
+}
+
+export function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+/**
+ * The invite fields that decide what a claim grants and who may make it,
+ * checked for shape before enroll or augment reads them: `mode`, `maxUses`,
+ * `uses`, `roles`, legacy `caps`, and `grant` with its scope. The file is
+ * hand-editable, and the code reads several of these by presence or as
+ * found: a string where an array belongs would be read one character at a
+ * time (as role names, capabilities or channel ids), `scope: { all: false }`
+ * would grant everything because `all` is tested by presence, a misspelled
+ * `mode` would make an augment-only invite mint personas, and a non-numeric
+ * `maxUses` or `uses` would never exhaust. Returns the reason, or null when the shapes
+ * are sound. Names are not checked: an unknown role, capability or channel
+ * grants nothing.
+ */
+export function inviteShapeError(inv: InviteTemplate): string | null {
+  // An optional field given as null reads as absent, as the code downstream
+  // has always read it (?., ?? and !grant).
+  const mode: unknown = inv.mode;
+  if (mode != null && mode !== 'mint' && mode !== 'augment' && mode !== 'both') {
+    return 'invite mode must be "mint", "augment" or "both"';
+  }
+  const maxUses: unknown = inv.maxUses;
+  if (maxUses != null && !(Number.isInteger(maxUses) && (maxUses as number) >= 0)) {
+    return 'invite maxUses must be a non-negative integer';
+  }
+  // The relay keeps `uses`, but in the same file: a string would never reach
+  // maxUses, and consume() would concatenate onto it.
+  const uses: unknown = inv.uses;
+  if (uses != null && !(Number.isInteger(uses) && (uses as number) >= 0)) {
+    return 'invite uses must be a non-negative integer';
+  }
+  if (inv.roles != null && !isStringArray(inv.roles)) return 'invite roles must be an array of strings';
+  // The two are exclusive: a claim reads roles and would drop the grant unread.
+  if (inv.roles != null && inv.grant != null) return 'invite gives both roles and grant; it must give one of them';
+  if (inv.caps != null && !isStringArray(inv.caps)) return 'invite caps must be an array of strings';
+  // A guild the strict comparisons downstream could never match would leave
+  // the persona with an inert grant and the invite spent.
+  const guildId: unknown = inv.guildId;
+  if (guildId != null && typeof guildId !== 'string') return 'invite guildId must be a string';
+  // A falsy minter would skip the machine-mint recheck as if an admin had minted it.
+  const mintedBy: unknown = inv.mintedBy;
+  if (mintedBy != null && (typeof mintedBy !== 'string' || !mintedBy)) return 'invite mintedBy must be a non-empty string';
+  const grant: unknown = inv.grant;
+  if (grant == null) return null;
+  if (typeof grant !== 'object') return 'invite grant must be an object';
+  const { caps, scope } = grant as { caps?: unknown; scope?: unknown };
+  if (!isStringArray(caps)) return 'invite grant caps must be an array of strings';
+  if (scope === null || typeof scope !== 'object' || Array.isArray(scope)) return 'invite grant scope must be an object';
+  // A Scope is exactly one of its four forms; code downstream branches on
+  // which key is present, so a second key or a false `all` would be misread.
+  const kinds = ['channels', 'mirrorRole', 'mirrorRoles', 'all'].filter((key) => key in scope);
+  if (kinds.length !== 1) {
+    return 'invite grant scope must have exactly one of channels, mirrorRole, mirrorRoles or all';
+  }
+  const value = (scope as Record<string, unknown>)[kinds[0]!];
+  if (kinds[0] === 'all' && value !== true) return 'invite grant scope all must be true';
+  if ((kinds[0] === 'channels' || kinds[0] === 'mirrorRoles') && !isStringArray(value)) {
+    return `invite grant scope ${kinds[0]} must be an array of strings`;
+  }
+  if (kinds[0] === 'mirrorRole' && typeof value !== 'string') return 'invite grant scope mirrorRole must be a string';
+  // A mirror that names no role matches no channel: a deny-all persona with the invite spent.
+  if ((kinds[0] === 'mirrorRole' && !value) || (kinds[0] === 'mirrorRoles' && ((value as string[]).length === 0 || (value as string[]).some((id) => !id)))) {
+    return 'invite grant scope must name at least one mirrored role';
+  }
+  // Channels are guild-scoped: without a guild, the grant would apply as deny-all.
+  if (kinds[0] === 'channels' && !inv.guildId) return 'invite grant scope channels needs the invite\'s guildId';
+  return null;
 }

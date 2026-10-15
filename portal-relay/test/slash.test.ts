@@ -56,6 +56,7 @@ function makeHandler() {
   const permissions = new PermissionsStore(join(dir, 'permissions.json'));
   const invites = new InviteStore(join(dir, 'invites.json'));
   const resyncs: string[] = [];
+  const audits: Array<Record<string, unknown>> = [];
   const handler = new SlashHandler({
     identity,
     permissions,
@@ -67,6 +68,7 @@ function makeHandler() {
     canAccessGuild: (pid, gid) => permissions.couldAccessGuild(pid, gid, () => true),
     resync: (pid) => (resyncs.push(pid), 7),
     newInviteCode: () => 'inv_TESTCODE',
+    audit: { append: (rec: Record<string, unknown>) => { audits.push(rec); } } as never,
   });
 
   const inv = (command: string, options: Record<string, string | undefined> = {}, invoker = ADMIN): SlashInvocation => ({
@@ -78,7 +80,7 @@ function makeHandler() {
     options,
   });
 
-  return { handler, permissions, invites, resyncs, inv, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { handler, permissions, invites, resyncs, audits, inv, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 test('authorization: Manage-Server, superadmin, or guild delegate pass; others are denied', () => {
@@ -177,6 +179,10 @@ test('/invite mints a single-use invite carrying the given roles', () => {
     assert.deepEqual(minted.roles, ['chan-role', 'guild-role']);
     assert.equal(minted.maxUses, 1);
     assert.equal(minted.label, 'for tavy');
+    // The audit names it by a prefix: the code is a live bearer credential.
+    const rec = t.audits.find((r) => r.action === 'slash.invite');
+    assert.equal(rec?.target, 'inv_TE…');
+    assert.ok(!JSON.stringify(t.audits).includes('inv_TESTCODE'), 'no record carries the whole code');
 
     assert.match(t.handler.handle(t.inv('invite', { role: 'nope' })), /No such access role/);
   } finally {

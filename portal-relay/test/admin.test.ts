@@ -422,6 +422,18 @@ test('integration: guild-admin mutations (invite/role/grant/token/claim) + CSRF'
     assert.equal(claim.status, 200);
     assert.ok((await claim.json()).roles.includes('r-g1'));
 
+    // Revoking the minted invite, then: the audit stream names each invite by
+    // a prefix of its code, never the whole code, which a claim could use.
+    const revokeInv = await fetch(`${base}/admin/g/G1/invites/${encodeURIComponent(minted.code)}`, {
+      method: 'DELETE', headers: hdr({ 'x-csrf-token': csrf }),
+    });
+    assert.equal(revokeInv.status, 200);
+    const auditText = readFileSync(ctx.deps.config.auditPath, 'utf8');
+    for (const code of [minted.code, 'aug-g1']) {
+      assert.ok(!auditText.includes(code), `the audit stream carries ${code} whole`);
+    }
+    assert.ok(auditText.includes(`"${minted.code.slice(0, 5)}…"`), 'the mint and the revoke name it by its prefix');
+
     // Token lifecycle is super-admin-only and NOT on the guild path: a guild-admin
     // hitting the global endpoint is forbidden, and the old guild path 404s.
     const tokGlobal = await fetch(`${base}/admin/personas/p1/token`, {

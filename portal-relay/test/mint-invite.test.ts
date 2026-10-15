@@ -345,9 +345,10 @@ test('recheck rejects hand-edited machine mints carrying roles (what is APPLIED 
   const t = makeRelay();
   try {
     t.relay.permissions.setRole('sneaky', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: GUILD });
+    // Roles alone: with a grant beside them, the shape check refuses the
+    // invite first, for giving both.
     t.relay.invites.mint({
       code: 'inv_sneaky', mintedBy: SPAWNER, roles: ['sneaky'],
-      grant: { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_A] } },
       guildId: GUILD, maxUses: 1, mode: 'mint',
       expiresAt: new Date(Date.now() + 600_000).toISOString(),
     });
@@ -367,6 +368,41 @@ test('augment path: machine mints get a flat "not claimable" (mode gate before r
       /not claimable \(mint-only\)/,
       'no minter-state oracle for code holders',
     );
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('the claim_invite audit names the invite by a prefix of its code', async () => {
+  const t = makeRelay();
+  try {
+    const code = 'inv_augmentclaim0123456789';
+    t.relay.invites.mint({ code, guildId: GUILD, mode: 'augment', maxUses: 2, grant: { caps: [...RW], scope: { channels: [CHAN_A] } } });
+    const session = { personaId: SPAWNER, subscriptions: new Set<string>() };
+    await t.relay.dispatchRpc(session, 'claim_invite', { code });
+    const rec = t.auditLines().at(-1);
+    assert.equal(rec.action, 'claim_invite');
+    assert.equal(rec.target, 'inv_augmentc…');
+    assert.ok(!JSON.stringify(t.auditLines()).includes(code), 'the whole code is in no record');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('the outstanding-mint cap does not count an invite whose expiresAt is not a timestamp', () => {
+  const t = makeRelay();
+  try {
+    // Twenty of the spawner's codes with expiresAt 0, as loaded from the file
+    // (a persist would prune them): each is refused as expired, so none is
+    // outstanding, and the next mint is allowed.
+    const zeros = Array.from({ length: 20 }, (_, i) => ({
+      code: `inv_zero_${i}`, guildId: GUILD, mintedBy: SPAWNER, maxUses: 1, expiresAt: 0,
+      grant: { caps: [...RW], scope: { channels: [CHAN_A] } },
+    }));
+    writeFileSync(join(t.dir, 'invites.json'), JSON.stringify({ invites: zeros }));
+    t.relay.invites.reload();
+    assert.equal(t.relay.invites.all().length, 20);
+    assert.ok(t.mint(SPAWNER, t.goodParams()).code);
   } finally {
     t.cleanup();
   }

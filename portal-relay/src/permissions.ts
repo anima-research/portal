@@ -214,13 +214,14 @@ export class PermissionsStore {
     return this.roles.has(name) || Object.hasOwn(this.quarantinedRoles, name);
   }
 
-  /** Whether any persona still names this role. removeRole keeps those
+  /** The personas that still name this role. removeRole keeps those
    *  references, inert; creating the role again would make them live. */
-  isRoleReferenced(name: string): boolean {
-    for (const entry of this.personas.values()) {
-      if (entry.roles?.includes(name)) return true;
+  personasNamingRole(name: string): string[] {
+    const ids: string[] = [];
+    for (const [id, entry] of this.personas) {
+      if (entry.roles?.includes(name)) ids.push(id);
     }
-    return false;
+    return ids;
   }
 
   /** The full access-role catalog (read-only snapshot) — admin panel pickers. */

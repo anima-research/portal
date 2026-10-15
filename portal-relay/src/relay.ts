@@ -26,7 +26,7 @@ import { Gateway, type GatewayHooks, Session } from './gateway.js';
 import { GuildAllowStore, type GuildAllowChange } from './guild-allowlist.js';
 import { HistoryCache } from './history-cache.js';
 import { IdentityStore, type IdentityChange, generateToken, hashToken } from './identity.js';
-import { InviteStore } from './invites.js';
+import { InviteStore, codePrefix, inviteExpired, inviteName, inviteShapeError, isStringArray } from './invites.js';
 import { MessageStore, makeRelayId, parseRelayId, type MessageRef } from './message-store.js';
 import { MirrorCache } from './mirror-cache.js';
 import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities } from './permissions.js';
@@ -741,7 +741,14 @@ export class Relay implements GatewayHooks {
     }
     // An admin's removeRole keeps personas' references to it, inert. Recreating
     // the role here would silently hand its caps back to every one of them.
-    if (!existing && this.permissions.isRoleReferenced(name)) {
+    const naming = existing ? [] : this.permissions.personasNamingRole(name);
+    if (naming.length) {
+      // The claimant isn't told who; the operator is, to clear the references
+      // (or restore the role) in permissions.json.
+      console.error(
+        `[portal-relay] invite mirror grant refused: removed role "${name}" is still named by ` +
+          `${naming.map((id) => JSON.stringify(id)).join(', ')} in permissions.json`,
+      );
       return { error: `invite mirror grant conflicts with removed role "${name}", which personas still name` };
     }
     if (existing) {
@@ -757,6 +764,8 @@ export class Relay implements GatewayHooks {
         && !('all' in existing.scope)
         && !('channels' in existing.scope)
         && isMirrorScope(existing.scope)
+        // Exactly one mirror key, as an invite's scope must have.
+        && ('mirrorRole' in existing.scope) !== ('mirrorRoles' in existing.scope)
         && sameStringSet('mirrorRoles' in existing.scope ? existing.scope.mirrorRoles : [existing.scope.mirrorRole], roleIds)
         && sameStringSet(existing.caps, sortedCaps);
       if (!matches) return { error: `invite mirror grant conflicts with existing role "${name}"` };
@@ -871,11 +880,7 @@ export class Relay implements GatewayHooks {
     const outstanding = this.invites.all().filter((inv) => {
       if (inv.mintedBy !== personaId) return false;
       if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return false;
-      if (inv.expiresAt) {
-        const at = Date.parse(inv.expiresAt);
-        if (!Number.isFinite(at) || at <= now) return false;
-      }
-      return true;
+      return !inviteExpired(inv, now);
     }).length;
     if (outstanding >= 20) {
       reject('FORBIDDEN', 'too many outstanding unclaimed invites for this minter (max 20)');
@@ -1418,7 +1423,8 @@ export class Relay implements GatewayHooks {
         this.audit?.append({
           actor: { id: personaId, name: this.displayName(personaId), kind: 'persona' },
           action: 'claim_invite',
-          target: p.code,
+          // Redacted, as the mint audit is: an augment invite can stay live after a claim.
+          target: codePrefix(p.code),
           ok: true,
           after: { roles: result.roles },
         });
@@ -1995,86 +2001,6 @@ export class Relay implements GatewayHooks {
 
 function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirrorRoles: string[] } {
   return 'mirrorRole' in scope || 'mirrorRoles' in scope;
-}
-
-/** How logs name an invite: its label, or the start of its code. The code is a
- *  bearer credential, so a log line never carries it whole: an unlabelled
- *  invite is shown by a prefix of at most half its code, capped at the 12
- *  characters the mint audit shows, which for a generated `inv_` code find it
- *  in the invites file. */
-function inviteName(inv: InviteTemplate, code: string): string {
-  const text = String(code);
-  return inv.label || `${text.slice(0, Math.min(12, Math.floor(text.length / 2)))}…`;
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === 'string');
-}
-
-/**
- * The invite fields that decide what a claim grants and who may make it,
- * checked for shape before enroll or augment reads them: `mode`, `maxUses`,
- * `uses`, `roles`, legacy `caps`, and `grant` with its scope. The file is
- * hand-editable, and the code reads several of these by presence or as
- * found: a string where an array belongs would be read one character at a
- * time (as role names, capabilities or channel ids), `scope: { all: false }`
- * would grant everything because `all` is tested by presence, a misspelled
- * `mode` would make an augment-only invite mint personas, and a non-numeric
- * `maxUses` or `uses` would never exhaust. Returns the reason, or null when the shapes
- * are sound. Names are not checked: an unknown role, capability or channel
- * grants nothing.
- */
-function inviteShapeError(inv: InviteTemplate): string | null {
-  // An optional field given as null reads as absent, as the code downstream
-  // has always read it (?., ?? and !grant).
-  const mode: unknown = inv.mode;
-  if (mode != null && mode !== 'mint' && mode !== 'augment' && mode !== 'both') {
-    return 'invite mode must be "mint", "augment" or "both"';
-  }
-  const maxUses: unknown = inv.maxUses;
-  if (maxUses != null && !(Number.isInteger(maxUses) && (maxUses as number) >= 0)) {
-    return 'invite maxUses must be a non-negative integer';
-  }
-  // The relay keeps `uses`, but in the same file: a string would never reach
-  // maxUses, and consume() would concatenate onto it.
-  const uses: unknown = inv.uses;
-  if (uses != null && !(Number.isInteger(uses) && (uses as number) >= 0)) {
-    return 'invite uses must be a non-negative integer';
-  }
-  if (inv.roles != null && !isStringArray(inv.roles)) return 'invite roles must be an array of strings';
-  if (inv.caps != null && !isStringArray(inv.caps)) return 'invite caps must be an array of strings';
-  // A guild the strict comparisons downstream could never match would leave
-  // the persona with an inert grant and the invite spent.
-  const guildId: unknown = inv.guildId;
-  if (guildId != null && typeof guildId !== 'string') return 'invite guildId must be a string';
-  // A falsy minter would skip the machine-mint recheck as if an admin had minted it.
-  const mintedBy: unknown = inv.mintedBy;
-  if (mintedBy != null && (typeof mintedBy !== 'string' || !mintedBy)) return 'invite mintedBy must be a non-empty string';
-  const grant: unknown = inv.grant;
-  if (grant == null) return null;
-  if (typeof grant !== 'object') return 'invite grant must be an object';
-  const { caps, scope } = grant as { caps?: unknown; scope?: unknown };
-  if (!isStringArray(caps)) return 'invite grant caps must be an array of strings';
-  if (scope === null || typeof scope !== 'object' || Array.isArray(scope)) return 'invite grant scope must be an object';
-  // A Scope is exactly one of its four forms; code downstream branches on
-  // which key is present, so a second key or a false `all` would be misread.
-  const kinds = ['channels', 'mirrorRole', 'mirrorRoles', 'all'].filter((key) => key in scope);
-  if (kinds.length !== 1) {
-    return 'invite grant scope must have exactly one of channels, mirrorRole, mirrorRoles or all';
-  }
-  const value = (scope as Record<string, unknown>)[kinds[0]!];
-  if (kinds[0] === 'all' && value !== true) return 'invite grant scope all must be true';
-  if ((kinds[0] === 'channels' || kinds[0] === 'mirrorRoles') && !isStringArray(value)) {
-    return `invite grant scope ${kinds[0]} must be an array of strings`;
-  }
-  if (kinds[0] === 'mirrorRole' && typeof value !== 'string') return 'invite grant scope mirrorRole must be a string';
-  // A mirror that names no role matches no channel: a deny-all persona with the invite spent.
-  if ((kinds[0] === 'mirrorRole' && !value) || (kinds[0] === 'mirrorRoles' && ((value as string[]).length === 0 || (value as string[]).some((id) => !id)))) {
-    return 'invite grant scope must name at least one mirrored role';
-  }
-  // Channels are guild-scoped: without a guild, the grant would apply as deny-all.
-  if (kinds[0] === 'channels' && !inv.guildId) return 'invite grant scope channels needs the invite\'s guildId';
-  return null;
 }
 
 /** Capabilities and mirrored role ids are sets: order and duplicates are inert. */
