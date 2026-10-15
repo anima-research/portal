@@ -17,12 +17,18 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The two packages are separate jobs, so a failure in one never skips the
-  # other's checks.
+  # Each package is its own job, so a failure in one never skips another's
+  # checks.
   protocol:
-    name: Protocol strict install, build & test
+    name: Protocol strict install, build & test (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The floor the packages' engines promise, pinned exactly, the newest
+    # Node, and 24, the maintained line between them.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12.0', '24', 'latest']
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -30,7 +36,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
           cache: npm
           cache-dependency-path: portal-protocol/package-lock.json
 
@@ -42,9 +48,13 @@ jobs:
           npm test
 
   client:
-    name: Client strict install, build & test
+    name: Client strict install, build & test (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12.0', '24', 'latest']
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -52,7 +62,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
           cache: npm
           cache-dependency-path: portal-client/package-lock.json
 
@@ -66,6 +76,46 @@ jobs:
       # include it.
       - name: Install, build & test client
         working-directory: portal-client
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+  mcpl:
+    name: MCPL strict install, build & test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12.0', '24', 'latest']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: |
+            portal-protocol/package-lock.json
+            portal-client/package-lock.json
+            portal-mcpl/package-lock.json
+
+      # portal-mcpl links portal-protocol and portal-client from this
+      # checkout (file:../portal-protocol, file:../portal-client), and its
+      # tsconfig references both projects, so they're built first. The
+      # client's own imports still resolve to the published protocol its
+      # lockfile pins, as the client job's comment says, so mcpl runs against
+      # this checkout's protocol and client, with the client on that release.
+      - name: Build protocol and client
+        run: |
+          (cd portal-protocol && npm ci && npm run build)
+          (cd portal-client && npm ci && npm run build)
+
+      - name: Install, build & test mcpl
+        working-directory: portal-mcpl
         run: |
           npm ci
           npm run build

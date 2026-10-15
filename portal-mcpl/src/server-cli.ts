@@ -8,6 +8,8 @@
  *                  persona on first run and caches creds at PORTAL_CREDENTIALS
  *                  (default ~/.portal/<persona-name>.creds.json); later runs reuse
  *                  them, so the identity is stable across restarts.
+ *                  Optional PORTAL_AVATAR (a filename under the relay's avatar
+ *                  base, or an absolute URL) is sent with that enrollment only.
  *
  * Durable agent state (watermarks + pending pings + channel SUBSCRIPTIONS) is
  * persisted at PORTAL_STATE (default <creds-dir>/<personaId>.state.json) — the
@@ -23,6 +25,7 @@
  *       "PORTAL_URL": "wss://portal.animalabs.ai",
  *       "PORTAL_INVITE": "<invite code>",
  *       "PORTAL_PERSONA_NAME": "Lena46",
+ *       "PORTAL_AVATAR": "<avatar URL or filename>",
  *       "PORTAL_SUBSCRIPTIONS": "<chanId>,<chanId>"
  *     },
  *     "channelSubscription": "auto",
@@ -60,7 +63,10 @@ async function resolveCreds(url: string): Promise<{ personaId: string; token: st
     console.error('[portal-mcpl] need PORTAL_TOKEN+PORTAL_PERSONA, or PORTAL_PERSONA_NAME(+PORTAL_INVITE)');
     process.exit(1);
   }
-  return loadOrEnrollCreds({ url, credsPath, invite, desiredName });
+  // Optional avatar (filename under the relay's avatar base, or absolute URL),
+  // applied at enrollment only.
+  const avatar = process.env.PORTAL_AVATAR || undefined;
+  return loadOrEnrollCreds({ url, credsPath, invite, desiredName, avatar });
 }
 
 async function main(): Promise<void> {

@@ -20,6 +20,7 @@
  *           "PORTAL_URL": "ws://127.0.0.1:8790",
  *           "PORTAL_INVITE": "<invite code>",
  *           "PORTAL_PERSONA_NAME": "claude-code",
+ *           "PORTAL_AVATAR": "<avatar URL or filename>",
  *           "PORTAL_SUBSCRIPTIONS": "<chanId>,<chanId>"
  *         }
  *       }
@@ -30,6 +31,8 @@
  * (default ~/.portal/<persona-name>.creds.json, derived from PORTAL_PERSONA_NAME
  * so distinct names get distinct identities automatically); subsequent runs reuse
  * them, so the persona (and its Discord identity/role) is stable across restarts.
+ * Optional PORTAL_AVATAR (a filename under the relay's avatar base, or an absolute
+ * URL) is sent with that first enrollment only.
  *
  * Durable agent state (watermarks, pending pings, and channel SUBSCRIPTIONS) is
  * persisted at PORTAL_STATE (default ~/.portal/<personaId>.state.json). Channels
@@ -77,8 +80,11 @@ async function main(): Promise<void> {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  // Load cached creds or enroll once via the invite template.
-  const creds = await loadOrEnrollCreds({ url, credsPath, invite, desiredName });
+  // Load cached creds or enroll once via the invite template. The optional
+  // avatar (filename under the relay's avatar base, or absolute URL) is applied
+  // at enrollment only.
+  const avatar = process.env.PORTAL_AVATAR || undefined;
+  const creds = await loadOrEnrollCreds({ url, credsPath, invite, desiredName, avatar });
   console.error(`[portal-cc] persona "${creds.personaId}" via ${url} (creds: ${credsPath})`);
 
   // Durable agent state (watermarks + pending pings + subscriptions). Keyed to

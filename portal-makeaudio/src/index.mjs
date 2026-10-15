@@ -33,6 +33,8 @@
  *   PORTAL_INVITE        invite code            (required on first run, to enroll)
  *   PORTAL_PERSONA_NAME  display name           (default "makeaudio")
  *   PORTAL_CREDENTIALS   creds cache path       (default ~/.portal/makeaudio.creds.json)
+ *   PORTAL_AVATAR        avatar at enrollment   (optional; a filename under the relay's
+ *                                                avatar base, or an absolute URL)
  *   PORTAL_SUBSCRIPTIONS comma channel ids      (optional; default none — mentions
  *                                                are delivered without subscribing)
  *   FAL_KEY              fal.ai api key         (required)
@@ -47,6 +49,9 @@ import { PortalClient, loadOrEnrollCreds } from '../../portal-client/dist/src/in
 const URL_WS = process.env.PORTAL_URL ?? 'wss://portal.animalabs.ai';
 const INVITE = process.env.PORTAL_INVITE ?? 'inv_eWHy-z-gbVsyA-KoXb2RTi3Q';
 const PERSONA_NAME = process.env.PORTAL_PERSONA_NAME ?? 'makeaudio';
+// Optional avatar (filename under the relay's avatar base, or absolute URL),
+// applied at enrollment only.
+const AVATAR = process.env.PORTAL_AVATAR || undefined;
 const CREDS_PATH =
   process.env.PORTAL_CREDENTIALS ?? join(homedir(), '.portal', 'makeaudio.creds.json');
 const FAL_KEY = process.env.FAL_KEY ?? '2b577689-e3dc-40f9-9e06-89c0e6ad249d:ec02c54404adc4e2690d35b065d1586a';
@@ -387,6 +392,7 @@ async function main() {
     credsPath: CREDS_PATH,
     invite: INVITE,
     desiredName: PERSONA_NAME,
+    avatar: AVATAR,
   });
   log(`persona ${PERSONA_NAME} → ${creds.personaId}`);
 

@@ -82,6 +82,7 @@ post duplicate replies**, so always run exactly one.
 | `PORTAL_INVITE` | (baked) | Invite code; only used on first enroll |
 | `PORTAL_PERSONA_NAME` | `makeaudio` | Display name |
 | `PORTAL_CREDENTIALS` | `~/.portal/makeaudio.creds.json` | Cached creds |
+| `PORTAL_AVATAR` | _(none)_ | Avatar URL, or a filename under the relay's avatar base; only used on first enroll |
 | `FAL_KEY` | (baked fallback) | fal.ai API key — prefer setting in env |
 | `FAL_MODEL` | `bytedance/seed-audio-1.0` | fal model id |
 | `PORTAL_SUBSCRIPTIONS` | _(none)_ | Optional comma-separated channel ids |
