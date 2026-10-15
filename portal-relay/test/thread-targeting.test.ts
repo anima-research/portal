@@ -121,10 +121,11 @@ function makeRelay() {
 test('send_message {channelId, threadId} posts into the thread, not the parent', async () => {
   const { rpc, sent, cleanup } = makeRelay();
   try {
-    await rpc('send_message', { channelId: PARENT, threadId: THREAD, content: 'to the thread' });
+    const result = await rpc('send_message', { channelId: PARENT, threadId: THREAD, content: 'to the thread' });
     assert.equal(sent.length, 1);
     assert.equal(sent[0].channelId, PARENT); // webhook lives on the parent
     assert.equal(sent[0].threadId, THREAD); // ...and posts into the thread
+    assert.equal(result.threadId, THREAD, 'the result says where it posted');
   } finally {
     cleanup();
   }
@@ -153,9 +154,46 @@ test('send_message with a bare thread id as channelId checks caps on the PARENT 
   try {
     // Persona's grants live on PARENT only; pre-fix this refused with
     // SEND_IN_THREADS because caps were looked up on the thread id itself.
-    await rpc('send_message', { channelId: THREAD, content: 'via bare thread id' });
+    const result = await rpc('send_message', { channelId: THREAD, content: 'via bare thread id' });
     assert.equal(sent.length, 1);
     assert.equal(sent[0].threadId, THREAD);
+    assert.equal(result.threadId, THREAD, 'a bare thread id is still a thread post');
+  } finally {
+    cleanup();
+  }
+});
+
+test("a Discord rejection reaches the client with Discord's own JSON error code", async () => {
+  // portal-mcpl reads a numeric code on a targeted publish's first chunk as
+  // Discord's refusal from a 4xx (nothing was created), so the relay must
+  // pass it through as Discord gave it rather than mapping it to its own.
+  const { relay, cleanup } = makeRelay();
+  try {
+    relay.webhooks = {
+      send: async () => {
+        throw Object.assign(new Error('Missing Permissions'), { code: 50013, status: 403 });
+      },
+    };
+    const frames: any[] = [];
+    await relay.handleRpc(
+      { personaId: PERSONA, send: (f: unknown) => frames.push(f) },
+      { id: 'r1', method: 'send_message', params: { channelId: PARENT, content: 'hi' } },
+    );
+    assert.deepEqual(frames, [
+      { op: 'rpc_result', d: { id: 'r1', ok: false, error: { code: 50013, message: 'Missing Permissions' } } },
+    ]);
+  } finally {
+    cleanup();
+  }
+});
+
+test('send_message to a channel that is not a thread reports threadId null', async () => {
+  const { rpc, sent, cleanup } = makeRelay();
+  try {
+    const result = await rpc('send_message', { channelId: PARENT, content: 'to the channel' });
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].threadId, undefined);
+    assert.equal(result.threadId, null);
   } finally {
     cleanup();
   }

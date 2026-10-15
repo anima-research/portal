@@ -45,6 +45,10 @@ export interface SendMessageParams {
 }
 export interface SendMessageResult {
   messageId: RelayMessageId;
+  /** Where the relay posted: the thread it posted into (whether named as
+   *  `threadId` or as a bare thread `channelId`), or `null` for a channel
+   *  that is not a thread. Relays that predate this field omit it. */
+  threadId?: ThreadId | null;
 }
 
 export interface EditMessageParams {
