@@ -510,6 +510,30 @@ test('an invite with roles and a mirror grant gives both, at enrollment and at a
   }
 });
 
+test('a claim refused for its mirror adds none of the invite\'s roles', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.permissions.setRole('some-role', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: GUILD });
+    // A first enrollment creates the mirror role, and an admin then narrows it,
+    // so a later claim of the same grant conflicts with it.
+    const first = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'first' });
+    assert.ok(!('error' in first), JSON.stringify(first));
+    const [name] = t.relay.permissions.getRoleNames(first.personaId);
+    t.relay.permissions.setRole(name, { ...t.relay.permissions.getRole(name), caps: ['VIEW_CHANNEL'] });
+    t.relay.invites.mint({
+      code: 'roles-and-narrowed-mirror', guildId: GUILD, mode: 'augment', maxUses: 1, roles: ['some-role'],
+      grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } },
+    });
+    const before = t.snapshot();
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'roles-and-narrowed-mirror'), {
+      code: 'INVALID_PARAMS', message: /conflicts with existing role/,
+    });
+    assert.deepEqual(t.snapshot(), before, 'no role added, and the invite unspent');
+  } finally {
+    t.cleanup();
+  }
+});
+
 test('a rejected augment changes nothing: no roles granted, invite not consumed', () => {
   const t = makeRelay();
   try {
