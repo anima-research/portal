@@ -102,8 +102,11 @@ export class InviteStore {
       if (byCode.has(inv.code)) throw new Error(`duplicate invite code ${codePrefix(inv.code)}`);
       byCode.set(inv.code, inv);
       // Tell the operator now, rather than when a claimant is turned away.
-      const problem = inviteLoadProblem(inv);
-      if (problem) console.error(`[portal-relay] invite "${inviteName(inv, inv.code)}" ${problem}`);
+      const problem = inviteProblem(inv);
+      if (problem) {
+        const what = problem.blocks === 'claim' ? "can't be claimed" : "can't enroll a persona";
+        console.error(`[portal-relay] invite ${inviteName(inv, inv.code)} ${what}: ${problem.reason}`);
+      }
     }
     this.byCode = byCode;
   }
@@ -133,13 +136,14 @@ export class InviteStore {
   }
 }
 
-/** How logs name an invite: its label, or the start of its code. The code is a
- *  bearer credential, so a log line never carries it whole: an unlabelled
- *  invite is shown by a prefix of at most half its code, capped at the 12
- *  characters the mint audit shows, which for a generated `inv_` code find it
- *  in the invites file. */
+/** How logs name an invite: its label, quoted, and the start of its code, or
+ *  the start of its code alone when it has no label. Labels repeat (every
+ *  unlabelled admin mint is "invite"), so the prefix is what finds the entry
+ *  in the invites file. The code is a bearer credential, so a log line never
+ *  carries it whole: the prefix is at most half the code, capped at the 12
+ *  characters the mint audit shows. */
 export function inviteName(inv: InviteTemplate, code: string): string {
-  return inv.label || codePrefix(code);
+  return inv.label ? `${JSON.stringify(inv.label)} (${codePrefix(code)})` : codePrefix(code);
 }
 
 /** The start of an invite code, for a log line or an audit record: at most
@@ -240,21 +244,40 @@ export function inviteEnrollFieldError(inv: InviteTemplate): string | null {
   return null;
 }
 
-/** What the file shows an invite can't do, for the load warning, as the end
- *  of a sentence about it: "can't be claimed" for a malformed field every
- *  claim reads or an expiresAt that isn't a timestamp string (every claim
- *  reads it as expired), and "can't enroll a persona" for a malformed field
- *  only an enrollment reads, on an invite that can enroll. Null when none. */
-export function inviteLoadProblem(inv: InviteTemplate): string | null {
+/** A machine-minted invite's own structure, which every claim's recheck
+ *  refuses before it looks at the minter: a grant scoped to channels, and no
+ *  roles or blanket caps, since those can carry scope:{all} or mirror shapes
+ *  the subset rule never examines. Reads the grant's scope as an object, so
+ *  run it after `inviteShapeError`. Returns the reason, or null, which an
+ *  invite no machine minted always gets. */
+export function machineMintShapeError(inv: InviteTemplate): string | null {
+  if (!inv.mintedBy) return null;
+  if (inv.roles?.length || inv.caps?.length) {
+    return 'malformed machine mint (roles/blanket caps are not permitted in machine-minted invites)';
+  }
+  if (!inv.grant || !('channels' in inv.grant.scope)) return 'malformed machine mint';
+  return null;
+}
+
+/** What an invite's own entry keeps it from doing, if anything: `claim` when
+ *  every claim refuses it (a malformed field any claim reads, an expiresAt
+ *  that isn't a timestamp string, which every claim reads as expired, or a
+ *  machine mint's structure), and `enroll` when an enrollment refuses it (a
+ *  malformed field only an enrollment reads, on an invite that can enroll).
+ *  Null when neither. The load warning names such an entry, and the admin
+ *  panel's mint refuses one. */
+export function inviteProblem(inv: InviteTemplate): { blocks: 'claim' | 'enroll'; reason: string } | null {
   const shape = inviteShapeError(inv);
-  if (shape) return `can't be claimed: ${shape}`;
+  if (shape) return { blocks: 'claim', reason: shape };
   const expiresAt: unknown = inv.expiresAt;
   if (expiresAt != null && (typeof expiresAt !== 'string' || !Number.isFinite(Date.parse(expiresAt)))) {
-    return "can't be claimed: invite expiresAt must be a timestamp string, so every claim reads it as expired";
+    return { blocks: 'claim', reason: 'invite expiresAt must be a timestamp string, so every claim reads it as expired' };
   }
+  const machine = machineMintShapeError(inv);
+  if (machine) return { blocks: 'claim', reason: machine };
   if (inv.mode !== 'augment') {
     const enroll = inviteEnrollFieldError(inv);
-    if (enroll) return `can't enroll a persona: ${enroll}`;
+    if (enroll) return { blocks: 'enroll', reason: enroll };
   }
   return null;
 }

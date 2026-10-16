@@ -26,7 +26,7 @@ import { Gateway, type GatewayHooks, Session } from './gateway.js';
 import { GuildAllowStore, type GuildAllowChange } from './guild-allowlist.js';
 import { HistoryCache } from './history-cache.js';
 import { IdentityStore, type IdentityChange, generateToken, hashToken } from './identity.js';
-import { InviteStore, codePrefix, inviteEnrollFieldError, inviteExpired, inviteName, inviteShapeError, isStringArray } from './invites.js';
+import { InviteStore, codePrefix, inviteEnrollFieldError, inviteExpired, inviteName, inviteShapeError, isStringArray, machineMintShapeError } from './invites.js';
 import { MessageStore, makeRelayId, parseRelayId, type MessageRef } from './message-store.js';
 import { MirrorCache } from './mirror-cache.js';
 import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities } from './permissions.js';
@@ -665,7 +665,7 @@ export class Relay implements GatewayHooks {
     const displayName = (d.desiredName || 'agent').slice(0, 80).trim() || 'agent';
     const clash = this.nameClash(displayName, d.uniqueName === true);
     if (clash) {
-      console.error(`[portal-relay] enroll refused (${inviteName(checked, d.invite)}): ${clash}`);
+      console.error(`[portal-relay] enroll via invite ${inviteName(checked, d.invite)} refused: ${clash}`);
       return { error: clash };
     }
     const personaId = this.mintPersonaId(checked.namePrefix ?? displayName);
@@ -680,7 +680,7 @@ export class Relay implements GatewayHooks {
       ? [...new Set([...(d.subscriptions ?? []), ...checked.subscriptions])]
       : d.subscriptions ?? undefined;
     const persona = this.identity.toPersona(identity);
-    const enrollmentLog = `[portal-relay] enrolled persona "${personaId}" via invite (${inviteName(checked, d.invite)})`;
+    const enrollmentLog = `[portal-relay] enrolled persona "${personaId}" via invite ${inviteName(checked, d.invite)}`;
 
     // Reject malformed grants and catalog collisions before persisting or
     // emitting the identity. Request/template derivations above are complete.
@@ -752,7 +752,7 @@ export class Relay implements GatewayHooks {
     let grant = inv.grant;
     if (!grant && inv.caps?.length) {
       console.error(
-        `[portal-relay] invite "${inviteName(inv, inv.code)}" uses deprecated blanket caps; ` +
+        `[portal-relay] invite ${inviteName(inv, inv.code)} uses deprecated blanket caps; ` +
           `honouring as scope:{all}. Re-mint scoped (RFC-004).`,
       );
       grant = { caps: inv.caps, scope: { all: true } };
@@ -1000,9 +1000,9 @@ export class Relay implements GatewayHooks {
     // grant-only recheck and then receive roles the subset rule never examined
     // (roles can carry scope:{all}/mirror shapes — exactly what machine mints
     // forbid).
-    if (inv.roles?.length || inv.caps?.length) {
-      return 'malformed machine mint (roles/blanket caps are not permitted in machine-minted invites)';
-    }
+    const structure = machineMintShapeError(inv);
+    if (structure) return structure;
+    // Checked there too; this narrows the grant's type for the loop below.
     if (!inv.grant || !('channels' in inv.grant.scope)) return 'malformed machine mint';
     if (!this.identity.get(inv.mintedBy)) return 'invite minter no longer exists';
     if (!(this.config.inviteMinters ?? []).includes(inv.mintedBy)) return 'invite minter no longer authorized';
@@ -1058,14 +1058,18 @@ export class Relay implements GatewayHooks {
       if (typeof role !== 'string') throw rpcError('INVALID_PARAMS', role.error);
       mirrorRole = role;
     }
-    if (checked.roles?.length) this.permissions.addPersonaRoles(personaId, checked.roles);
-    if (mirrorRole) {
-      this.permissions.addPersonaRoles(personaId, [mirrorRole]);
-    } else if (grant) {
+    // A static grant's merged policy is built before anything is written too:
+    // the merge reads the persona's policy as permissions.json holds it, and
+    // can throw on a malformed one.
+    let policy: PersonaPolicy | undefined;
+    if (!mirrorRole && grant) {
       const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
       const base = this.permissions.getPolicy(personaId) ?? { default: [] };
-      this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
+      policy = this.mergePolicy(base, add);
     }
+    if (checked.roles?.length) this.permissions.addPersonaRoles(personaId, checked.roles);
+    if (mirrorRole) this.permissions.addPersonaRoles(personaId, [mirrorRole]);
+    else if (policy) this.permissions.setPersonaPolicy(personaId, policy);
     this.invites.consume(code);
     return { roles: this.permissions.getRoleNames(personaId) };
   }

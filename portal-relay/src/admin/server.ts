@@ -14,7 +14,7 @@ import { join, extname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { AdminConfig } from '../config.js';
 import type { IdentityStore } from '../identity.js';
-import { codePrefix, type InviteStore } from '../invites.js';
+import { codePrefix, inviteProblem, type InviteStore } from '../invites.js';
 import type { PermissionsStore } from '../permissions.js';
 import type { AuditLog } from './audit.js';
 import { canManageGuild } from './authz.js';
@@ -501,6 +501,12 @@ export class AdminServer {
       ...(expiresAt ? { expiresAt } : {}),
       ...(Array.isArray(body?.subscriptions) ? { subscriptions: body.subscriptions } : {}),
     };
+    // The panel's form can't send these, but the API takes any body: refuse an
+    // invite its own entry shows no claim could use, rather than storing it
+    // for a claimant to be turned away. The load warning wouldn't name it,
+    // since the store skips reloading its own write.
+    const problem = inviteProblem(template);
+    if (problem) return sendJson(res, 400, err('INVALID', problem.reason));
     let inv;
     try {
       inv = this.deps.invites.mint(template);

@@ -534,6 +534,25 @@ test('a claim refused for its mirror adds none of the invite\'s roles', async ()
   }
 });
 
+test('a claim whose static grant can\'t merge into the persona\'s policy adds none of the invite\'s roles', () => {
+  const t = makeRelay();
+  try {
+    t.relay.permissions.setRole('some-role', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: GUILD });
+    // A hand-edited permissions.json can hold a policy with no default list,
+    // which the merge with the invite's grant can't read.
+    t.relay.permissions.setPersonaPolicy(EXISTING, { default: null } as never);
+    t.relay.invites.mint({
+      code: 'roles-and-channel', guildId: GUILD, mode: 'augment', maxUses: 1, roles: ['some-role'],
+      grant: { caps: [...RW], scope: { channels: [CHAN_A] } },
+    });
+    const before = t.snapshot();
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'roles-and-channel'), TypeError);
+    assert.deepEqual(t.snapshot(), before, 'no role added, and the invite unspent');
+  } finally {
+    t.cleanup();
+  }
+});
+
 test('a rejected augment changes nothing: no roles granted, invite not consumed', () => {
   const t = makeRelay();
   try {
@@ -655,7 +674,7 @@ test('the enrollment log shows at most half an unlabelled code, and 12 character
       assert.ok(!('error' in enrolled), JSON.stringify(enrolled));
       const line = lines.find((l) => l.includes(`enrolled persona "${enrolled.personaId}"`));
       assert.ok(line, lines.join('\n'));
-      assert.ok(line.includes(`via invite (${shown})`), line);
+      assert.ok(line.endsWith(`via invite ${shown}`), line);
       assert.ok(!lines.some((l) => l.includes(code)), lines.join('\n'));
     }
   } finally {

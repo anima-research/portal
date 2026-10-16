@@ -390,6 +390,23 @@ test('integration: guild-admin mutations (invite/role/grant/token/claim) + CSRF'
     assert.equal(minted.invite.mode, 'both');
     assert.ok(ctx.invites.get(minted.code), 'invite persisted');
 
+    // An invite whose own entry no claim could use → 400, and nothing stored.
+    const stored = ctx.invites.all().length;
+    for (const body of [
+      { roles: ['r-g1'], maxUses: -1 },
+      { roles: ['r-g1'], maxUses: 1.5 },
+      { grant: { caps: [], scope: { all: true } } },
+      { grant: { caps: ['VIEW_CHANNEL'], scope: { all: false } } },
+      { roles: ['r-g1'], subscriptions: [5] },
+    ]) {
+      const bad = await fetch(`${base}/admin/g/G1/invites`, {
+        method: 'POST', headers: hdr({ 'x-csrf-token': csrf }), body: JSON.stringify(body),
+      });
+      assert.equal(bad.status, 400, JSON.stringify(body));
+      assert.equal((await bad.json()).error.code, 'INVALID', JSON.stringify(body));
+    }
+    assert.equal(ctx.invites.all().length, stored, 'no refused invite is stored');
+
     // Mint with an unknown role → 403.
     const badRole = await fetch(`${base}/admin/g/G1/invites`, {
       method: 'POST', headers: hdr({ 'x-csrf-token': csrf }),

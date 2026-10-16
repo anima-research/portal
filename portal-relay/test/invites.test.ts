@@ -85,7 +85,7 @@ test('an expiresAt that is neither absent nor a timestamp counts as expired, and
   rmSync(path, { force: true });
 });
 
-test('a reload names each invite no claim can use, without its whole code', () => {
+test('a reload names each invite no claim can use, by its label and a prefix of its code, never the whole code', () => {
   const logged: string[] = [];
   const realError = console.error;
   console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -100,6 +100,10 @@ test('a reload names each invite no claim can use, without its whole code', () =
         { code: 'negmax', label: 'negative-max', caps: ['VIEW_CHANNEL'], maxUses: -1 },
         { code: 'inv_expiryzero0', caps: ['VIEW_CHANNEL'], expiresAt: 0 },
         { code: 'no-guild', label: 'mirror-no-guild', grant: { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'r1' } } },
+        // A machine mint's recheck refuses these before it looks at the minter.
+        { code: 'machine-roles', label: 'machine-with-roles', guildId: 'g1', mintedBy: 'spawner', roles: ['r'], grant: { caps: ['VIEW_CHANNEL'], scope: { channels: ['c1'] } } },
+        { code: 'machine-all', mintedBy: 'spawner', grant: { caps: ['VIEW_CHANNEL'], scope: { all: true } } },
+        { code: 'machine-ok', guildId: 'g1', mintedBy: 'spawner', grant: { caps: ['VIEW_CHANNEL'], scope: { channels: ['c1'] } } },
         { code: 'future', caps: ['VIEW_CHANNEL'], expiresAt: '2099-01-01T00:00:00.000Z' },
         // Only an enrollment reads namePrefix, so a claim on an existing persona
         // can still use a `both` invite; an augment-only invite is never named.
@@ -113,13 +117,15 @@ test('a reload names each invite no claim can use, without its whole code', () =
     console.error = realError;
   }
   assert.deepEqual(logged, [
-    '[portal-relay] invite "inv_secr…" can\'t be claimed: invite maxUses must be a non-negative integer',
-    '[portal-relay] invite "onboarding" can\'t be claimed: invite roles must be an array of strings',
-    '[portal-relay] invite "null-max" can\'t be claimed: invite maxUses must be a non-negative integer',
-    '[portal-relay] invite "negative-max" can\'t be claimed: invite maxUses must be a non-negative integer',
-    '[portal-relay] invite "inv_exp…" can\'t be claimed: invite expiresAt must be a timestamp string, so every claim reads it as expired',
-    '[portal-relay] invite "mirror-no-guild" can\'t be claimed: invite mirror grant is missing guildId',
-    '[portal-relay] invite "prefixed" can\'t enroll a persona: invite namePrefix must be a string',
+    '[portal-relay] invite inv_secr… can\'t be claimed: invite maxUses must be a non-negative integer',
+    '[portal-relay] invite "onboarding" (labell…) can\'t be claimed: invite roles must be an array of strings',
+    '[portal-relay] invite "null-max" (nul…) can\'t be claimed: invite maxUses must be a non-negative integer',
+    '[portal-relay] invite "negative-max" (neg…) can\'t be claimed: invite maxUses must be a non-negative integer',
+    '[portal-relay] invite inv_exp… can\'t be claimed: invite expiresAt must be a timestamp string, so every claim reads it as expired',
+    '[portal-relay] invite "mirror-no-guild" (no-g…) can\'t be claimed: invite mirror grant is missing guildId',
+    '[portal-relay] invite "machine-with-roles" (machin…) can\'t be claimed: malformed machine mint (roles/blanket caps are not permitted in machine-minted invites)',
+    '[portal-relay] invite machi… can\'t be claimed: malformed machine mint',
+    '[portal-relay] invite "prefixed" (pref…) can\'t enroll a persona: invite namePrefix must be a string',
   ]);
 });
 
