@@ -501,10 +501,11 @@ export class AdminServer {
       ...(expiresAt ? { expiresAt } : {}),
       ...(Array.isArray(body?.subscriptions) ? { subscriptions: body.subscriptions } : {}),
     };
-    // The panel's form can't send these, but the API takes any body: refuse an
-    // invite its own entry shows no claim could use, rather than storing it
-    // for a claimant to be turned away. The load warning wouldn't name it,
-    // since the store skips reloading its own write.
+    // Any body can reach this route: the API takes whatever it's sent, and the
+    // panel's form reads its Max uses box with parseInt and checks no minimum,
+    // so it can send -1. Refuse an invite its own entry shows no claim could
+    // use, rather than storing it for a claimant to be turned away. The load
+    // warning wouldn't name it, since the store skips reloading its own write.
     const problem = inviteProblem(template);
     if (problem) return sendJson(res, 400, err('INVALID', problem.reason));
     let inv;
