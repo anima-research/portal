@@ -26,7 +26,7 @@ import { Gateway, type GatewayHooks, Session } from './gateway.js';
 import { GuildAllowStore, type GuildAllowChange } from './guild-allowlist.js';
 import { HistoryCache } from './history-cache.js';
 import { IdentityStore, type IdentityChange, generateToken, hashToken } from './identity.js';
-import { InviteStore, codePrefix, inviteExpired, inviteName, inviteShapeError, isStringArray } from './invites.js';
+import { InviteStore, codePrefix, inviteEnrollFieldError, inviteExpired, inviteName, inviteShapeError, isStringArray } from './invites.js';
 import { MessageStore, makeRelayId, parseRelayId, type MessageRef } from './message-store.js';
 import { MirrorCache } from './mirror-cache.js';
 import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities } from './permissions.js';
@@ -657,19 +657,15 @@ export class Relay implements GatewayHooks {
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) return { error: staleMint };
 
-    if (checked.namePrefix != null && typeof checked.namePrefix !== 'string') {
-      return { error: 'invite namePrefix must be a string' };
-    }
-    if (checked.subscriptions != null && !isStringArray(checked.subscriptions)) {
-      return { error: 'invite subscriptions must be an array of strings' };
-    }
+    const enrollFields = inviteEnrollFieldError(checked);
+    if (enrollFields) return { error: enrollFields };
 
     // Derive the full registration result before materialization can create a
     // catalog role and activate existing references to it.
     const displayName = (d.desiredName || 'agent').slice(0, 80).trim() || 'agent';
     const clash = this.nameClash(displayName, d.uniqueName === true);
     if (clash) {
-      console.error(`[portal-relay] enroll refused (${checked.label ?? 'invite'}): ${clash}`);
+      console.error(`[portal-relay] enroll refused (${inviteName(checked, d.invite)}): ${clash}`);
       return { error: clash };
     }
     const personaId = this.mintPersonaId(checked.namePrefix ?? displayName);
@@ -963,7 +959,7 @@ export class Relay implements GatewayHooks {
       // UNAUTHENTICATED register — the audit stream (panel, shippers,
       // backups) must not enable front-running the claim. A 12-char prefix
       // correlates with invites.json for forensics.
-      target: `${code.slice(0, 12)}…`,
+      target: codePrefix(code),
       guildId: p.guildId,
       ok: true,
       detail: { via: 'rpc', channels, caps, expiresAt, label: p.label },
@@ -999,11 +995,11 @@ export class Relay implements GatewayHooks {
   private recheckMachineMint(inv: InviteTemplate): string | null {
     if (!inv.mintedBy) return null;
     // Re-validate what will actually be APPLIED, not what we expect to be
-    // there: prepareInviteGrant short-circuits on roles (and legacy caps) BEFORE
-    // it looks at grant, so a hand-edited invite carrying mintedBy + roles
-    // would pass a grant-only recheck and then receive roles the subset rule
-    // never examined (roles can carry scope:{all}/mirror shapes — exactly
-    // what machine mints forbid).
+    // there: a claim applies an invite's roles and legacy caps as well as its
+    // grant, so a hand-edited invite carrying mintedBy + roles would pass a
+    // grant-only recheck and then receive roles the subset rule never examined
+    // (roles can carry scope:{all}/mirror shapes — exactly what machine mints
+    // forbid).
     if (inv.roles?.length || inv.caps?.length) {
       return 'malformed machine mint (roles/blanket caps are not permitted in machine-minted invites)';
     }

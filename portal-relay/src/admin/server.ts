@@ -171,7 +171,9 @@ export class AdminServer {
           action: 'authz.denied',
           guildId,
           ok: false,
-          detail: { method, path },
+          // A revoke's path ends in the invite's code, a live bearer
+          // credential: the record keeps its prefix, as every audit does.
+          detail: { method, path: path.replace(/(\/invites\/)([^/]+)/, (_m, at: string, code: string) => at + codePrefix(code)) },
         });
         return sendJson(res, 403, { error: { code: 'FORBIDDEN', message: 'not an admin of this guild' } });
       }

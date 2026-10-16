@@ -501,6 +501,27 @@ test('enroll refuses a name that reads like a human member\'s — always, withou
   }
 });
 
+test('a refused name leaves the role catalog as it was: the name check comes before the grant is prepared', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({
+      code: 'inv_mirror_clash', label: 'm', guildId: GUILD, maxUses: 2,
+      grant: { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'discord-role-1' } },
+    });
+    const before = JSON.stringify(t.relay.permissions.allRoles());
+    const refused = await t.relay.enroll({ invite: 'inv_mirror_clash', desiredName: 'antra' });
+    assert.ok('error' in refused);
+    assert.match(refused.error, /reads like a server member's name/);
+    assert.equal(JSON.stringify(t.relay.permissions.allRoles()), before, 'no mirror role created');
+    // A free name enrolls through the same invite and creates the role, so the check above can fail.
+    const enrolled = await t.relay.enroll({ invite: 'inv_mirror_clash', desiredName: 'fresh-name' });
+    assert.ok(!('error' in enrolled), JSON.stringify(enrolled));
+    assert.notEqual(JSON.stringify(t.relay.permissions.allRoles()), before);
+  } finally {
+    t.cleanup();
+  }
+});
+
 test('enroll: persona and bot-name clashes are refused only when uniqueName is asked', async () => {
   const t = makeRelay();
   try {

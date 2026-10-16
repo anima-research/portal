@@ -77,7 +77,7 @@ export class InviteStore {
 
   /** Add a new invite template. Throws on duplicate code. Returns it. */
   mint(template: InviteTemplate): InviteTemplate {
-    if (this.byCode.has(template.code)) throw new Error(`duplicate invite code ${template.code}`);
+    if (this.byCode.has(template.code)) throw new Error(`duplicate invite code ${codePrefix(template.code)}`);
     const inv = { uses: 0, ...template };
     this.byCode.set(inv.code, inv);
     this.persist();
@@ -99,11 +99,11 @@ export class InviteStore {
     const byCode = new Map<string, InviteTemplate>();
     for (const inv of next.invites) {
       if (!inv.code) throw new Error('invite missing code');
-      if (byCode.has(inv.code)) throw new Error(`duplicate invite code ${inv.code}`);
+      if (byCode.has(inv.code)) throw new Error(`duplicate invite code ${codePrefix(inv.code)}`);
       byCode.set(inv.code, inv);
       // Tell the operator now, rather than when a claimant is turned away.
-      const malformed = inviteShapeError(inv);
-      if (malformed) console.error(`[portal-relay] invite "${inviteName(inv, inv.code)}" can't be claimed: ${malformed}`);
+      const problem = inviteLoadProblem(inv);
+      if (problem) console.error(`[portal-relay] invite "${inviteName(inv, inv.code)}" can't be claimed: ${problem}`);
     }
     this.byCode = byCode;
   }
@@ -121,7 +121,9 @@ export class InviteStore {
    * TTL ≤ 60min) would otherwise accumulate forever and every persist() is a
    * full-file rewrite — O(total) bytes per mint. The 24h grace keeps a short
    * forensic tail on disk; the audit log holds provenance permanently. An
-   * unparseable expiresAt counts as long-expired (fail closed, matches check).
+   * expiresAt that isn't a timestamp string counts as long-expired (fail
+   * closed, as check() reads it), so the first write drops such an invite;
+   * the load warning has named it by then.
    */
   private pruneExpired(): void {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
@@ -173,8 +175,10 @@ export function inviteShapeError(inv: InviteTemplate): string | null {
   if (mode != null && mode !== 'mint' && mode !== 'augment' && mode !== 'both') {
     return 'invite mode must be "mint", "augment" or "both"';
   }
+  // maxUses is the exception to null reading as absent: check() has always
+  // compared a null maxUses as a limit of 0, so such an invite is exhausted.
   const maxUses: unknown = inv.maxUses;
-  if (maxUses != null && !(Number.isInteger(maxUses) && (maxUses as number) >= 0)) {
+  if (maxUses !== undefined && !(Number.isInteger(maxUses) && (maxUses as number) >= 0)) {
     return 'invite maxUses must be a non-negative integer';
   }
   // The relay keeps `uses`, but in the same file: a string would never reach
@@ -197,6 +201,9 @@ export function inviteShapeError(inv: InviteTemplate): string | null {
   if (typeof grant !== 'object') return 'invite grant must be an object';
   const { caps, scope } = grant as { caps?: unknown; scope?: unknown };
   if (!isStringArray(caps)) return 'invite grant caps must be an array of strings';
+  // A grant of no capability, like a mirror or a channel list that names
+  // nothing, applies as deny-all with the invite spent.
+  if (caps.length === 0) return 'invite grant caps must name at least one capability';
   if (scope === null || typeof scope !== 'object' || Array.isArray(scope)) return 'invite grant scope must be an object';
   // A Scope is exactly one of its four forms; code downstream branches on
   // which key is present, so a second key or a false `all` would be misread.
@@ -214,7 +221,37 @@ export function inviteShapeError(inv: InviteTemplate): string | null {
   if ((kinds[0] === 'mirrorRole' && !value) || (kinds[0] === 'mirrorRoles' && ((value as string[]).length === 0 || (value as string[]).some((id) => !id)))) {
     return 'invite grant scope must name at least one mirrored role';
   }
+  if (kinds[0] === 'channels' && ((value as string[]).length === 0 || (value as string[]).some((id) => !id))) {
+    return 'invite grant scope channels must name at least one channel';
+  }
   // Channels are guild-scoped: without a guild, the grant would apply as deny-all.
   if (kinds[0] === 'channels' && !inv.guildId) return 'invite grant scope channels needs the invite\'s guildId';
+  return null;
+}
+
+/** The fields only an enrollment reads, `namePrefix` and `subscriptions`.
+ *  Enroll refuses a malformed one; a claim on an existing persona doesn't
+ *  read them. Returns the reason, or null. */
+export function inviteEnrollFieldError(inv: InviteTemplate): string | null {
+  if (inv.namePrefix != null && typeof inv.namePrefix !== 'string') return 'invite namePrefix must be a string';
+  if (inv.subscriptions != null && !isStringArray(inv.subscriptions)) return 'invite subscriptions must be an array of strings';
+  return null;
+}
+
+/** Why no claim can use an invite, as far as the file shows, for the load
+ *  warning: a malformed field every claim reads, a malformed field an
+ *  enrollment reads when the invite can enroll, or an expiresAt that isn't a
+ *  timestamp string, which every claim reads as expired. Null when none. */
+export function inviteLoadProblem(inv: InviteTemplate): string | null {
+  const shape = inviteShapeError(inv);
+  if (shape) return shape;
+  if (inv.mode !== 'augment') {
+    const enroll = inviteEnrollFieldError(inv);
+    if (enroll) return enroll;
+  }
+  const expiresAt: unknown = inv.expiresAt;
+  if (expiresAt != null && (typeof expiresAt !== 'string' || !Number.isFinite(Date.parse(expiresAt)))) {
+    return 'invite expiresAt must be a timestamp string, so every claim reads it as expired';
+  }
   return null;
 }

@@ -275,6 +275,19 @@ test('integration: guild-admin can read own guild, blocked cross-guild', async (
     const cross = await fetch(`${base}/admin/g/G2/invites`, auth);
     assert.equal(cross.status, 403);
 
+    // A refused revoke's audit record keeps only a prefix of the code its path names.
+    const code = 'inv_crossguildsecret01';
+    const del = await fetch(`${base}/admin/g/G2/invites/${code}`, {
+      method: 'DELETE',
+      headers: { cookie: `portal_admin_session=${session}`, 'x-csrf-token': me.csrf },
+    });
+    assert.equal(del.status, 403);
+    const auditText = readFileSync(deps.config.auditPath, 'utf8');
+    const denied = auditText.trim().split('\n').map((line) => JSON.parse(line))
+      .filter((r) => r.action === 'authz.denied' && r.detail?.method === 'DELETE');
+    assert.equal(denied.at(-1)?.detail.path, '/admin/g/G2/invites/inv_crossgu…');
+    assert.ok(!auditText.includes(code), 'no record carries the whole code');
+
     // No session: 401.
     const anon = await fetch(`${base}/admin/me`);
     assert.equal(anon.status, 401);

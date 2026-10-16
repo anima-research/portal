@@ -95,6 +95,14 @@ test('a reload names each invite no claim can use, without its whole code', () =
         { code: 'inv_secretcode123', caps: ['VIEW_CHANNEL'], maxUses: 'two' },
         { code: 'labelled-code', label: 'onboarding', roles: 'r' },
         { code: 'fine', caps: ['VIEW_CHANNEL'] },
+        // check() reads these as exhausted, and every claim as expired.
+        { code: 'nullmax', label: 'null-max', caps: ['VIEW_CHANNEL'], maxUses: null },
+        { code: 'negmax', label: 'negative-max', caps: ['VIEW_CHANNEL'], maxUses: -1 },
+        { code: 'inv_expiryzero0', caps: ['VIEW_CHANNEL'], expiresAt: 0 },
+        { code: 'future', caps: ['VIEW_CHANNEL'], expiresAt: '2099-01-01T00:00:00.000Z' },
+        // Enrollment reads namePrefix; a claim on an existing persona doesn't.
+        { code: 'prefixed', label: 'prefixed', caps: ['VIEW_CHANNEL'], namePrefix: 5 },
+        { code: 'aug-prefixed', label: 'augment-only', mode: 'augment', caps: ['VIEW_CHANNEL'], namePrefix: 5 },
       ],
     });
     new InviteStore(path);
@@ -105,7 +113,22 @@ test('a reload names each invite no claim can use, without its whole code', () =
   assert.deepEqual(logged, [
     '[portal-relay] invite "inv_secr…" can\'t be claimed: invite maxUses must be a non-negative integer',
     '[portal-relay] invite "onboarding" can\'t be claimed: invite roles must be an array of strings',
+    '[portal-relay] invite "null-max" can\'t be claimed: invite maxUses must be a non-negative integer',
+    '[portal-relay] invite "negative-max" can\'t be claimed: invite maxUses must be a non-negative integer',
+    '[portal-relay] invite "inv_exp…" can\'t be claimed: invite expiresAt must be a timestamp string, so every claim reads it as expired',
+    '[portal-relay] invite "prefixed" can\'t be claimed: invite namePrefix must be a string',
   ]);
+});
+
+test('a duplicate code is named by a prefix, at load and at mint', () => {
+  const code = 'inv_duplicate0123456789ab';
+  const twice = tmpFile({ invites: [{ code, caps: ['VIEW_CHANNEL'] }, { code, caps: ['VIEW_CHANNEL'] }] });
+  assert.throws(() => new InviteStore(twice), { message: 'duplicate invite code inv_duplicat…' });
+  rmSync(twice, { force: true });
+  const once = tmpFile({ invites: [{ code, caps: ['VIEW_CHANNEL'] }] });
+  const store = new InviteStore(once);
+  assert.throws(() => store.mint({ code, caps: ['VIEW_CHANNEL'] } as never), { message: 'duplicate invite code inv_duplicat…' });
+  rmSync(once, { force: true });
 });
 
 test('a code prefix is at most half the code and at most 12 characters', () => {

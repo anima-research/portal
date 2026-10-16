@@ -32,6 +32,7 @@ const MALFORMED_GRANTS: Array<[string, Record<string, unknown>, RegExp, { code: 
   ['shape-roles-mixed', { roles: ['reader', 7] }, /invite roles must be an array of strings/],
   ['shape-caps-string', { caps: 'SEND_MESSAGES' }, /invite caps must be an array of strings/],
   ['shape-grant-caps-string', { grant: { caps: 'SEND_MESSAGES', scope: { all: true } } }, /invite grant caps must be an array of strings/],
+  ['shape-grant-string', { grant: 'SEND_MESSAGES' }, /invite grant must be an object/],
   ['shape-grant-scope-null', { grant: { caps: [...RW], scope: null } }, /invite grant scope must be an object/],
   ['shape-grant-channels-string', { grant: { caps: [...RW], scope: { channels: CHAN_A } } }, /invite grant scope channels must be an array of strings/],
   ['shape-grant-mirrorRoles-string', { grant: { caps: [...RW], scope: { mirrorRoles: DISCORD_ROLE } } }, /invite grant scope mirrorRoles must be an array of strings/],
@@ -53,6 +54,10 @@ const MALFORMED_GRANTS: Array<[string, Record<string, unknown>, RegExp, { code: 
   ['shape-guildId-number', { guildId: 7 }, /invite guildId must be a string/],
   ['shape-mirrorRoles-empty', { grant: { caps: [...RW], scope: { mirrorRoles: [] } } }, /must name at least one mirrored role/],
   ['shape-mirrorRole-empty', { grant: { caps: [...RW], scope: { mirrorRole: '' } } }, /must name at least one mirrored role/],
+  ['shape-mirrorRoles-blank-id', { grant: { caps: [...RW], scope: { mirrorRoles: [DISCORD_ROLE, ''] } } }, /must name at least one mirrored role/],
+  ['shape-channels-empty', { grant: { caps: [...RW], scope: { channels: [] } } }, /must name at least one channel/],
+  ['shape-channels-blank-id', { grant: { caps: [...RW], scope: { channels: [CHAN_A, ''] } } }, /must name at least one channel/],
+  ['shape-grant-caps-empty', { grant: { caps: [], scope: { channels: [CHAN_A] } } }, /invite grant caps must name at least one capability/],
   ['shape-channels-guildless', { guildId: undefined, grant: { caps: [...RW], scope: { channels: [CHAN_A] } } }, /channels needs the invite's guildId/],
   // A falsy minter would skip the machine-mint recheck.
   ['shape-mintedBy-empty', { mintedBy: '' }, /invite mintedBy must be a non-empty string/],
