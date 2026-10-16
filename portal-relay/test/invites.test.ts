@@ -99,9 +99,11 @@ test('a reload names each invite no claim can use, without its whole code', () =
         { code: 'nullmax', label: 'null-max', caps: ['VIEW_CHANNEL'], maxUses: null },
         { code: 'negmax', label: 'negative-max', caps: ['VIEW_CHANNEL'], maxUses: -1 },
         { code: 'inv_expiryzero0', caps: ['VIEW_CHANNEL'], expiresAt: 0 },
+        { code: 'no-guild', label: 'mirror-no-guild', grant: { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'r1' } } },
         { code: 'future', caps: ['VIEW_CHANNEL'], expiresAt: '2099-01-01T00:00:00.000Z' },
-        // Enrollment reads namePrefix; a claim on an existing persona doesn't.
-        { code: 'prefixed', label: 'prefixed', caps: ['VIEW_CHANNEL'], namePrefix: 5 },
+        // Only an enrollment reads namePrefix, so a claim on an existing persona
+        // can still use a `both` invite; an augment-only invite is never named.
+        { code: 'prefixed', label: 'prefixed', mode: 'both', caps: ['VIEW_CHANNEL'], namePrefix: 5 },
         { code: 'aug-prefixed', label: 'augment-only', mode: 'augment', caps: ['VIEW_CHANNEL'], namePrefix: 5 },
       ],
     });
@@ -116,7 +118,8 @@ test('a reload names each invite no claim can use, without its whole code', () =
     '[portal-relay] invite "null-max" can\'t be claimed: invite maxUses must be a non-negative integer',
     '[portal-relay] invite "negative-max" can\'t be claimed: invite maxUses must be a non-negative integer',
     '[portal-relay] invite "inv_exp…" can\'t be claimed: invite expiresAt must be a timestamp string, so every claim reads it as expired',
-    '[portal-relay] invite "prefixed" can\'t be claimed: invite namePrefix must be a string',
+    '[portal-relay] invite "mirror-no-guild" can\'t be claimed: invite mirror grant is missing guildId',
+    '[portal-relay] invite "prefixed" can\'t enroll a persona: invite namePrefix must be a string',
   ]);
 });
 

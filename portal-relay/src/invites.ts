@@ -103,7 +103,7 @@ export class InviteStore {
       byCode.set(inv.code, inv);
       // Tell the operator now, rather than when a claimant is turned away.
       const problem = inviteLoadProblem(inv);
-      if (problem) console.error(`[portal-relay] invite "${inviteName(inv, inv.code)}" can't be claimed: ${problem}`);
+      if (problem) console.error(`[portal-relay] invite "${inviteName(inv, inv.code)}" ${problem}`);
     }
     this.byCode = byCode;
   }
@@ -224,8 +224,10 @@ export function inviteShapeError(inv: InviteTemplate): string | null {
   if (kinds[0] === 'channels' && ((value as string[]).length === 0 || (value as string[]).some((id) => !id))) {
     return 'invite grant scope channels must name at least one channel';
   }
-  // Channels are guild-scoped: without a guild, the grant would apply as deny-all.
+  // Channels and mirrors are guild-scoped: without a guild, the grant would
+  // apply as deny-all, or name no guild a mirror role can live in.
   if (kinds[0] === 'channels' && !inv.guildId) return 'invite grant scope channels needs the invite\'s guildId';
+  if ((kinds[0] === 'mirrorRole' || kinds[0] === 'mirrorRoles') && !inv.guildId) return 'invite mirror grant is missing guildId';
   return null;
 }
 
@@ -238,20 +240,21 @@ export function inviteEnrollFieldError(inv: InviteTemplate): string | null {
   return null;
 }
 
-/** Why no claim can use an invite, as far as the file shows, for the load
- *  warning: a malformed field every claim reads, a malformed field an
- *  enrollment reads when the invite can enroll, or an expiresAt that isn't a
- *  timestamp string, which every claim reads as expired. Null when none. */
+/** What the file shows an invite can't do, for the load warning, as the end
+ *  of a sentence about it: "can't be claimed" for a malformed field every
+ *  claim reads or an expiresAt that isn't a timestamp string (every claim
+ *  reads it as expired), and "can't enroll a persona" for a malformed field
+ *  only an enrollment reads, on an invite that can enroll. Null when none. */
 export function inviteLoadProblem(inv: InviteTemplate): string | null {
   const shape = inviteShapeError(inv);
-  if (shape) return shape;
-  if (inv.mode !== 'augment') {
-    const enroll = inviteEnrollFieldError(inv);
-    if (enroll) return enroll;
-  }
+  if (shape) return `can't be claimed: ${shape}`;
   const expiresAt: unknown = inv.expiresAt;
   if (expiresAt != null && (typeof expiresAt !== 'string' || !Number.isFinite(Date.parse(expiresAt)))) {
-    return 'invite expiresAt must be a timestamp string, so every claim reads it as expired';
+    return "can't be claimed: invite expiresAt must be a timestamp string, so every claim reads it as expired";
+  }
+  if (inv.mode !== 'augment') {
+    const enroll = inviteEnrollFieldError(inv);
+    if (enroll) return `can't enroll a persona: ${enroll}`;
   }
   return null;
 }
