@@ -259,6 +259,22 @@ export class SlashHandler {
     return this.deps.superadmins.includes(invoker.id);
   }
 
+  /** Why named roles that aren't live can't be used here, or null: names
+   *  the catalog has never had, and names set aside when the relay loaded
+   *  them, which it can't read until its operator fixes them. */
+  private notLive(names: string[]): string | null {
+    const p = this.deps.permissions;
+    const absent = names.filter((n) => !p.getRole(n));
+    const unknown = absent.filter((n) => !p.isQuarantined(n));
+    const unreadable = absent.filter((n) => p.isQuarantined(n));
+    const list = (ns: string[]) => ns.map((n) => `\`${n}\``).join(', ');
+    const parts = [
+      ...(unknown.length ? [`No such access role${unknown.length === 1 ? '' : 's'}: ${list(unknown)}.`] : []),
+      ...(unreadable.length ? [`Access role${unreadable.length === 1 ? '' : 's'} ${list(unreadable)} can't be read (set aside when the relay loaded ${unreadable.length === 1 ? 'it' : 'them'}), so the relay's operator must fix ${unreadable.length === 1 ? 'it' : 'them'} first.`] : []),
+    ];
+    return parts.length ? parts.join(' ') : null;
+  }
+
   /**
    * Guild containment for role grants (/add-role, /remove-role, /invite): a
    * guild's admin may only hand out (or take away) roles SCOPED TO THAT
@@ -351,7 +367,7 @@ export class SlashHandler {
     if (typeof persona === 'string') return persona;
     const name = inv.options.role ?? '';
     const role = this.deps.permissions.getRole(name);
-    if (!role) return `No such access role: \`${name}\``;
+    if (!role) return this.notLive([name])!;
     if (!this.roleGrantableHere(role, inv)) {
       this.audit(inv, 'slash.add-role', persona.id, false, { role: name, reason: 'guild-containment' });
       return `\`${name}\` is scoped to another guild — only a portal superadmin can assign it.`;
@@ -371,10 +387,25 @@ export class SlashHandler {
     }
     // Same containment as granting: removing another guild's (or a global)
     // role changes the persona's access OUTSIDE this admin's authority.
-    const role = this.deps.permissions.getRole(name);
+    // A role set aside at load is contained by the guild its entry names, and
+    // one whose entry names no guild it can read is a superadmin's to remove,
+    // as in the admin panel. A name the catalog has never had keeps no guild.
+    const p = this.deps.permissions;
+    const role = p.getRole(name);
     if (role && !this.roleGrantableHere(role, inv)) {
       this.audit(inv, 'slash.remove-role', persona.id, false, { role: name, reason: 'guild-containment' });
       return `\`${name}\` is scoped to another guild — only a portal superadmin can remove it.`;
+    }
+    if (!role && p.isQuarantined(name) && !this.isSuper(inv.invoker)) {
+      const guildId = p.quarantinedGuildId(name);
+      if (guildId === undefined) {
+        this.audit(inv, 'slash.remove-role', persona.id, false, { role: name, reason: 'guild-unreadable' });
+        return `\`${name}\` can't be read (set aside when the relay loaded it) and names no guild the relay can read, so only a portal superadmin can remove it.`;
+      }
+      if (guildId !== inv.guildId) {
+        this.audit(inv, 'slash.remove-role', persona.id, false, { role: name, reason: 'guild-containment' });
+        return `\`${name}\` is scoped to another guild — only a portal superadmin can remove it.`;
+      }
     }
     const roles = this.visibleRoles(this.deps.permissions.removePersonaRole(persona.id, name), inv);
     this.audit(inv, 'slash.remove-role', persona.id, true, { role: name });
@@ -386,8 +417,8 @@ export class SlashHandler {
     const names = [inv.options.role, inv.options.role2, inv.options.role3].filter(
       (r): r is string => !!r,
     );
-    const unknown = names.filter((n) => !this.deps.permissions.getRole(n));
-    if (unknown.length) return `No such access role${unknown.length === 1 ? '' : 's'}: ${unknown.map((n) => `\`${n}\``).join(', ')}`;
+    const notLive = this.notLive(names);
+    if (notLive) return notLive;
     // Guild containment: the invite's roles carry their own scope, so an
     // uncontained mint here would hand out cross-guild/fleet-wide access.
     const uncontained = names.filter((n) => !this.roleGrantableHere(this.deps.permissions.getRole(n)!, inv));

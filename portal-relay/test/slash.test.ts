@@ -4,7 +4,7 @@
 // (channel-access for remove/caps, guild-access for ban/resync/remove-role).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Capability } from '@animalabs/portal-protocol';
@@ -168,6 +168,44 @@ test('/add-role and /remove-role mutate the persona role list', () => {
   }
 });
 
+test("roles set aside at load: /invite and add-role say they can't be read, and removing one keeps to the guild its entry names, or to a superadmin when it names none", () => {
+  const t = makeHandler();
+  try {
+    const path = (t.permissions as any).path as string;
+    const file = JSON.parse(readFileSync(path, 'utf8'));
+    file.roles['aside-here'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: [CHAN] }, guildId: GUILD };
+    file.roles['aside-g2'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: [CHAN] }, guildId: 'g2' };
+    // An entry naming its guild as a number, as a hand edit might: no guild the relay can read.
+    file.roles['aside-noguild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 5 };
+    file.personas['evander-1'] = { policy: { default: [] }, roles: ['aside-here', 'aside-g2', 'aside-noguild'] };
+    writeFileSync(path, JSON.stringify(file));
+    (t.permissions as any).reload();
+    const unreadable = /Access role `aside-here` can't be read \(set aside when the relay loaded it\), so the relay's operator must fix it first\./;
+    assert.match(t.handler.handle(t.inv('invite', { role: 'aside-here' })), unreadable);
+    assert.match(t.handler.handle(t.inv('add-role', { persona: 'ash-1', role: 'aside-here' })), unreadable);
+    const both = t.handler.handle(t.inv('invite', { role: 'nope', role2: 'aside-here' }));
+    assert.match(both, /No such access role: `nope`\./);
+    assert.match(both, unreadable);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-g2' })), /scoped to another guild/);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-here' })), /Removed `aside-here`/);
+    // One whose entry names no guild the relay can read is a superadmin's to remove, as in the panel.
+    const audited: any[] = [];
+    (t.handler as any).deps.audit = { append: (r: unknown) => audited.push(r) };
+    assert.equal(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-noguild' })),
+      "`aside-noguild` can't be read (set aside when the relay loaded it) and names no guild the relay can read, so only a portal superadmin can remove it.");
+    assert.ok(audited.some((a) => a.action === 'slash.remove-role' && a.ok === false && a.target === 'evander-1'
+      && a.detail?.role === 'aside-noguild' && a.detail?.reason === 'guild-unreadable'), JSON.stringify(audited));
+    assert.deepEqual(t.permissions.getRoleNames('evander-1'), ['aside-g2', 'aside-noguild']);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-noguild' }, SUPER)), /Removed `aside-noguild`/);
+    assert.deepEqual(t.permissions.getRoleNames('evander-1'), ['aside-g2']);
+    // A superadmin removes one naming another guild too.
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-g2' }, SUPER)), /Removed `aside-g2`/);
+    assert.deepEqual(t.permissions.getRoleNames('evander-1'), []);
+  } finally {
+    t.cleanup();
+  }
+});
+
 test('/invite mints a single-use invite carrying the given roles', () => {
   const t = makeHandler();
   try {
@@ -188,6 +226,41 @@ test('/invite mints a single-use invite carrying the given roles', () => {
     assert.deepEqual(t.invites.get('inv_TESTCODE')!.grant!.caps, LEVEL_CAPS.read);
 
     assert.match(t.handler.handle(t.inv('invite', { role: 'nope' })), /No such access role/);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("/ban takes off a role set aside at load that names this guild, and leaves one naming another guild or none", () => {
+  const t = makeHandler();
+  try {
+    const path = (t.permissions as any).path as string;
+    const file = JSON.parse(readFileSync(path, 'utf8'));
+    file.roles['aside-here'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: [CHAN] }, guildId: GUILD };
+    file.roles['aside-g2'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: [CHAN] }, guildId: 'g2' };
+    file.roles['aside-noguild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 5 };
+    file.personas['evander-1'] = { policy: { default: [] }, roles: ['aside-here', 'aside-g2', 'aside-noguild'] };
+    writeFileSync(path, JSON.stringify(file));
+    (t.permissions as any).reload();
+    const audited: any[] = [];
+    (t.handler as any).deps.audit = { append: (r: unknown) => audited.push(r) };
+    const reply = t.handler.handle(t.inv('ban', { persona: 'evander-1' }));
+    assert.deepEqual(t.permissions.getRoleNames('evander-1'), ['aside-g2', 'aside-noguild']);
+    // What the ban says and records names the role it took off.
+    assert.match(reply, /Removed guild role `aside-here`/, reply);
+    const rec = audited.find((a) => a.action === 'slash.ban');
+    assert.deepEqual(rec?.detail?.rolesRemoved, ['aside-here'], JSON.stringify(audited));
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('/remove-role of a name the catalog has never had removes it from the persona, as before', () => {
+  const t = makeHandler();
+  try {
+    t.permissions.addPersonaRoles('ash-1', ['never-was']);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'ash-1', role: 'never-was' })), /Removed `never-was`/);
+    assert.ok(!t.permissions.getRoleNames('ash-1').includes('never-was'), JSON.stringify(t.permissions.getRoleNames('ash-1')));
   } finally {
     t.cleanup();
   }

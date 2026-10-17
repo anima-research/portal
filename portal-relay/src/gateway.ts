@@ -356,7 +356,18 @@ export class Gateway {
       session.close(4003, 'registration disabled');
       return;
     }
-    const res = await this.hooks.enroll(d);
+    // A throw is a refusal the hook didn't word. Answer it as one, so the
+    // client isn't left waiting for a frame that never comes; the error
+    // itself is for the operator's log, not for the claimant. The hook may
+    // have thrown after it made the persona, and a register isn't
+    // idempotent, so the answer says what trying again may do.
+    let res: Awaited<ReturnType<NonNullable<GatewayHooks['enroll']>>>;
+    try {
+      res = await this.hooks.enroll(d);
+    } catch (err) {
+      this.sessionLog('register-error', session, `error="${logSafe((err as Error)?.message ?? String(err), 160)}"`);
+      res = { error: "registration failed on the relay, possibly after it made a persona and spent the invite, so registering again may make another or find the invite used; the error is in the relay's session log, for its operator" };
+    }
     // Enrollment hooks may await external work. A closed or closing socket
     // can't carry the result, and another identify/register may have won
     // while we waited. Neither may be promoted into a new live session here.

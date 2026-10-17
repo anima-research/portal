@@ -366,3 +366,29 @@ test('session lifecycle is logged: identify timing, auth reject, resume, close, 
     await gw.close();
   }
 });
+
+test('register: an enroll hook that throws is answered as a refusal, with the error in the log', async () => {
+  const lines: string[] = [];
+  const h: GatewayHooks = { ...hooks(), enroll: async () => { throw new Error('disk full'); } };
+  const gw = new Gateway(h, 30_000, { log: (l: string) => { lines.push(l); } });
+  gw.listen(PORT + 1);
+  // Closed here whatever happens: on a gateway that never answers, nothing else would.
+  let ws: WebSocket | undefined;
+  try {
+    ws = new WebSocket(`ws://127.0.0.1:${PORT + 1}`);
+    const frames = new Frames(ws);
+    const sock = ws;
+    await new Promise<void>((r) => sock.on('open', () => r()));
+    await frames.next((f) => f.op === 'hello');
+    const closed = new Promise<number>((resolve) => sock.on('close', (code) => resolve(code)));
+    sock.send(JSON.stringify({ op: 'register', d: { protocolVersion: 1, invite: 'good', desiredName: 'x' } }));
+    const refused = (await frames.next((f) => f.op === 'invalid_session')) as Extract<ServerFrame, { op: 'invalid_session' }>;
+    assert.equal(refused.d.reason, "registration failed on the relay, possibly after it made a persona and spent the invite, so registering again may make another or find the invite used; the error is in the relay's session log, for its operator");
+    assert.equal(refused.d.resumable, false);
+    assert.equal(await closed, 4003);
+    assert.ok(lines.some((l) => / register-error .*error="disk full"/.test(l)), lines.join('\n'));
+  } finally {
+    ws?.terminate();
+    await gw.close();
+  }
+});

@@ -2585,3 +2585,291 @@ test('persona rows: a guild-wide deny is flagged, and so are direct grants here 
     await s.close();
   }
 });
+
+const MINT_GRANT = { caps: ['VIEW_CHANNEL'], scope: { all: true } };
+// [the body, the field its refusal names]
+const MINT_REFUSED: Array<[Record<string, unknown>, string]> = [
+  [{ roles: ['r-g1'], maxUses: -1 }, 'maxUses'],
+  [{ roles: ['r-g1'], maxUses: 0 }, 'maxUses'],
+  [{ roles: ['r-g1'], subscriptions: [5] }, 'subscriptions'],
+  // Roles, a grant, a mode, a count, subscriptions or an expiry given as null, '' or false is not sent (the tests below).
+  [{ roles: ['r-g1'], maxUses: '5' }, 'maxUses'],
+  [{ roles: ['r-g1'], maxUses: true }, 'maxUses'],
+  [{ roles: ['r-g1'], subscriptions: 'c1' }, 'subscriptions'],
+  [{ roles: ['r-g1'], mode: 'augmnet' }, 'mode'],
+  // Dropped, roles that aren't a list would leave the grant alone, and an expiry that isn't a number of days would
+  // never expire.
+  [{ roles: 'r-g1', grant: MINT_GRANT }, 'roles'],
+  [{ roles: ['r-g1'], expiresInDays: '7' }, 'expiresInDays'],
+  [{ roles: ['r-g1'], expiresInDays: 0 }, 'expiresInDays'],
+  [{ roles: ['r-g1'], expiresInDays: -1 }, 'expiresInDays'],
+  [{ roles: ['r-g1'], expiresInDays: true }, 'expiresInDays'],
+  // Past a date's range, where building the date would throw and answer 500.
+  [{ roles: ['r-g1'], expiresInDays: 1e12 }, 'expiresInDays'],
+];
+for (const [body, field] of MINT_REFUSED) {
+  test(`invites: a mint of ${JSON.stringify(body)}, which a claim would refuse, is refused by name and stores nothing`, async () => {
+    const ctx = setupDeps([]);
+    const s = await signedIn(ctx);
+    try {
+      const before = storeBytes(ctx.dir);
+      const r = await s.call('POST', '/admin/g/G1/invites', body);
+      assert.equal(r.status, 400, JSON.stringify(r.body));
+      assert.equal(r.body.error.code, 'INVALID', JSON.stringify(r.body));
+      assert.ok(new RegExp(`\\b${field}\\b`).test(r.body.error.message), `names ${field}: ${JSON.stringify(r.body)}`);
+      assert.deepEqual(storeBytes(ctx.dir), before, 'nothing stored, nothing audited');
+    } finally {
+      await s.close();
+    }
+  });
+}
+
+test('invites: a mint whose maxUses JSON reads as infinite, 1e400, is refused by name and stores nothing', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    const before = storeBytes(ctx.dir);
+    // Sent as text, since JSON.stringify would send Infinity as null, which the route leaves out.
+    const r = await s.call('POST', '/admin/g/G1/invites', undefined, { raw: Buffer.from('{"roles":["r-g1"],"maxUses":1e400}'), type: 'application/json' });
+    assert.equal(r.status, 400, JSON.stringify(r.body));
+    assert.equal(r.body.error.code, 'INVALID', JSON.stringify(r.body));
+    assert.match(r.body.error.message, /invite maxUses must be a finite number above 0/, JSON.stringify(r.body));
+    assert.deepEqual(storeBytes(ctx.dir), before, 'nothing stored, nothing audited');
+  } finally {
+    await s.close();
+  }
+});
+
+test('invites: a mint with a fractional count is stored, as it reads', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], maxUses: 2.5 });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(ctx.invites.get(r.body.code)?.maxUses, 2.5, JSON.stringify(ctx.invites.get(r.body.code)));
+  } finally {
+    await s.close();
+  }
+});
+
+test('invites: a mint with expiresInDays expires that many days on, and one with it null, empty or false never expires', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    const week = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], expiresInDays: 7 });
+    assert.equal(week.status, 200, JSON.stringify(week.body));
+    const at = Date.parse(ctx.invites.get(week.body.code)?.expiresAt ?? '');
+    assert.ok(Math.abs(at - (Date.now() + 7 * 86_400_000)) < 60_000, `expires at ${new Date(at).toISOString()}`);
+    for (const expiresInDays of [null, '', false]) {
+      const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], expiresInDays });
+      assert.equal(r.status, 200, `${JSON.stringify(expiresInDays)}: ${JSON.stringify(r.body)}`);
+      assert.equal(ctx.invites.get(r.body.code)?.expiresAt, undefined, JSON.stringify(expiresInDays));
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+/** Hand-edits permissions.json and reloads it, as an operator's edit and a restart would. */
+function editPermissions(ctx: ReturnType<typeof setupDeps>, edit: (file: any) => void): void {
+  const path = (ctx.permissions as any).path as string;
+  const file = JSON.parse(readFileSync(path, 'utf8'));
+  edit(file);
+  writeFileSync(path, JSON.stringify(file));
+  (ctx.permissions as any).reload();
+}
+
+test('role catalog: a name set aside at load is in use: refused unless replaced in its own guild, with the entry as the audit\'s before', async () => {
+  const ctx = setupDeps(['admin1']);
+  const twoKeys = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G1' };
+  editPermissions(ctx, (f) => {
+    f.roles['two-keys'] = twoKeys;
+    f.roles['no-guild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true } };
+    f.roles['empty-guild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: '' };
+  });
+  const s = await signedIn(ctx, []);
+  const post = (body: unknown) => s.call('POST', '/admin/roles', body);
+  try {
+    assert.equal(ctx.permissions.isQuarantined('two-keys'), true);
+    const taken = await post({ name: 'two-keys', role: { caps: WRITE, scope: { all: true }, guildId: 'G2' } });
+    assert.equal(taken.status, 409, JSON.stringify(taken.body));
+    assert.equal(taken.body.error.code, 'EXISTS');
+    assert.deepEqual(taken.body.error.existing, { guildId: 'G1', setAside: true });
+    const otherGuild = await post({ name: 'two-keys', role: { caps: WRITE, scope: { all: true }, guildId: 'G2' }, replace: true, expectedGuildId: 'G2' });
+    assert.equal(otherGuild.body.error?.code, 'GUILD_MISMATCH', JSON.stringify(otherGuild.body));
+    assert.equal(ctx.permissions.isQuarantined('two-keys'), true, 'still set aside');
+    const repaired = await post({ name: 'two-keys', role: { caps: WRITE, scope: { all: true }, guildId: 'G1' }, replace: true, expectedGuildId: 'G1' });
+    assert.equal(repaired.status, 200, JSON.stringify(repaired.body));
+    assert.equal(ctx.permissions.isQuarantined('two-keys'), false);
+    const rec = ctx.deps.audit.read({ limit: 1 })[0];
+    assert.equal(rec.action, 'role.set');
+    assert.deepEqual(rec.before, twoKeys);
+    // An entry that names no guild has none to keep, so replace is enough.
+    const noGuild = await post({ name: 'no-guild', role: { caps: READ, scope: { all: true }, guildId: 'G1' }, replace: true });
+    assert.equal(noGuild.status, 200, JSON.stringify(noGuild.body));
+    // Nor does one whose guild is '', which names none.
+    assert.equal(ctx.permissions.isQuarantined('empty-guild'), true);
+    const emptyGuild = await post({ name: 'empty-guild', role: { caps: READ, scope: { all: true }, guildId: 'G1' }, replace: true });
+    assert.equal(emptyGuild.status, 200, JSON.stringify(emptyGuild.body));
+  } finally {
+    await s.close();
+  }
+});
+
+test('a role set aside at load can be revoked from a persona by an admin of the guild its entry names, and is assigned by nobody', async () => {
+  const ctx = setupDeps([]);
+  editPermissions(ctx, (f) => {
+    f.roles['aside-g1'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G1' };
+    f.roles['aside-g2'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G2' };
+    f.personas.p1.roles = ['aside-g1', 'aside-g2'];
+  });
+  const s = await signedIn(ctx);
+  try {
+    const assign = await s.call('POST', '/admin/g/G1/personas/p1/roles', { role: 'aside-g1' });
+    assert.equal(assign.status, 403, JSON.stringify(assign.body));
+    assert.match(assign.body.error.message, /role aside-g1 can't be read .*the relay's operator must fix it first/);
+    const foreign = await s.call('DELETE', '/admin/g/G1/personas/p1/roles/aside-g2');
+    assert.equal(foreign.status, 403, JSON.stringify(foreign.body));
+    const own = await s.call('DELETE', '/admin/g/G1/personas/p1/roles/aside-g1');
+    assert.equal(own.status, 200, JSON.stringify(own.body));
+    assert.deepEqual(ctx.permissions.getRoleNames('p1'), ['aside-g2']);
+  } finally {
+    await s.close();
+  }
+});
+
+test('remove from guild takes off a role set aside at load naming that guild, and says and records it', async () => {
+  const ctx = setupDeps([]);
+  editPermissions(ctx, (f) => {
+    f.roles['aside-g1'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G1' };
+    f.roles['aside-g2'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G2' };
+    f.personas.p1.roles = ['aside-g1', 'aside-g2'];
+  });
+  const s = await signedIn(ctx);
+  try {
+    const r = await s.call('POST', '/admin/g/G1/personas/p1/remove');
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual(r.body.rolesRemoved, ['aside-g1']);
+    assert.deepEqual(ctx.permissions.getRoleNames('p1'), ['aside-g2'], 'the other guild\'s set-aside role stays');
+    const rec = ctx.deps.audit.read({ guildId: 'G1' }).find((x) => x.action === 'persona.guild.remove')!;
+    assert.deepEqual(rec.before.roles, ['aside-g1']);
+  } finally {
+    await s.close();
+  }
+});
+
+for (const asSuper of [false, true]) {
+  test(`a role set aside at load naming another guild, or none it can read, is revoked by ${asSuper ? 'a super-admin' : 'no guild admin'}`, async () => {
+    const ctx = setupDeps(asSuper ? ['admin1'] : []);
+    editPermissions(ctx, (f) => {
+      f.roles['aside-g2'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G2' };
+      f.roles['aside-noguild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 5 };
+      f.personas.p1.roles = ['aside-g2', 'aside-noguild'];
+    });
+    const s = await signedIn(ctx);
+    try {
+      for (const role of ['aside-g2', 'aside-noguild']) {
+        const r = await s.call('DELETE', `/admin/g/G1/personas/p1/roles/${role}`);
+        assert.equal(r.status, asSuper ? 200 : 403, `${role}: ${JSON.stringify(r.body)}`);
+      }
+      assert.deepEqual(ctx.permissions.getRoleNames('p1'), asSuper ? [] : ['aside-g2', 'aside-noguild']);
+    } finally {
+      await s.close();
+    }
+  });
+}
+
+test('invites: a mint whose roles are null, empty, false or 0 beside a grant mints the grant alone, as if roles were left out', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    const grant = { caps: ['VIEW_CHANNEL'], scope: { channels: ['c1'] } };
+    for (const roles of [null, '', false, 0]) {
+      const r = await s.call('POST', '/admin/g/G1/invites', { roles, grant });
+      assert.equal(r.status, 200, `${JSON.stringify(roles)}: ${JSON.stringify(r.body)}`);
+      const inv = ctx.invites.get(r.body.code) as Record<string, unknown> | undefined;
+      assert.equal(inv?.roles, undefined, `${JSON.stringify(roles)} stored as ${JSON.stringify(inv)}`);
+      assert.deepEqual(inv?.grant, grant, `${JSON.stringify(roles)} stored as ${JSON.stringify(inv)}`);
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+test('invites: a mint with no roles and a grant of null, empty or false is refused as needing roles or a grant', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    for (const grant of [null, '', false]) {
+      const before = storeBytes(ctx.dir);
+      const r = await s.call('POST', '/admin/g/G1/invites', { grant });
+      assert.equal(r.status, 400, `${JSON.stringify(grant)}: ${JSON.stringify(r.body)}`);
+      assert.equal(r.body.error.message, 'invite needs roles or a grant', `${JSON.stringify(grant)}: ${JSON.stringify(r.body)}`);
+      assert.deepEqual(storeBytes(ctx.dir), before, `${JSON.stringify(grant)}: nothing stored`);
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+test('invites: a mint whose mode or subscriptions are 0 stores them as sent', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    for (const extra of [{ mode: 0 }, { subscriptions: 0 }]) {
+      const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], ...extra });
+      assert.equal(r.status, 200, `${JSON.stringify(extra)}: ${JSON.stringify(r.body)}`);
+      const inv = ctx.invites.get(r.body.code) as Record<string, unknown> | undefined;
+      const key = Object.keys(extra)[0]!;
+      assert.equal(inv?.[key], 0, `${JSON.stringify(extra)} stored as ${JSON.stringify(inv)}`);
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+test('invites: a mint whose mode, count or subscriptions are null, empty or false mints as if they were left out', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    for (const extra of [
+      { maxUses: null }, { maxUses: '' }, { maxUses: false }, { mode: null }, { mode: '' }, { mode: false },
+      { subscriptions: null }, { subscriptions: '' }, { subscriptions: false },
+    ]) {
+      const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], ...extra });
+      assert.equal(r.status, 200, `${JSON.stringify(extra)}: ${JSON.stringify(r.body)}`);
+      const inv = ctx.invites.get(r.body.code) as Record<string, unknown> | undefined;
+      const key = Object.keys(extra)[0]!;
+      assert.equal(inv?.[key], undefined, `${JSON.stringify(extra)} stored as ${JSON.stringify(inv)}`);
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+for (const asSuper of [false, true]) {
+  test(`invites: a hand-edited invite whose roles aren't a list, as ${asSuper ? 'a super-admin' : 'a guild admin'}, is ${asSuper ? 'refused by name at a claim' : 'hidden'}, and the guild's invite list still answers`, async () => {
+    const ctx = setupDeps(asSuper ? ['admin1'] : []);
+    // A number: read as roles, it threw in the guild admin's list and in the claim's ban check.
+    ctx.invites.mint({ code: 'roles-text', guildId: 'G1', roles: 5, mode: 'both', uses: 0 } as any);
+    ctx.invites.mint({ code: 'plain', guildId: 'G1', roles: ['r-g1'], mode: 'both', uses: 0 } as any);
+    const s = await signedIn(ctx);
+    try {
+      const list = await s.get('/admin/g/G1/invites');
+      assert.equal(list.status, 200, JSON.stringify(list.body));
+      const codes = (list.body.invites as Array<{ code: string }>).map((i) => i.code);
+      assert.ok(codes.includes('plain') && codes.includes('roles-text') === asSuper, JSON.stringify(codes));
+      const before = storeBytes(ctx.dir);
+      const claim = await s.call('POST', '/admin/g/G1/personas/p1/claim', { code: 'roles-text' });
+      if (asSuper) {
+        assert.equal(claim.status, 400, JSON.stringify(claim.body));
+        assert.equal(claim.body.error.message, 'invite roles must be a list of access role names — whoever minted it must mint a new one', JSON.stringify(claim.body));
+      } else {
+        assert.equal(claim.status, 404, JSON.stringify(claim.body));
+      }
+      assert.deepEqual(storeBytes(ctx.dir), before, 'nothing changed');
+    } finally {
+      await s.close();
+    }
+  });
+}

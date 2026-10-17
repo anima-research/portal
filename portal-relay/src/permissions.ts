@@ -76,8 +76,9 @@ export class PermissionsStore {
   private roles = new Map<string, AccessRole>();
   /** Catalog entries refused at load (no guildId / malformed): excluded from
    *  resolution but written back verbatim on persist — quarantine, not
-   *  deletion. A live entry created under the same name wins on merge. */
-  private quarantinedRoles: Record<string, unknown> = {};
+   *  deletion. setRole of the same name replaces one, and removeRole removes
+   *  one. Without a prototype, so a role named `__proto__` is kept as one. */
+  private quarantinedRoles: Record<string, unknown> = Object.create(null);
   private fileDefault: Capability[] = [];
   private listeners: Array<(c: PermissionChange) => void> = [];
   private file?: WatchedFile;
@@ -277,6 +278,24 @@ export class PermissionsStore {
     return this.roles.get(name);
   }
 
+  /** Whether `name` is a catalog entry quarantined at load: on disk, but
+   *  inert until it's fixed. */
+  isQuarantined(name: string): boolean {
+    return Object.hasOwn(this.quarantinedRoles, name);
+  }
+
+  /** A quarantined entry as it is on disk (cloned), or undefined. */
+  quarantinedEntry(name: string): unknown {
+    return this.isQuarantined(name) ? structuredClone(this.quarantinedRoles[name]) : undefined;
+  }
+
+  /** The guild a quarantined entry names, when it names one as a string that
+   *  isn't empty. */
+  quarantinedGuildId(name: string): string | undefined {
+    const e = this.isQuarantined(name) ? (this.quarantinedRoles[name] as { guildId?: unknown } | null) : undefined;
+    return typeof e?.guildId === 'string' && e.guildId ? e.guildId : undefined;
+  }
+
   /** The full access-role catalog (read-only snapshot) — admin panel pickers. */
   allRoles(): Record<string, AccessRole> {
     return Object.fromEntries([...this.roles].map(([k, v]) => [k, structuredClone(v)]));
@@ -454,17 +473,26 @@ export class PermissionsStore {
    *  references the role. */
   setRole(name: string, role: AccessRole): void {
     if (!role.guildId) throw new Error('roles are guild-scoped: guildId is required');
+    // The same rule loading quarantines by, so no role goes live that a reader can't read.
+    const shape = roleShapeProblem(role);
+    if (shape) throw new Error(`access role ${name} can't be read: ${shape}`);
     this.roles.set(name, role);
+    // The role written replaces a quarantined entry of its name, so a later
+    // removal doesn't write that entry back.
+    delete this.quarantinedRoles[name];
     this.persist();
     for (const [pid, e] of this.personas) {
       if (e.roles?.includes(name)) this.emit({ personaId: pid, scope: 'reload' });
     }
   }
 
-  /** Remove a named access role from the catalog. Personas referencing it lose
-   *  those caps on their next action (live revocation, §5.8). */
+  /** Remove a named access role from the catalog, live or quarantined.
+   *  Personas referencing it lose those caps on their next action (live
+   *  revocation, §5.8). */
   removeRole(name: string): boolean {
-    if (!this.roles.delete(name)) return false;
+    const live = this.roles.delete(name);
+    const quarantined = this.isQuarantined(name) && delete this.quarantinedRoles[name];
+    if (!live && !quarantined) return false;
     this.persist();
     for (const [pid, e] of this.personas) {
       if (e.roles?.includes(name)) this.emit({ personaId: pid, scope: 'reload' });
@@ -516,13 +544,22 @@ export class PermissionsStore {
     // fleet-wide. Loud, because a catalog entry silently granting nothing is
     // a debugging trap. Quarantined — not dropped — so the next persist()
     // doesn't destroy config the operator intends to repair.
-    this.quarantinedRoles = {};
+    this.quarantinedRoles = Object.create(null);
     this.roles = new Map(
       Object.entries(next.roles ?? {}).filter(([name, role]) => {
         if (!role || !role.guildId) {
           console.error(
             `[portal-relay] permissions: role "${name}" has no guildId — roles are guild-scoped; ` +
               `treating it as INERT until it gets one (entry preserved on save)`,
+          );
+          this.quarantinedRoles[name] = role;
+          return false;
+        }
+        const shape = roleShapeProblem(role);
+        if (shape) {
+          console.error(
+            `[portal-relay] permissions: role "${name}" can't be read (${shape}); ` +
+              `treating it as INERT until it is fixed (entry preserved on save)`,
           );
           this.quarantinedRoles[name] = role;
           return false;
@@ -596,11 +633,68 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
   VOICE_SPEAK: F.Speak,
 };
 
-/** The portal caps a permission bitfield supports (per-channel, post-overwrite).
- *  Backs full-fidelity `mirrorCaps` roles: what could a member holding exactly
- *  this role do here? EDIT_OWN/DELETE_OWN have no Discord bit (members always
- *  manage their own messages) — gated on SendMessages, mirroring
- *  {@link computeCapabilities}. */
+/** Why a catalog role can't be read as written, or null. A role is set aside
+ *  only where a reader would misread it, reading it otherwise than its writer
+ *  meant or than another reader does, or would throw: its guild must be a
+ *  string (loading sets aside one with no guild, '' included, before asking
+ *  here), its caps a list of strings or '', a `mirrorCaps` a boolean, a
+ *  number, null or '', and its scope an object naming at most one of `all`,
+ *  `channels`, `mirrorRoles` and `mirrorRole`, holding that kind's type, with
+ *  `all` true or off (false, 0, '' or null). Every relay writer makes one
+ *  scope key (an `all` it makes is true), a list of caps, and a `mirrorCaps`
+ *  only as a boolean on a mirror scope: the admin API allows no other, and a
+ *  mirror grant materializes one key and no `mirrorCaps`.
+ *  Every reader takes `mirrorCaps` by its truth, so a string that isn't empty
+ *  reads as on whatever it says, "false" included, and so do a list and an
+ *  object, which no writer means; '' reads as off, and a hand-written number
+ *  reads by its truth, as one who writes 0 for off and 1 for on means it.
+ *  A role whose scope is {} or one kind that names nothing (an `all` that is
+ *  off, a list that is empty or holds only '', a `mirrorRole` of ''), or
+ *  whose caps are an empty list or '', grants nothing in every reader and is
+ *  kept as a role (roleGrantsAccess). A Discord role or channel id written as
+ *  anything but a string names one its writer meant, which no reader finds,
+ *  since every reader looks ids up as strings, so it is set aside, and the
+ *  load warning names the role and its malformed key.
+ *  couldAccessGuild takes `all` by its truth where every
+ *  other reader wants true, so an `all` of 1 or "yes" reads two ways, and
+ *  readers don't share one order over a scope's keys (with `mirrorCaps`,
+ *  resolveForRoles reads the mirror keys before `all`), so a scope with two
+ *  keys can read one way in one place and another way in the next, and it is
+ *  set aside whatever its keys name. Read as
+ *  found, a scope that is null or not an object throws whenever a persona
+ *  holding the role is resolved, caps of a number throw where the role
+ *  reaches, a caps string with something in it is read a character at a
+ *  time, and channels as a string match channel ids as substrings in
+ *  scopeIncludes and throw in couldAccessGuild. */
+export function roleShapeProblem(role: AccessRole): string | null {
+  const r = role as unknown as Record<string, unknown>;
+  const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');
+  if (typeof r.guildId !== 'string') return 'guildId must be a string';
+  if (!strings(r.caps) && r.caps !== '') return 'caps must be a list of capability names';
+  if (r.mirrorCaps != null && r.mirrorCaps !== '' && typeof r.mirrorCaps !== 'boolean' && typeof r.mirrorCaps !== 'number') {
+    return `mirrorCaps must be true or false, not ${typeof r.mirrorCaps === 'string' ? 'a string, which reads as on whatever it says' : 'a list or an object, which reads as on'}`;
+  }
+  const sc = r.scope;
+  if (!sc || typeof sc !== 'object' || Array.isArray(sc)) return 'scope must be an object';
+  const kinds: Record<string, (v: unknown) => boolean> = {
+    all: (v) => v === true || !v,
+    channels: strings,
+    mirrorRoles: strings,
+    mirrorRole: (v) => typeof v === 'string',
+  };
+  const keys = Object.keys(sc);
+  if (keys.length === 0) return null;
+  // Each key quoted, so an empty one or one holding a comma shows as itself.
+  const named = (k: string) => JSON.stringify(k);
+  if (keys.length > 1) {
+    return `scope names ${keys.slice(0, -1).map(named).join(', ')} and ${named(keys[keys.length - 1]!)}, but may name only one of all, channels, mirrorRoles and mirrorRole`;
+  }
+  // Own keys only: a scope key named like an Object method (constructor,
+  // __proto__) is no kind.
+  if (!Object.hasOwn(kinds, keys[0]!)) return `scope names ${named(keys[0]!)}, which is none of all, channels, mirrorRoles and mirrorRole`;
+  return kinds[keys[0]!]!((sc as Record<string, unknown>)[keys[0]!]) ? null : `scope ${keys[0]} is malformed`;
+}
+
 /** Whether an access role can grant anything at all: some capability, over a
  *  scope that names something (every channel, at least one channel, or at
  *  least one Discord role to mirror). Only such a role ends a /ban. */
@@ -612,6 +706,11 @@ export function roleGrantsAccess(role: AccessRole | undefined): boolean {
   return named(sc.channels) || (typeof sc.mirrorRole === 'string' && sc.mirrorRole !== '') || named(sc.mirrorRoles);
 }
 
+/** The portal caps a permission bitfield supports (per-channel, post-overwrite).
+ *  Backs full-fidelity `mirrorCaps` roles: what could a member holding exactly
+ *  this role do here? EDIT_OWN/DELETE_OWN have no Discord bit (members always
+ *  manage their own messages) — gated on SendMessages, mirroring
+ *  {@link computeCapabilities}. */
 export function capsFromPerms(perms: Readonly<PermissionsBitField>): Set<Capability> {
   const out = new Set<Capability>();
   for (const cap of ALL_CAPS) {

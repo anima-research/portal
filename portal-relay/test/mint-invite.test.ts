@@ -544,3 +544,18 @@ test('an invite granting scope:{all} covers every channel of ITS guild only — 
     t.cleanup();
   }
 });
+
+test('outstanding-mint cap counts what a claim finds live: a hand-edited numeric expiry is expired', () => {
+  const t = makeRelay();
+  try {
+    const dead = Array.from({ length: 20 }, (_, i) => ({
+      code: `inv_dead${i}`, mintedBy: SPAWNER, maxUses: 1, uses: 0, expiresAt: 0, mode: 'mint',
+      grant: { caps: [...RW], scope: { channels: [CHAN_A] } }, guildId: GUILD,
+    }));
+    writeFileSync(join(t.dir, 'invites.json'), JSON.stringify({ invites: dead }));
+    t.relay.invites.reload();
+    assert.doesNotThrow(() => t.mint(SPAWNER, t.goodParams()));
+  } finally {
+    t.cleanup();
+  }
+});

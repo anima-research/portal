@@ -26,7 +26,7 @@ import { Gateway, type GatewayHooks, Session } from './gateway.js';
 import { GuildAllowStore, type GuildAllowChange } from './guild-allowlist.js';
 import { HistoryCache } from './history-cache.js';
 import { IdentityStore, type IdentityChange, generateToken, hashToken } from './identity.js';
-import { InviteStore, grantShapeProblem } from './invites.js';
+import { InviteStore, inviteModeProblem, inviteShapeProblem } from './invites.js';
 import { MessageStore, makeRelayId, parseRelayId, type MessageRef } from './message-store.js';
 import { MirrorCache } from './mirror-cache.js';
 import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities, roleGrantsAccess } from './permissions.js';
@@ -100,6 +100,24 @@ function sameAccessRole(a: AccessRole, b: AccessRole): boolean {
     return JSON.stringify([r.guildId, [...new Set(r.caps)].sort(), scope, !!r.mirrorCaps]);
   };
   return norm(a) === norm(b);
+}
+
+/** Why a register frame's own fields can't be used, or null. A name or an
+ *  avatar that isn't a string would throw mid-enroll or be stored as sent, and
+ *  subscriptions that aren't a list of channel ids would throw or be read a
+ *  character at a time. An empty or false name, avatar or subscriptions ('',
+ *  0, false or null) means none: the default name, no avatar
+ *  and no subscriptions.
+ *  Checked before anything is read or created. */
+function registerFieldProblem(d: RegisterData): string | null {
+  const f = d as unknown as Record<string, unknown>;
+  if (f.desiredName && typeof f.desiredName !== 'string') return 'register desiredName must be a string';
+  if (f.avatar && typeof f.avatar !== 'string') return 'register avatar must be a string';
+  const subs = f.subscriptions;
+  if (subs && !(Array.isArray(subs) && subs.every((c) => typeof c === 'string'))) {
+    return 'register subscriptions must be a list of channel ids';
+  }
+  return null;
 }
 
 export class Relay implements GatewayHooks {
@@ -689,18 +707,22 @@ export class Relay implements GatewayHooks {
    */
   async enroll(d: RegisterData): Promise<RegisteredData | { error: string }> {
     if (!this.invites) return { error: 'registration disabled' };
+    const frameProblem = registerFieldProblem(d);
+    if (frameProblem) return { error: frameProblem };
     const checked = this.invites.check(d.invite, Date.now());
     if (typeof checked === 'string') return { error: `invite ${checked}` };
     // RFC-005 §5.6: an augment-only invite cannot mint a new persona.
     if (checked.mode === 'augment') return { error: 'invite is augment-only' };
+    // Before anything is created or consumed, and before the machine-mint
+    // recheck reads its grant: an invite a claim can't read as written, or
+    // whose grant can't be applied, must fail loudly, not mint a persona with
+    // no access.
+    const grantProblem = this.inviteGrantProblem(checked);
+    if (grantProblem) return { error: grantProblem };
     // Machine mints re-verify the subset rule against the minter's CURRENT
     // rights — a revoked/demoted spawner's outstanding codes die here.
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) return { error: staleMint };
-    // Before anything is created or consumed: an invite whose grant can't be
-    // applied must fail loudly, not mint a persona with no access.
-    const grantProblem = this.inviteGrantProblem(checked);
-    if (grantProblem) return { error: grantProblem };
 
     const displayName = (d.desiredName || 'agent').slice(0, 80).trim() || 'agent';
     const clash = this.nameClash(displayName, d.uniqueName === true);
@@ -713,16 +735,18 @@ export class Relay implements GatewayHooks {
     const identity: PersonaIdentity = {
       id: personaId,
       displayName,
-      avatar: d.avatar ?? '',
+      avatar: d.avatar || '',
       token: hashToken(token), // stored hashed-at-rest (RFC-005 §5.9)
     };
     this.identity.upsert(identity);
     this.applyInviteGrant(personaId, checked);
     this.invites.consume(d.invite);
 
-    // Carry the invite's default subscriptions through to this session.
+    // Carry the invite's default subscriptions through to this session. The
+    // frame's own are a list, or '', 0, false or null for none: registerFieldProblem
+    // lets those through.
     if (checked.subscriptions?.length) {
-      d.subscriptions = [...new Set([...(d.subscriptions ?? []), ...checked.subscriptions])];
+      d.subscriptions = [...new Set([...(d.subscriptions || []), ...checked.subscriptions])];
     }
 
     console.error(`[portal-relay] enrolled persona "${personaId}" via invite (${checked.label ?? d.invite})`);
@@ -836,6 +860,13 @@ export class Relay implements GatewayHooks {
       }
       return name;
     }
+    // A role set aside at load under this name is replaced: the name is a
+    // digest of the grant's guild, roles and caps, so the entry was this
+    // grant's role unless a hand edit changed it. The log keeps what was
+    // there, for the relay's operator.
+    if (this.permissions.isQuarantined(name)) {
+      console.warn(`[portal-relay] mirror grant ${name}: replacing the entry set aside at load, which was ${JSON.stringify(this.permissions.quarantinedEntry(name))}`);
+    }
     this.permissions.setRole(name, role);
     return name;
   }
@@ -845,18 +876,29 @@ export class Relay implements GatewayHooks {
    * is created or a use is consumed, so a bad invite fails loudly instead of
    * minting a persona with no access. The grant (or legacy blanket caps) must
    * be well-formed and name its guild — every scope resolves within one guild
-   * (grantShapeProblem) — and a mirror grant must not collide with a
+   * — with every other field a claim reads of its declared type
+   * (inviteShapeProblem), and a mirror grant must not collide with a
    * different access role of the same name.
    */
   private inviteGrantProblem(inv: InviteTemplate): string | null {
-    const shape = grantShapeProblem(inv);
-    if (shape) return shape;
+    // The claimant can't change a stored invite, so the refusal says who can.
+    const shape = inviteShapeProblem(inv);
+    if (shape) return `${shape} — whoever minted it must mint a new one`;
     // A role name that resolves to nothing is refused, not stored: a name
     // left on a persona would come alive if a role of that name were created
     // later — possibly in another guild, by someone the invite's minter
-    // never meant to delegate to.
+    // never meant to delegate to. A role quarantined at load is still on
+    // disk, and only the relay's operator can repair it.
     const missing = (inv.roles ?? []).filter((r) => !this.permissions.getRole(r));
-    if (missing.length) return `invite names access role(s) that no longer exist: ${missing.join(', ')} — it must be re-minted`;
+    const unreadable = missing.filter((r) => this.permissions.isQuarantined(r));
+    const gone = missing.filter((r) => !this.permissions.isQuarantined(r));
+    if (unreadable.length && gone.length) {
+      return `invite names access role(s) that can't be read: ${unreadable.join(', ')}, which the relay's operator must fix, and that no longer exist: ${gone.join(', ')}, so whoever minted it must mint a new one`;
+    }
+    if (unreadable.length) {
+      return `invite names access role(s) that can't be read: ${unreadable.join(', ')} — the relay's operator must fix them`;
+    }
+    if (gone.length) return `invite names access role(s) that no longer exist: ${gone.join(', ')} — whoever minted it must mint a new one`;
     const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true } as Scope } : undefined);
     if (!grant || !inv.guildId) return null;
     if (isMirrorScope(grant.scope)) {
@@ -975,15 +1017,10 @@ export class Relay implements GatewayHooks {
     }
     // Outstanding-mint cap: a minter may hold at most 20 live unclaimed codes.
     const now = Date.now();
-    const outstanding = this.invites.all().filter((inv) => {
-      if (inv.mintedBy !== personaId) return false;
-      if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return false;
-      if (inv.expiresAt) {
-        const at = Date.parse(inv.expiresAt);
-        if (!Number.isFinite(at) || at <= now) return false;
-      }
-      return true;
-    }).length;
+    // Counted by check()'s own expiry and use rules: a code it finds neither
+    // expired nor used up.
+    const invites = this.invites;
+    const outstanding = invites.all().filter((inv) => inv.mintedBy === personaId && invites.check(inv.code, now) === inv).length;
     if (outstanding >= 20) {
       reject('FORBIDDEN', 'too many outstanding unclaimed invites for this minter (max 20)');
     }
@@ -1083,19 +1120,24 @@ export class Relay implements GatewayHooks {
     // the recheck's distinct messages) whether the minter still exists / is
     // still allowlisted / still holds rights. The recheck below is NOT dead
     // code — it is load-bearing for hand-edited mintedBy + mode:'both' invites.
+    // A mode outside the three gets the shape check's reason, since
+    // "mint-only" would be false for it.
     if (checked.mode !== 'augment' && checked.mode !== 'both') {
+      const mode = inviteModeProblem(checked);
+      if (mode) throw rpcError('INVALID_PARAMS', `${mode} — whoever minted it must mint a new one`);
       throw rpcError('FORBIDDEN', 'invite is not claimable (mint-only)');
     }
-    const staleMint = this.recheckMachineMint(checked);
-    if (staleMint) throw rpcError('FORBIDDEN', staleMint);
     // Roles AND grant: an /invite carries roles plus a direct grant on the
     // channel it was run in, and an augment must apply both. Validate ALL of
     // it before changing anything: a rejection must leave the persona as it
     // was and the invite unconsumed — otherwise a rejected claim still grants
-    // its roles, and can be repeated past maxUses.
-    const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
+    // its roles, and can be repeated past maxUses. The shape comes before the
+    // machine-mint recheck, which reads the grant.
     const grantProblem = this.inviteGrantProblem(checked);
     if (grantProblem) throw rpcError('INVALID_PARAMS', grantProblem);
+    const staleMint = this.recheckMachineMint(checked);
+    if (staleMint) throw rpcError('FORBIDDEN', staleMint);
+    const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
     // A persona banned from a guild (/ban) can't give itself access there
     // again by claiming an invite — only an admin can. An admin-initiated
     // claim is that admin's decision, and lifts the ban in each guild where

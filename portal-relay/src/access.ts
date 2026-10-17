@@ -347,10 +347,12 @@ export function removeFromGuild(
   personaId: string,
   guildId: string,
 ): RemovedFromGuild {
-  // Guild-scoped access roles off, inline guild policy pinned to deny.
+  // Guild-scoped access roles off, inline guild policy pinned to deny. A role
+  // set aside at load counts by the guild its entry names: it is still held by
+  // name, and a repair would make it live again here.
   const rolesRemoved = permissions
     .getRoleNames(personaId)
-    .filter((name) => permissions.getRole(name)?.guildId === guildId);
+    .filter((name) => (permissions.getRole(name)?.guildId ?? permissions.quarantinedGuildId(name)) === guildId);
   for (const name of rolesRemoved) permissions.removePersonaRole(personaId, name);
   permissions.clearGuild(personaId, guildId);
   return { rolesRemoved, accessFullyRevoked: !canAccessGuild(personaId, guildId) };
