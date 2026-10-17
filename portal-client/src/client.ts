@@ -111,6 +111,13 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   private backoff = 1000;
   private closedByUser = false;
   private ready = false;
+  /** RPC frames waiting for a session that can take them: identified (`ready`
+   *  or `resumed`) and on an OPEN socket. Held through startup, reconnects and
+   *  a CLOSING socket, and flushed by flushOutbox in call order. Each frame is
+   *  serialized when the call is made, so a caller mutating its params
+   *  afterwards can't change what gets sent. Each call's own timer still
+   *  bounds how long it waits; close() rejects them. */
+  private outbox: Array<{ id: string; json: string }> = [];
 
   constructor(options: PortalClientOptions) {
     super();
@@ -150,19 +157,39 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   close(): void {
     this.closedByUser = true;
     if (this.heartbeat) clearInterval(this.heartbeat);
+    // Unsent work dies with the client: a later connect() must not run an
+    // operation the caller issued before shutting down. Calls already sent
+    // keep their timers, since a result can still arrive before the socket
+    // finishes closing.
+    const held = this.outbox;
+    this.outbox = [];
+    for (const { id } of held) {
+      const pending = this.pending.get(id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pending.delete(id);
+        pending.reject(new Error('RPC cancelled: client closed'));
+      }
+    }
     this.ws?.close(1000, 'client closing');
   }
 
   /** Typed RPC call. */
   call<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>> {
+    if (this.closedByUser) return Promise.reject(new Error('RPC cancelled: client closed'));
     const id = `rpc_${randomUUID()}`;
     return new Promise<RpcResult<M>>((resolve, reject) => {
+      const json = JSON.stringify({ op: 'rpc', d: { id, method, params } });
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        // A call that timed out while held must not be sent later, nor pile
+        // up across a long outage.
+        this.outbox = this.outbox.filter((f) => f.id !== id);
         reject(new Error(`RPC ${method} timed out`));
       }, this.opts.rpcTimeoutMs);
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
-      this.sendFrame({ op: 'rpc', d: { id, method, params } });
+      this.outbox.push({ id, json });
+      if (this.ready) this.flushOutbox();
     });
   }
 
@@ -268,11 +295,13 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         this.sessionId = frame.d.sessionId;
         this.lastSeq = frame.d.seq;
         this.cache.hydrate(frame.d);
+        this.flushOutbox();
         this.emit('ready', frame.d);
         return;
       case 'resumed':
         this.ready = true;
         this.backoff = 1000;
+        this.flushOutbox();
         this.emit('resumed', frame.d.replayedEvents);
         return;
       case 'invalid_session':
@@ -437,10 +466,24 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     this.emit('close', { code, willReconnect });
   }
 
+  /** Send the held RPCs in call order. `ready` alone isn't enough: a socket
+   *  can be CLOSING before its close event resets `ready`, so whatever trySend
+   *  refuses stays held for the next `ready`/`resumed`. */
+  private flushOutbox(): void {
+    while (this.outbox.length > 0 && this.trySend(this.outbox[0].json)) this.outbox.shift();
+  }
+
+  /** Control frames (identify, resume, heartbeat) are dropped when the socket
+   *  isn't OPEN; the next connection sends its own. */
   private sendFrame(frame: unknown): void {
-    if (this.ws && this.ws.readyState === this.ws.OPEN) {
-      this.ws.send(JSON.stringify(frame));
-    }
+    this.trySend(JSON.stringify(frame));
+  }
+
+  /** Send on an OPEN socket. Returns false, sending nothing, otherwise. */
+  private trySend(json: string): boolean {
+    if (!this.ws || this.ws.readyState !== this.ws.OPEN) return false;
+    this.ws.send(json);
+    return true;
   }
 }
 
