@@ -29,7 +29,14 @@ test('failed unsubscribe restores reconnect state', async () => {
   internal.call = async () => {
     throw new Error('relay unavailable');
   };
+  // Channels the relay has: a failed unsubscribe doesn't put back one it removed.
+  client.cache.hydrate({
+    sessionId: 's1', seq: 0, persona: { id: 'p', displayName: 'P', avatarUrl: '' },
+    guilds: [{ id: 'g', name: 'G' }],
+    channels: ['c1', 'c2'].map((id) => ({ id, guildId: 'g', name: id, type: 'text' as const, capabilities: ['VIEW_CHANNEL' as const] })),
+  });
 
   await assert.rejects(client.unsubscribe('c1'), /relay unavailable/);
-  assert.deepEqual(internal.opts.subscriptions, ['c1', 'c2']);
+  // Back in the list, at its end: the order a reconnect asks in means nothing.
+  assert.deepEqual([...(internal.opts.subscriptions ?? [])].sort(), ['c1', 'c2']);
 });

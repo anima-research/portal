@@ -43,8 +43,11 @@ export class AgentState {
   /** channelId → unseen messages (above the watermark), oldest first. */
   private unseen = new Map<string, PortalMessage[]>();
   private pings: PendingPing[] = [];
-  /** Channels this agent ambiently subscribes to. Durable agent state — the
-   *  source of truth for what the relay session should be subscribed to. */
+  /** Channels this agent ambiently follows. Durable. Standalone, the client is
+   *  built with them and the agent keeps the two together; where the host owns
+   *  channel lifecycle, they're offered to it as initiallyOpen hints where it
+   *  grants channels.register (server.ts), and the channels it opens make the
+   *  client's list. */
   private subscriptions = new Set<string>();
   /** Channels opted into live reaction visibility (per-channel, default off).
    *  Reactions from these channels surface in context but NEVER wake the agent

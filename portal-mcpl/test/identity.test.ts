@@ -385,6 +385,25 @@ test('the subscription seed is handed out once per process (a switch back to roo
   assert.equal(next(), undefined);
 });
 
+test("a session whose host owns channel lifecycle starts its client's list empty; a standalone one starts it from the state", async () => {
+  // In host mode the state's follows only seed the host's initiallyOpen hints,
+  // and the channels the host opens make the client's list, which identify
+  // carries and a resume replays.
+  const { buildSession } = await import('../src/session.js');
+  const dir = mkdtempSync(join(tmpdir(), 'portal-hostlist-'));
+  const hosted = buildSession(ROOT, {
+    url: 'ws://test', stateDir: dir, seedSubscriptions: ['111'], agent: { hostOwnsChannelLifecycle: true },
+  });
+  assert.deepEqual(hosted.agent.state.subscriptionList(), ['111']);
+  assert.equal(hosted.client.isSubscribed('111'), false);
+  hosted.close?.();
+  const standalone = buildSession(ROOT, { url: 'ws://test', stateDir: dir });
+  assert.deepEqual(standalone.agent.state.subscriptionList(), ['111']);
+  assert.equal(standalone.client.isSubscribed('111'), true);
+  standalone.close?.();
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('two processes sharing a roster both keep their minted identities', async () => {
   const h = harness({ invite: 'inv' });
   const other = h.make();

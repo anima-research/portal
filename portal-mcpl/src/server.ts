@@ -643,19 +643,15 @@ export class PortalMcplServer {
         );
       }
     }));
-    track(this.client.on('resumed', () => {
-      // A Portal transport resume restores event delivery but the relay session
-      // starts with no ambient subscriptions. Reassert actual host-open state;
-      // a fresh identify already receives the client's mutable replay set.
-      for (const channelId of this.openChannels) {
-        void this.client.subscribe(channelId).catch((err) =>
-          console.error(
-            `[portal-mcpl] failed to restore open channel ${channelId}:`,
-            (err as Error).message,
-          ),
-        );
-      }
-    }));
+    // No `resumed` handler subscribes the open channels again: the client asks
+    // the relay for its own list on a resume, as identify carries it.
+    // handleChannelOpen records a channel open only once the client has
+    // subscribed it, and handleChannelClose records it closed only once the
+    // unsubscribe succeeds, so the client's list holds every channel opened
+    // that way. Subscribing here as well would put back a channel whose close
+    // is still waiting. One case stays open but unlisted: a channel whose
+    // reopen under a new identity failed (swapSession, without
+    // channels.register), which nothing tries again.
     track(this.client.on('message', (e) => {
       // Self-echo filter: the relay dispatches the persona's OWN webhook posts
       // back to it like any other channel message. Re-ingesting them is pure
@@ -1267,6 +1263,12 @@ export class PortalMcplServer {
       removed.push(id);
       this.openChannels.delete(channelId); // openChannels holds RAW relay ids
       this.agent.state.unsubscribe(channelId);
+      // Out of the client's list too, whatever it holds now: a reconnect asks
+      // for every listed channel, and would subscribe this one again if it came
+      // back into view. As the newest call on the channel, this leaves a close
+      // still waiting nothing to put back, and if this one fails, the client
+      // doesn't put back a channel its cache has dropped.
+      void this.client.unsubscribe(channelId).catch(() => {});
     }
     this.pendingRemovals.clear();
     if (removed.length) {
