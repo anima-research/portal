@@ -300,6 +300,51 @@ test('a subscribe whose frame a dropped socket lost times out after a newer one 
   assert.ok(!ws.subscriptionCalls().some(([method]) => method === 'unsubscribe_channel'), 'nothing unsubscribed it');
 });
 
+test('a newer call that fails after an older one on the channel settled still undoes its change', async (t) => {
+  // The older call's settling leaves the newer call's number in place.
+  const { client, sockets } = await connected(t, ['c1']);
+  const ws = sockets[0];
+  const older = client.unsubscribe('c1');
+  const newer = client.subscribe('c1');
+  ws.answer('unsubscribe_channel', 'c1', true);
+  await older;
+  ws.answer('subscribe_channel', 'c1', false);
+  await assert.rejects(newer, /refused c1/);
+  assert.deepEqual(listOf(client), [], 'the failed subscribe takes c1 back out');
+  assert.deepEqual(ws.subscriptionCalls(), [['unsubscribe_channel', 'c1'], ['subscribe_channel', 'c1'], ['unsubscribe_channel', 'c1']]);
+});
+
+test('a settled call leaves no number behind for its channel', async (t) => {
+  // A long-running client meets many short-lived channels, such as threads.
+  const { client, sockets } = await connected(t, []);
+  const ws = sockets[0];
+  const numbers = () => (client as unknown as { newestSubscriptionCall: Map<string, number> }).newestSubscriptionCall;
+  const subscribing = client.subscribe('c1');
+  assert.equal(numbers().size, 1, 'a waiting call keeps its number');
+  ws.answer('subscribe_channel', 'c1', true);
+  await subscribing;
+  assert.equal(numbers().size, 0, 'none after a call that succeeded');
+  const failing = client.unsubscribe('c1');
+  ws.answer('unsubscribe_channel', 'c1', false);
+  await assert.rejects(failing, /refused c1/);
+  assert.equal(numbers().size, 0, 'none after a call that failed');
+});
+
+test('a call still waiting at close() sends no reassert when it times out', async (t) => {
+  // Nothing would hear it, and its timer would keep the process up for another
+  // rpcTimeoutMs. The undo still runs, so the next connect() sends the list as
+  // the call left it.
+  const { client } = await connected(t, []);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const subscribing = client.subscribe('c1').catch((error: unknown) => error);
+  client.close();
+  t.mock.timers.tick(300); // the call's timeout (rpcTimeoutMs 300)
+  assert.match(String(await subscribing), /timed out/);
+  assert.deepEqual(listOf(client), []);
+  const pending = (client as unknown as { pending: Map<string, unknown> }).pending;
+  assert.equal(pending.size, 0, 'no call left waiting, so no timer');
+});
+
 test('a channel the relay refuses on a resume stays in the list, and nothing rejects or reports an error', async (t) => {
   const { client, sockets, errors } = await connected(t, ['c1']);
   drop(sockets[0]);

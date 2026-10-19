@@ -118,7 +118,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   private closedByUser = false;
   private ready = false;
   /** The newest subscribe or unsubscribe call on each channel, by number
-   *  (subscriptionCall): one entry per channel ever called. */
+   *  (subscriptionCall), while that call is waiting. */
   private readonly newestSubscriptionCall = new Map<string, number>();
   private subscriptionCalls = 0;
 
@@ -454,6 +454,10 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         this.reassertSubscription(channelId);
       }
       throw error;
+    } finally {
+      // The numbers only grow, so a call made before this one still finds
+      // another number here, or none, and isn't the newest.
+      if (this.newestSubscriptionCall.get(channelId) === call) this.newestSubscriptionCall.delete(channelId);
     }
   }
 
@@ -463,8 +467,11 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
    * channel once, its answer ignored. A failed call can still have reached
    * the relay, with only its reply lost, so without this the relay could keep a
    * subscription the list has dropped, or have dropped one the list keeps.
+   * After close() it sends nothing: the next connect() rebuilds the relay's set
+   * from the list, and a call now would only start a timer.
    */
   private reassertSubscription(channelId: string): void {
+    if (this.closedByUser) return;
     const listed = (this.opts.subscriptions ?? []).includes(channelId);
     this.call(listed ? 'subscribe_channel' : 'unsubscribe_channel', { channelId }).catch(() => {});
   }
