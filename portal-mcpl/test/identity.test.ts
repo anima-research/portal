@@ -384,11 +384,11 @@ test('without channels.register, the follows in the state are reported once as n
     console.error = realError;
   }
   const notes = errors.filter((args) => String(args[0]).includes("aren't open"));
-  assert.equal(notes.length, 1, 'once for the identity, however often the policy activates');
+  assert.equal(notes.length, 1, "once for the session's agent, however often the policy activates");
   assert.match(String(notes[0]![0]), /^\[portal-mcpl\] 2 followed channel\(s\)/);
   assert.match(
     String(notes[0]![0]),
-    /grant channels\.register, or, where the host has channels\.lifecycle, open each from the host with channels\/open/,
+    /grant channels\.register and channels\.lifecycle, so they reach the host as initiallyOpen hints it can open, or grant channels\.lifecycle and open each from the host with channels\/open/,
   );
 });
 

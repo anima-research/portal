@@ -482,8 +482,8 @@ test("a standalone agent's auto-subscribe keeps the durable state as the client'
 });
 
 test("a standalone agent's subscription tools keep the durable state as the client's list leaves each channel", async () => {
-  // The client is built with the state's list (session.ts), and holds `channel`
-  // in its cache, so a failed unsubscribe of it puts it back.
+  // The client is built with the state's list (session.ts). A failed
+  // unsubscribe puts its channel back, since its caller still holds it.
   const c = channel.id;
   const [a, d] = ['1526659685036331001', '1526659685036331004'];
   const client = clientWithChannel([c]);
@@ -769,6 +769,45 @@ test('a removal that lands while an open waits for its subscribe leaves the chan
   assert.equal(t.internal.openChannels.has(channel.id), false, 'not open');
   assert.equal(t.client.isSubscribed(channel.id), false, 'not listed');
   assert.deepEqual(t.notifications.at(-1)?.params, { removed: [`portal:${channel.id}`] }, 'the host was told');
+});
+
+test("an open whose subscribe fails leaves the channel closed and out of the client's list", async () => {
+  // openChannels changes only once the call has succeeded.
+  const t = await registeredServer();
+  const { nth } = heldCalls(t.client);
+  const open = (t.server as unknown as {
+    handleChannelOpen(params: { channelId: string; type: string; address: unknown }): Promise<unknown>;
+  }).handleChannelOpen({ channelId: `portal:${channel.id}`, type: 'portal', address: {} });
+  await settle();
+  const subscribing = nth('subscribe_channel', channel.id, 0);
+  assert.ok(subscribing, "the open's subscribe went out");
+  assert.equal(t.internal.openChannels.has(channel.id), false, 'not open while the subscribe waits');
+  subscribing.answer(false);
+  await assert.rejects(open, /refused/);
+  assert.equal(t.internal.openChannels.has(channel.id), false, 'not open');
+  assert.equal(t.client.isSubscribed(channel.id), false, 'not listed');
+});
+
+test('a close whose unsubscribe fails leaves the channel open and listed, and subscribes it again', async () => {
+  // The host still holds the channel open, as the failure tells it.
+  const t = await registeredServer();
+  const { nth } = heldCalls(t.client);
+  const handlers = t.server as unknown as {
+    handleChannelOpen(params: { channelId: string; type: string; address: unknown }): Promise<unknown>;
+    handleChannelClose(params: { channelId: string }): Promise<unknown>;
+  };
+  const open = handlers.handleChannelOpen({ channelId: `portal:${channel.id}`, type: 'portal', address: {} });
+  await settle();
+  nth('subscribe_channel', channel.id, 0).answer(true);
+  await open;
+  const close = handlers.handleChannelClose({ channelId: `portal:${channel.id}` });
+  await settle();
+  assert.equal(t.internal.openChannels.has(channel.id), true, 'still open while the unsubscribe waits');
+  nth('unsubscribe_channel', channel.id, 0).answer(false);
+  await assert.rejects(close, /refused/);
+  assert.equal(t.internal.openChannels.has(channel.id), true, 'still open');
+  assert.equal(t.client.isSubscribed(channel.id), true, 'listed again');
+  assert.ok(nth('subscribe_channel', channel.id, 1), 'subscribed again on the relay');
 });
 
 test('a channel arriving via live channel_create is announced as added', async () => {

@@ -127,7 +127,8 @@ export class PortalMcplServer {
    *  (a removal can land while channels/register is in flight, before
    *  `advertised` is stamped — retracting inline would silently miss it). */
   private pendingRemovals = new Set<string>();
-  /** Identities whose follows noteUnofferedFollows has already reported. */
+  /** Agents whose follows noteUnofferedFollows has already reported. Each
+   *  session, a persona switch's included, brings an agent of its own. */
   private readonly unofferedFollowsNoted = new WeakSet<PortalAgent>();
   private initialRegistrationComplete = false;
   private registrationInFlight: Promise<void> | null = null;
@@ -468,10 +469,11 @@ export class PortalMcplServer {
   /** Without channels.register the host gets no channel list, so the
    *  state's follows (PORTAL_SUBSCRIPTIONS, and follows saved before host
    *  mode) reach it as no initiallyOpen hints, and in host mode the client's
-   *  list starts empty: they open nothing. Say so once for each identity,
-   *  counting the follows not already open, when the policy arrives and when
-   *  a switch brings another identity's state, rather than leave them unused
-   *  without a word. */
+   *  list starts empty: they open nothing. Say so once for each session's
+   *  agent, counting the follows not already open, when the policy arrives and
+   *  when a switch brings another identity's state, rather than leave them
+   *  unused without a word. channels/open needs channels.lifecycle, so the
+   *  advice names it. */
   private noteUnofferedFollows(): void {
     const agent = this.agent;
     const unopened = agent.state.subscriptionList().filter((channelId) => !this.openChannels.has(channelId));
@@ -480,8 +482,8 @@ export class PortalMcplServer {
     console.error(
       `[portal-mcpl] ${unopened.length} followed channel(s), from PORTAL_SUBSCRIPTIONS or follows saved before, ` +
         "aren't open: this host doesn't grant channels.register, so they can't be offered to it. To open them, " +
-        'grant channels.register, or, where the host has channels.lifecycle, open each from the host with ' +
-        'channels/open.',
+        'grant channels.register and channels.lifecycle, so they reach the host as initiallyOpen hints it can ' +
+        'open, or grant channels.lifecycle and open each from the host with channels/open.',
     );
   }
 
