@@ -484,12 +484,10 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
    * before `resumed` is emitted. The answers aren't awaited. A channel the relay
    * refuses, such as one this persona can no longer view, stays in the list, as
    * identify's restore drops a refused channel without a word: the next resume
-   * or identify asks again.
+   * or identify asks again. After close(), call() refuses each of these, so a
+   * `resumed` frame that arrives then asks the relay for nothing.
    */
   private restoreSubscriptions(): void {
-    // After close(), as for a reassert: the next connect() identifies with the
-    // list, and a call now would only start a timer.
-    if (this.closedByUser) return;
     for (const channelId of this.opts.subscriptions ?? []) {
       this.call('subscribe_channel', { channelId }).catch(() => {});
     }
@@ -565,11 +563,10 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
    * channel once, its answer ignored. A failed call can still have reached
    * the relay, with only its reply lost, so without this the relay could keep a
    * subscription the list has dropped, or have dropped one the list keeps.
-   * After close() it sends nothing: the next connect() rebuilds the relay's set
-   * from the list, and a call now would only start a timer.
+   * After close(), call() refuses it, and the next connect() rebuilds the
+   * relay's set from the list.
    */
   private reassertSubscription(channelId: string): void {
-    if (this.closedByUser) return;
     const listed = (this.opts.subscriptions ?? []).includes(channelId);
     this.call(listed ? 'subscribe_channel' : 'unsubscribe_channel', { channelId }).catch(() => {});
   }
