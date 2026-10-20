@@ -547,6 +547,16 @@ export class PortalMcplServer {
 
     // Commit actual lifecycle only after requested history succeeds.
     await this.client.subscribe(channelId);
+    // serve() handles one host request at a time, so only a removal of the
+    // channel (flushRemovals, which tells the host it's gone) can have taken it
+    // out of the client's list meanwhile: then the open doesn't stand.
+    if (!this.client.isSubscribed(channelId)) {
+      throw new Error(
+        `Nothing was opened: ${portalChannelId(channelId)} was removed from this persona's view while it was being ` +
+          "opened, and the host has been told it's gone. If it comes back into view, it's offered again and can be " +
+          'opened then.',
+      );
+    }
     this.openChannels.add(channelId);
     return result;
   }
@@ -646,11 +656,14 @@ export class PortalMcplServer {
     // No `resumed` handler subscribes the open channels again: the client asks
     // the relay for its own list on a resume, as identify carries it.
     // handleChannelOpen records a channel open only once the client has
-    // subscribed it, and handleChannelClose records it closed only once the
-    // unsubscribe succeeds, so the client's list holds every channel opened
-    // that way. Subscribing here as well would put back a channel whose close
-    // is still waiting. A reopen under a new identity (swapSession, without
-    // channels.register) keeps its channel listed even when it fails.
+    // subscribed it, and only if a removal hasn't taken it out of the list
+    // meanwhile; handleChannelClose records it closed only once the
+    // unsubscribe succeeds. serve() handles one host request at a time, so the
+    // host's opens and closes of a channel never overlap, and the client's
+    // list holds every channel opened that way. A reopen under a new identity
+    // (swapSession, without channels.register) keeps its channel listed even
+    // when it fails. Subscribing here as well would put back a channel whose
+    // close is still waiting.
     track(this.client.on('message', (e) => {
       // Self-echo filter: the relay dispatches the persona's OWN webhook posts
       // back to it like any other channel message. Re-ingesting them is pure
