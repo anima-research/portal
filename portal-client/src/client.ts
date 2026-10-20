@@ -140,6 +140,13 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   /** The reconnect onClose scheduled, until it runs or cancelReconnect()
    *  cancels it: close(), a connect(), or onClose scheduling the next. */
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  /** RPC frames waiting for a session that can take them: identified (`ready`
+   *  or `resumed`) and on an OPEN socket. Held through startup, reconnects and
+   *  a CLOSING socket, and flushed by flushOutbox in call order. Each frame is
+   *  serialized when the call is made, so a caller mutating its params
+   *  afterwards can't change what gets sent. Each call's own timer still
+   *  bounds how long it waits; close() rejects them. */
+  private outbox: Array<{ id: string; json: string }> = [];
 
   constructor(options: PortalClientOptions) {
     super();
@@ -181,8 +188,26 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
    *  backoff, so a closed client stays closed until connect(). */
   close(): void {
     this.closedByUser = true;
+    // A real socket's close event comes only after its closing handshake, so
+    // close() marks the session gone itself: a connect() made before then
+    // holds calls until its own session is ready.
+    this.ready = false;
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.cancelReconnect();
+    // Unsent work dies with the client: a later connect() must not run an
+    // operation the caller issued before shutting down. Calls already sent
+    // keep their timers, since a result can still arrive before the socket
+    // finishes closing.
+    const held = this.outbox;
+    this.outbox = [];
+    for (const { id } of held) {
+      const pending = this.pending.get(id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pending.delete(id);
+        pending.reject(new Error('RPC cancelled: client closed'));
+      }
+    }
     this.ws?.close(1000, 'client closing');
   }
 
@@ -193,14 +218,25 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
 
   /** Typed RPC call. */
   call<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>> {
+    if (this.closedByUser) return Promise.reject(new Error('RPC cancelled: client closed'));
     const id = `rpc_${randomUUID()}`;
     return new Promise<RpcResult<M>>((resolve, reject) => {
+      const json = JSON.stringify({ op: 'rpc', d: { id, method, params } });
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`RPC ${method} timed out`));
+        // A call that timed out while held must not be sent later, nor pile
+        // up across a long outage. It never ran, so a retry is safe; one that
+        // was sent may have run, and its error says so. Both keep "timed out",
+        // which callers may match.
+        const held = this.outbox.some((f) => f.id === id);
+        this.outbox = this.outbox.filter((f) => f.id !== id);
+        reject(new Error(held
+          ? `RPC ${method} timed out before it was sent: no relay session within ${this.opts.rpcTimeoutMs} ms`
+          : `RPC ${method} timed out after it was sent; it may have run`));
       }, this.opts.rpcTimeoutMs);
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
-      this.sendFrame({ op: 'rpc', d: { id, method, params } });
+      this.outbox.push({ id, json });
+      if (this.ready) this.flushOutbox();
     });
   }
 
@@ -307,11 +343,13 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         this.sessionId = frame.d.sessionId;
         this.lastSeq = frame.d.seq;
         this.cache.hydrate(frame.d);
+        this.flushOutbox();
         this.emit('ready', frame.d);
         return;
       case 'resumed':
         this.ready = true;
         this.backoff = 1000;
+        this.flushOutbox();
         this.restoreSubscriptions();
         this.emit('resumed', frame.d.replayedEvents);
         return;
@@ -576,10 +614,24 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     this.emit('close', { code, willReconnect });
   }
 
+  /** Send the held RPCs in call order. `ready` alone isn't enough: a socket
+   *  can be CLOSING before its close event resets `ready`, so whatever trySend
+   *  refuses stays held for the next `ready`/`resumed`. */
+  private flushOutbox(): void {
+    while (this.outbox.length > 0 && this.trySend(this.outbox[0].json)) this.outbox.shift();
+  }
+
+  /** Control frames (identify, resume, heartbeat) are dropped when the socket
+   *  isn't OPEN; the next connection sends its own. */
   private sendFrame(frame: unknown): void {
-    if (this.ws && this.ws.readyState === this.ws.OPEN) {
-      this.ws.send(JSON.stringify(frame));
-    }
+    this.trySend(JSON.stringify(frame));
+  }
+
+  /** Send on an OPEN socket. Returns false, sending nothing, otherwise. */
+  private trySend(json: string): boolean {
+    if (!this.ws || this.ws.readyState !== this.ws.OPEN) return false;
+    this.ws.send(json);
+    return true;
   }
 }
 

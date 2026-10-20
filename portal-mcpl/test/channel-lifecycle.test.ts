@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { PortalClient } from '@animalabs/portal-client';
 import type { PortalChannel, PortalMessage } from '@animalabs/portal-protocol';
 import { AgentState } from '../src/agent-state.js';
@@ -303,6 +304,130 @@ test("a relay resume doesn't make the server subscribe its open channels again: 
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.deepEqual(subscribed, []);
+});
+
+type WsFactory = NonNullable<ConstructorParameters<typeof PortalClient>[0]['wsFactory']>;
+
+/**
+ * One socket of a relay stand-in for the real PortalClient. Like the gateway,
+ * it keeps a subscription set per socket: identify fills it from the frame's
+ * list, and a resumed session starts with it empty. It answers the frames it
+ * has received in the order they came, and only when the test calls
+ * `answer()`, so a test can put a call on the wire between `resume` and
+ * `resumed`.
+ */
+class RelaySocket extends EventEmitter {
+  readyState = 1;
+  readonly OPEN = 1;
+  readonly subscriptions = new Set<string>();
+  readonly inbox: Array<{ op: string; d: Record<string, unknown> }> = [];
+
+  send(data: string): void {
+    this.inbox.push(JSON.parse(data));
+  }
+
+  close(): void {
+    this.drop(1000);
+  }
+
+  drop(code = 1006): void {
+    this.readyState = 3;
+    this.emit('close', code);
+  }
+
+  deliver(frame: unknown): void {
+    this.emit('message', JSON.stringify(frame));
+  }
+
+  /** Answer every frame received so far, and those the answers make the client send. */
+  answer(ready: unknown): void {
+    while (this.inbox.length > 0) {
+      const frame = this.inbox.shift()!;
+      if (frame.op === 'identify') {
+        for (const id of (frame.d.subscriptions as string[] | undefined) ?? []) this.subscriptions.add(id);
+        this.deliver({ op: 'ready', d: ready });
+      } else if (frame.op === 'resume') {
+        this.deliver({ op: 'resumed', d: { replayedEvents: 0 } });
+      } else if (frame.op === 'rpc') {
+        const { id, method, params } = frame.d as { id: string; method: string; params: { channelId: string } };
+        if (method === 'subscribe_channel') this.subscriptions.add(params.channelId);
+        if (method === 'unsubscribe_channel') this.subscriptions.delete(params.channelId);
+        this.deliver({ op: 'rpc_result', d: { id, ok: true, result: {} } });
+      }
+    }
+  }
+}
+
+async function until(condition: () => boolean, what: string): Promise<void> {
+  for (let waited = 0; !condition(); waited += 5) {
+    if (waited > 2000) throw new Error(`timed out waiting until ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+test('with the real client, a close made between its resume and the relay\'s resumed leaves the channel unsubscribed', async () => {
+  // A close made after the client sends `resume`, and before `resumed`
+  // arrives, reaches the relay after the resume by either route: a client
+  // that sends at once puts it on the wire behind the resume, and one that
+  // holds calls until its session is ready flushes it just before it emits
+  // `resumed`. Either way the relay sends `resumed` and then applies the
+  // unsubscribe, so a resume that subscribed every open channel would put the
+  // closing channel back on the relay after it.
+  const sockets: RelaySocket[] = [];
+  const factory = (() => {
+    const socket = new RelaySocket();
+    sockets.push(socket);
+    setImmediate(() => socket.deliver({ op: 'hello', d: { heartbeatIntervalMs: 60_000 } }));
+    return socket;
+  }) as unknown as WsFactory;
+  const ready = {
+    sessionId: 's1',
+    persona: { id: 'p', displayName: 'Test', avatarUrl: 'https://example.test/a.png' },
+    guilds: [{ id: 'g1', name: 'Guild' }],
+    channels: [channel],
+    seq: 0,
+  };
+  const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p', maxBackoffMs: 20, wsFactory: factory });
+  const server = new PortalMcplServer(
+    client,
+    new PortalAgent(client, { hostOwnsChannelLifecycle: true }),
+  );
+  const internal = server as unknown as {
+    openChannels: Set<string>;
+    wireClient(): void;
+    handleChannelOpen(params: { channelId: string; type: string; address: unknown }): Promise<unknown>;
+    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
+  };
+  const listed = () => (client as unknown as { opts: { subscriptions?: string[] } }).opts.subscriptions ?? [];
+  internal.wireClient();
+
+  try {
+    const connected = client.connect();
+    await until(() => sockets[0]?.inbox.some((frame) => frame.op === 'identify') === true, 'the client identifies');
+    sockets[0].answer(ready);
+    await connected;
+
+    const opening = internal.handleChannelOpen({ channelId: `portal:${channel.id}`, type: 'portal', address: {} });
+    await until(() => sockets[0].inbox.length > 0, 'the open subscribes');
+    sockets[0].answer(ready);
+    await opening;
+    assert.equal(sockets[0].subscriptions.has(channel.id), true, 'the open subscribed the channel');
+
+    sockets[0].drop();
+    await until(() => sockets[1]?.inbox.some((frame) => frame.op === 'resume') === true, 'the client resumes');
+    const closing = internal.handleChannelClose({ channelId: `portal:${channel.id}` });
+    assert.equal(sockets[1].inbox[0]?.op, 'resume', 'the relay has the resume before anything the close sends');
+    sockets[1].answer(ready);
+
+    assert.deepEqual(await closing, { closed: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    sockets[1].answer(ready);
+    assert.equal(sockets[1].subscriptions.has(channel.id), false, 'the relay holds no subscription for the closed channel');
+    assert.equal(internal.openChannels.has(channel.id), false);
+    assert.equal(listed().includes(channel.id), false, 'a later identify will not ask for the closed channel');
+  } finally {
+    client.close();
+  }
 });
 
 test("a standalone agent doesn't subscribe its durable channels again on a resume: the client restores them", async () => {
