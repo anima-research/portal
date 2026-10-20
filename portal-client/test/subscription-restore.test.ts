@@ -1,9 +1,10 @@
 // A resumed relay session starts with no ambient subscriptions (portal-relay
 // gateway.ts onResume; identify carries them, a resume doesn't), so the client
-// asks for them again on a resume. A failed subscribe or unsubscribe can still
-// have reached the relay, so while it's the newest call on its channel the
-// client undoes its change and tells the relay the list's state for that
-// channel. These drive the real client over a fake socket.
+// asks for them again on a resume. A failed subscribe or unsubscribe changes
+// nothing in the list, unless a caller asks for its change to stand, and since
+// it can still have reached the relay, the relay is told the list's state for
+// the channel when it was the newest call there. These drive the real client
+// over a fake socket.
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -156,17 +157,40 @@ test('a failed unsubscribe puts the channel back in the list and subscribes it o
   assert.deepEqual(ws.subscriptionCalls(), [['unsubscribe_channel', 'c1'], ['subscribe_channel', 'c1']]);
 });
 
-test('a failed unsubscribe leaves out a channel the relay removed while it waited', async (t) => {
-  // Putting it back would only have every reconnect ask for a channel that
-  // can't be subscribed.
+test('a failed unsubscribe puts the channel back even after the relay removed it', async (t) => {
+  // The caller still holds the channel open, as the failure told it. A caller
+  // whose removal must hold whatever the relay answers says undo: false.
   const { client, sockets } = await connected(t, ['c1', 'c2']);
   const ws = sockets[0];
   const closing = client.unsubscribe('c1');
   client.cache.apply({ type: 'channel_delete', channelId: 'c1', guildId: 'g' });
   ws.answer('unsubscribe_channel', 'c1', false);
   await assert.rejects(closing, /refused c1/);
+  assert.deepEqual(listOf(client), ['c1', 'c2']);
+  assert.deepEqual(ws.subscriptionCalls(), [['unsubscribe_channel', 'c1'], ['subscribe_channel', 'c1']]);
+});
+
+test('an unsubscribe with undo false keeps the channel out of the list when it fails', async (t) => {
+  const { client, sockets } = await connected(t, ['c1', 'c2']);
+  const ws = sockets[0];
+  const removing = client.unsubscribe('c1', { undo: false });
+  ws.answer('unsubscribe_channel', 'c1', false);
+  await assert.rejects(removing, /refused c1/);
   assert.deepEqual(listOf(client), ['c2']);
   assert.deepEqual(ws.subscriptionCalls(), [['unsubscribe_channel', 'c1'], ['unsubscribe_channel', 'c1']]);
+});
+
+test('a subscribe with undo false keeps the channel listed when it fails, and the next resume asks for it again', async (t) => {
+  const { client, sockets } = await connected(t, ['c1']);
+  const ws = sockets[0];
+  const reopening = client.subscribe('c3', { undo: false });
+  ws.answer('subscribe_channel', 'c3', false);
+  await assert.rejects(reopening, /refused c3/);
+  assert.deepEqual(listOf(client), ['c1', 'c3']);
+  assert.deepEqual(ws.subscriptionCalls(), [['subscribe_channel', 'c3'], ['subscribe_channel', 'c3']]);
+  drop(ws);
+  const next = await resumedSocket(sockets, 1);
+  assert.deepEqual(next.subscriptionCalls().map(([, channel]) => channel).sort(), ['c1', 'c3']);
 });
 
 test('a failed subscribe of a channel already in the list leaves it there', async (t) => {
@@ -180,7 +204,7 @@ test('a failed subscribe of a channel already in the list leaves it there', asyn
 });
 
 test('a failed unsubscribe of a channel not in the list leaves it out', async (t) => {
-  // c3 is in the cache, so only the call having taken nothing out keeps it out.
+  // The list didn't hold c3 before the call, so it doesn't after the failure.
   const { client, sockets } = await connected(t, ['c1']);
   const ws = sockets[0];
   const closing = client.unsubscribe('c3');
@@ -267,19 +291,38 @@ test('an older subscribe that fails while a newer one on the channel waits leave
   assert.deepEqual(listOf(client), ['c1']);
 });
 
-test('when two subscribes of a channel both fail, the list ends as the newer one found it', async (t) => {
-  // The newer call found the channel listed by the older one, so it has
-  // nothing of its own to take back, and the relay hears the list's state once.
+test('when two subscribes of a channel both fail, the list ends as it was before them', async (t) => {
+  // As one failed subscribe does. While the older call still waits, the list
+  // holds what it asks for; once it fails too, nothing that stood listed c1.
   const { client, sockets } = await connected(t, []);
   const ws = sockets[0];
   const older = client.subscribe('c1');
   const newer = client.subscribe('c1');
   ws.answer('subscribe_channel', 'c1', false, 1);
   await assert.rejects(newer, /refused c1/);
+  assert.deepEqual(listOf(client), ['c1'], 'the older call is still out');
   ws.answer('subscribe_channel', 'c1', false, 0);
   await assert.rejects(older, /refused c1/);
+  assert.deepEqual(listOf(client), []);
+  assert.deepEqual(ws.subscriptionCalls(), [
+    ['subscribe_channel', 'c1'], ['subscribe_channel', 'c1'], ['subscribe_channel', 'c1'], ['unsubscribe_channel', 'c1'],
+  ]);
+});
+
+test('an unsubscribe that fails after an older subscribe of the channel succeeded leaves it listed', async (t) => {
+  // The subscribe stood, so the failed unsubscribe changes nothing: the list
+  // holds what it held before the unsubscribe, not before the subscribe.
+  const { client, sockets } = await connected(t, []);
+  const ws = sockets[0];
+  const opening = client.subscribe('c1');
+  const closing = client.unsubscribe('c1');
+  ws.answer('subscribe_channel', 'c1', true);
+  await opening;
+  assert.deepEqual(listOf(client), [], 'the unsubscribe is still out');
+  ws.answer('unsubscribe_channel', 'c1', false);
+  await assert.rejects(closing, /refused c1/);
   assert.deepEqual(listOf(client), ['c1']);
-  assert.deepEqual(ws.subscriptionCalls(), [['subscribe_channel', 'c1'], ['subscribe_channel', 'c1'], ['subscribe_channel', 'c1']]);
+  assert.deepEqual(ws.subscriptionCalls(), [['subscribe_channel', 'c1'], ['unsubscribe_channel', 'c1'], ['subscribe_channel', 'c1']]);
 });
 
 test('a subscribe whose frame a dropped socket lost times out after a newer one succeeded, and leaves the channel to it', async (t) => {
@@ -300,8 +343,30 @@ test('a subscribe whose frame a dropped socket lost times out after a newer one 
   assert.ok(!ws.subscriptionCalls().some(([method]) => method === 'unsubscribe_channel'), 'nothing unsubscribed it');
 });
 
+test('a call whose frame a dropped socket lost, timing out while a later call on the channel waits, leaves the channel to it', async (t) => {
+  // A call that stood passed over the lost one, so its timeout finds it in no
+  // run and changes nothing, though a later call has started a run since.
+  const { client, sockets } = await connected(t, []);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  drop(sockets[0]);
+  const lost = client.unsubscribe('c1').catch((error: unknown) => error);
+  t.mock.timers.tick(20); // the reconnect, due within maxBackoffMs
+  const ws = resume(sockets[1]);
+  const standing = client.unsubscribe('c1');
+  ws.answer('unsubscribe_channel', 'c1', true, -1);
+  await standing;
+  const waiting = client.subscribe('c1');
+  assert.deepEqual(listOf(client), ['c1'], 'the waiting subscribe lists it');
+  t.mock.timers.tick(280); // the lost call times out (made at 0, rpcTimeoutMs 300); the waiting one, made at 20, doesn't
+  assert.match(String(await lost), /timed out/);
+  assert.deepEqual(listOf(client), ['c1'], 'still the waiting call\'s');
+  ws.answer('subscribe_channel', 'c1', true, -1);
+  await waiting;
+  assert.deepEqual(listOf(client), ['c1']);
+});
+
 test('a newer call that fails after an older one on the channel settled still undoes its change', async (t) => {
-  // The older call's settling leaves the newer call's number in place.
+  // The older call's success leaves the newer call deciding the channel.
   const { client, sockets } = await connected(t, ['c1']);
   const ws = sockets[0];
   const older = client.unsubscribe('c1');
@@ -314,20 +379,20 @@ test('a newer call that fails after an older one on the channel settled still un
   assert.deepEqual(ws.subscriptionCalls(), [['unsubscribe_channel', 'c1'], ['subscribe_channel', 'c1'], ['unsubscribe_channel', 'c1']]);
 });
 
-test('a settled call leaves no number behind for its channel', async (t) => {
+test('a channel keeps no record of its calls once none is waiting', async (t) => {
   // A long-running client meets many short-lived channels, such as threads.
   const { client, sockets } = await connected(t, []);
   const ws = sockets[0];
-  const numbers = () => (client as unknown as { newestSubscriptionCall: Map<string, number> }).newestSubscriptionCall;
+  const runs = () => (client as unknown as { subscriptionRuns: Map<string, unknown> }).subscriptionRuns;
   const subscribing = client.subscribe('c1');
-  assert.equal(numbers().size, 1, 'a waiting call keeps its number');
+  assert.equal(runs().size, 1, 'a waiting call is recorded');
   ws.answer('subscribe_channel', 'c1', true);
   await subscribing;
-  assert.equal(numbers().size, 0, 'none after a call that succeeded');
+  assert.equal(runs().size, 0, 'none after a call that succeeded');
   const failing = client.unsubscribe('c1');
   ws.answer('unsubscribe_channel', 'c1', false);
   await assert.rejects(failing, /refused c1/);
-  assert.equal(numbers().size, 0, 'none after a call that failed');
+  assert.equal(runs().size, 0, 'none after a call that failed');
 });
 
 test('a call still waiting at close() sends no reassert when it times out', async (t) => {

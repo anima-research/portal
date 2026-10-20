@@ -1265,10 +1265,10 @@ export class PortalMcplServer {
       this.agent.state.unsubscribe(channelId);
       // Out of the client's list too, whatever it holds now: a reconnect asks
       // for every listed channel, and would subscribe this one again if it came
-      // back into view. As the newest call on the channel, this leaves a close
-      // still waiting nothing to put back, and if this one fails, the client
-      // doesn't put back a channel its cache has dropped.
-      void this.client.unsubscribe(channelId).catch(() => {});
+      // back into view. With undo false the removal stands even if the call
+      // fails, and as the newest call on the channel it leaves a close still
+      // waiting nothing to put back.
+      void this.client.unsubscribe(channelId, { undo: false }).catch(() => {});
     }
     this.pendingRemovals.clear();
     if (removed.length) {

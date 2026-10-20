@@ -100,6 +100,21 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** Options for PortalClient.subscribe() and unsubscribe(). */
+export interface SubscriptionOptions {
+  /** false: a failed call leaves its change to the list standing, as a
+   *  success would, for a caller whose subscribe or unsubscribe must hold
+   *  whether or not the relay answers. Defaults to true. */
+  undo?: boolean;
+}
+
+/** A subscribe or unsubscribe still waiting, with whether it lists its
+ *  channel (PortalClient.subscriptionCall). Each call is its own object, so a
+ *  run finds a call by identity. */
+interface SubscriptionCall {
+  listed: boolean;
+}
+
 export class PortalClient extends TypedEmitter<PortalClientEvents> {
   readonly cache = new ClientCache();
 
@@ -117,10 +132,11 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   private backoff = 1000;
   private closedByUser = false;
   private ready = false;
-  /** The newest subscribe or unsubscribe call on each channel, by number
-   *  (subscriptionCall), while that call is waiting. */
-  private readonly newestSubscriptionCall = new Map<string, number>();
-  private subscriptionCalls = 0;
+  /** Each channel with a subscribe or unsubscribe still waiting
+   *  (subscriptionCall): whether the list held the channel before those
+   *  calls, as the calls that stood leave it, and the calls still waiting,
+   *  oldest first, each with whether it lists the channel. */
+  private readonly subscriptionRuns = new Map<string, { before: boolean; calls: SubscriptionCall[] }>();
 
   constructor(options: PortalClientOptions) {
     super();
@@ -200,27 +216,18 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     return this.call('fetch_history', params);
   }
   /** Subscribe to a channel's ambient events. The channel joins the list a
-   *  reconnect restores at once. If the call fails while it's still the newest
-   *  subscribe or unsubscribe on the channel, a channel it added leaves the
-   *  list again, and the relay is told the list's state for it. */
-  async subscribe(channelId: string) {
-    const added = !this.isSubscribed(channelId);
-    if (added) (this.opts.subscriptions ??= []).push(channelId);
-    return this.subscriptionCall('subscribe_channel', channelId, () => {
-      if (added) this.opts.subscriptions = (this.opts.subscriptions ?? []).filter((c) => c !== channelId);
-    });
+   *  reconnect restores at once. A failed call is undone as subscriptionCall
+   *  says, unless `undo` is false: then the channel stays listed, as after a
+   *  success, and the next resume or identify asks the relay for it again. */
+  async subscribe(channelId: string, options: SubscriptionOptions = {}) {
+    return this.subscriptionCall('subscribe_channel', channelId, true, options.undo !== false);
   }
   /** Unsubscribe from a channel's ambient events. The channel leaves the list
-   *  a reconnect restores at once. If the call fails while it's still the
-   *  newest subscribe or unsubscribe on the channel, a channel it took out
-   *  goes back in, unless the cache doesn't hold it, as after the relay
-   *  removes it, and the relay is told the list's state for it. */
-  async unsubscribe(channelId: string) {
-    const removed = this.isSubscribed(channelId);
-    this.opts.subscriptions = (this.opts.subscriptions ?? []).filter((c) => c !== channelId);
-    return this.subscriptionCall('unsubscribe_channel', channelId, () => {
-      if (removed && this.cache.getChannel(channelId)) (this.opts.subscriptions ??= []).push(channelId);
-    });
+   *  a reconnect restores at once. A failed call is undone as subscriptionCall
+   *  says, unless `undo` is false: then the channel stays out of the list, as
+   *  after a success. */
+  async unsubscribe(channelId: string, options: SubscriptionOptions = {}) {
+    return this.subscriptionCall('unsubscribe_channel', channelId, false, options.undo !== false);
   }
   /** Whether the channel is in the list a reconnect restores, as subscribe()
    *  and unsubscribe() leave it. */
@@ -434,31 +441,67 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   }
 
   /**
-   * Send a subscribe or unsubscribe whose change to the list is already made.
-   * A failed call undoes that change and tells the relay the list's state for
-   * the channel only while it's still the newest call on the channel: a newer
-   * call has decided the channel since, and an older failure never undoes it.
+   * Send a subscribe or unsubscribe, putting its change in the list at once.
+   * While calls on the channel are waiting, the list holds what the newest of
+   * them that hasn't failed asks for. A call that succeeds stands, as does one
+   * that fails with `undo` false, and the calls before it no longer count.
+   * Once every call made since the last one that stood has failed, the list
+   * holds what it held before them, so failed calls change nothing. When a
+   * failed call was the newest on the channel, the relay is told the list's
+   * state for it.
    */
   private async subscriptionCall(
     method: 'subscribe_channel' | 'unsubscribe_channel',
     channelId: string,
-    undo: () => void,
+    listed: boolean,
+    undo: boolean,
   ) {
-    const call = ++this.subscriptionCalls;
-    this.newestSubscriptionCall.set(channelId, call);
-    try {
-      return await this.call(method, { channelId });
-    } catch (error) {
-      if (this.newestSubscriptionCall.get(channelId) === call) {
-        undo();
-        this.reassertSubscription(channelId);
-      }
-      throw error;
-    } finally {
-      // The numbers only grow, so a call made before this one still finds
-      // another number here, or none, and isn't the newest.
-      if (this.newestSubscriptionCall.get(channelId) === call) this.newestSubscriptionCall.delete(channelId);
+    let run = this.subscriptionRuns.get(channelId);
+    if (!run) {
+      run = { before: this.isSubscribed(channelId), calls: [] };
+      this.subscriptionRuns.set(channelId, run);
     }
+    const call: SubscriptionCall = { listed };
+    run.calls.push(call);
+    this.setListed(channelId, listed);
+    try {
+      const result = await this.call(method, { channelId });
+      this.settleSubscriptionCall(channelId, call, 'stood');
+      return result;
+    } catch (error) {
+      this.settleSubscriptionCall(channelId, call, undo ? 'failed' : 'failed, stands');
+      throw error;
+    }
+  }
+
+  /** Apply a settled subscribe or unsubscribe to the list (subscriptionCall).
+   *  A call that a later call's standing has already passed over changes
+   *  nothing. */
+  private settleSubscriptionCall(
+    channelId: string,
+    call: SubscriptionCall,
+    outcome: 'stood' | 'failed' | 'failed, stands',
+  ): void {
+    const run = this.subscriptionRuns.get(channelId);
+    const at = run ? run.calls.indexOf(call) : -1;
+    if (!run || at === -1) return;
+    const wasNewest = at === run.calls.length - 1;
+    if (outcome === 'failed') {
+      run.calls.splice(at, 1);
+    } else {
+      run.before = call.listed;
+      run.calls.splice(0, at + 1);
+    }
+    const newest = run.calls.at(-1);
+    this.setListed(channelId, newest ? newest.listed : run.before);
+    if (!newest) this.subscriptionRuns.delete(channelId);
+    if (outcome !== 'stood' && wasNewest) this.reassertSubscription(channelId);
+  }
+
+  private setListed(channelId: string, listed: boolean): void {
+    if (this.isSubscribed(channelId) === listed) return;
+    if (listed) (this.opts.subscriptions ??= []).push(channelId);
+    else this.opts.subscriptions = (this.opts.subscriptions ?? []).filter((c) => c !== channelId);
   }
 
   /**

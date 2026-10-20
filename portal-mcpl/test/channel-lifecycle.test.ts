@@ -517,8 +517,8 @@ test("channelRemove takes a removed channel out of the client's list for good", 
       guildId: channel.guildId,
     });
 
-  // Listed, and its unsubscribe fails: the client's cache has dropped the
-  // channel, so it isn't put back.
+  // Listed, and its unsubscribe fails: the removal's unsubscribe stands
+  // whatever the relay answers, so the channel isn't put back.
   {
     const t = await registeredServer([channel.id]);
     t.internal.openChannels.add(channel.id);
