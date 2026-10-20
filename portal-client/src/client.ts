@@ -314,8 +314,8 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   // ── Internals ──
 
   private open(): void {
-    // One socket at a time: a connect() while a reconnect waits for its
-    // backoff takes its place.
+    // One reconnect at a time: a connect() while a reconnect waits for its
+    // backoff takes its place, so the timer doesn't open a second socket.
     this.cancelReconnect();
     const ws = resolveWsFactory(this.opts.wsFactory)(this.opts.url);
     this.ws = ws;

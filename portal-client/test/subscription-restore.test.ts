@@ -437,6 +437,7 @@ test('a connect() while a reconnect waits for its backoff takes its place, so on
   const { client, sockets } = await connected(t, ['c1']);
   t.mock.timers.enable({ apis: ['setTimeout'] });
   drop(sockets[0]);
+  assert.ok((client as unknown as { reconnectTimer?: unknown }).reconnectTimer, 'a reconnect is waiting');
   void client.connect().catch(() => {});
   assert.equal(sockets.length, 2, "connect()'s socket");
   t.mock.timers.tick(1000);
@@ -449,6 +450,7 @@ test('a second close while a reconnect waits leaves one reconnect, which close()
   t.mock.timers.enable({ apis: ['setTimeout'] });
   drop(sockets[0]);
   drop(sockets[0]);
+  assert.ok((client as unknown as { reconnectTimer?: unknown }).reconnectTimer, 'a reconnect is waiting');
   client.close();
   t.mock.timers.tick(1000);
   assert.equal(sockets.length, 1, 'no new socket');
