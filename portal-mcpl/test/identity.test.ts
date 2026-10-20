@@ -368,6 +368,90 @@ test("a failed reopen that a later close passed over is logged without saying it
   assert.ok(!String(reopen[0]).includes('stays'), 'without saying it stays listed');
 });
 
+test('without channels.register, the follows in the state are reported once as not opened', async () => {
+  const client = readyClient('p_root', [chan('100', 'a'), chan('200', 'b')]);
+  const state = new AgentState();
+  state.subscribe('100');
+  state.subscribe('200');
+  const { internal } = serverWithoutRegister(client, new PortalAgent(client, { state, hostOwnsChannelLifecycle: true }));
+  const errors: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => void errors.push(args);
+  try {
+    internal.onPolicyActivated();
+    internal.onPolicyActivated();
+  } finally {
+    console.error = realError;
+  }
+  const notes = errors.filter((args) => String(args[0]).includes("aren't open"));
+  assert.equal(notes.length, 1, 'once for the identity, however often the policy activates');
+  assert.match(String(notes[0]![0]), /^\[portal-mcpl\] 2 followed channel\(s\)/);
+  assert.match(
+    String(notes[0]![0]),
+    /grant channels\.register, or, where the host has channels\.lifecycle, open each from the host with channels\/open/,
+  );
+});
+
+test('without channels.register, a follow the host already opened is left out of the note', async () => {
+  const client = readyClient('p_root', [chan('100', 'a'), chan('200', 'b')]);
+  const state = new AgentState();
+  state.subscribe('100');
+  state.subscribe('200');
+  const { internal } = serverWithoutRegister(client, new PortalAgent(client, { state, hostOwnsChannelLifecycle: true }));
+  internal.openChannels.add('100');
+  const errors: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => void errors.push(args);
+  try {
+    internal.onPolicyActivated();
+  } finally {
+    console.error = realError;
+  }
+  const notes = errors.filter((args) => String(args[0]).includes("aren't open"));
+  assert.equal(notes.length, 1);
+  assert.match(String(notes[0]![0]), /^\[portal-mcpl\] 1 followed channel\(s\)/);
+});
+
+test("without channels.register, a switch notes the new identity's follows", async () => {
+  const oldClient = readyClient('p_old', [chan('100', 'a')]);
+  const newClient = readyClient('p_new', [chan('100', 'a'), chan('300', 'c')]);
+  (newClient as unknown as { call: () => Promise<unknown> }).call = async () => ({ pings: [] });
+  const { server } = serverWithoutRegister(
+    oldClient,
+    new PortalAgent(oldClient, { state: new AgentState(), hostOwnsChannelLifecycle: true }),
+  );
+  const state = new AgentState();
+  state.subscribe('300');
+  const errors: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => void errors.push(args);
+  try {
+    await server.swapSession(newClient, new PortalAgent(newClient, { state, hostOwnsChannelLifecycle: true }));
+  } finally {
+    console.error = realError;
+  }
+  const notes = errors.filter((args) => String(args[0]).includes("aren't open"));
+  assert.equal(notes.length, 1, 'once, for the identity the switch brought');
+  assert.match(String(notes[0]![0]), /^\[portal-mcpl\] 1 followed channel\(s\)/);
+});
+
+test('with no follows in the state, nothing is reported', async () => {
+  const client = readyClient('p_root', [chan('100', 'a')]);
+  const { internal } = serverWithoutRegister(
+    client,
+    new PortalAgent(client, { state: new AgentState(), hostOwnsChannelLifecycle: true }),
+  );
+  const errors: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => void errors.push(args);
+  try {
+    internal.onPolicyActivated();
+  } finally {
+    console.error = realError;
+  }
+  assert.deepEqual(errors.filter((args) => String(args[0]).includes("aren't open")), []);
+});
+
 test('identity tools are absent — and undeclared — unless a manager is attached', () => {
   const client = readyClient('p', []);
   const server = new PortalMcplServer(client, new PortalAgent(client, { hostOwnsChannelLifecycle: true }));

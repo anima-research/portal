@@ -127,6 +127,8 @@ export class PortalMcplServer {
    *  (a removal can land while channels/register is in flight, before
    *  `advertised` is stamped — retracting inline would silently miss it). */
   private pendingRemovals = new Set<string>();
+  /** Identities whose follows noteUnofferedFollows has already reported. */
+  private readonly unofferedFollowsNoted = new WeakSet<PortalAgent>();
   private initialRegistrationComplete = false;
   private registrationInFlight: Promise<void> | null = null;
   /** Portal channel ids the host has opened — routed via channels/incoming so
@@ -453,12 +455,34 @@ export class PortalMcplServer {
       void this.registerChannels().catch((err) =>
         console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
       );
+    } else {
+      this.noteUnofferedFollows();
     }
     if (this.canPush()) {
       void this.catchUp().catch((err) =>
         console.error('[portal-mcpl] catch-up failed:', (err as Error).message),
       );
     }
+  }
+
+  /** Without channels.register the host gets no channel list, so the
+   *  state's follows (PORTAL_SUBSCRIPTIONS, and follows saved before host
+   *  mode) reach it as no initiallyOpen hints, and in host mode the client's
+   *  list starts empty: they open nothing. Say so once for each identity,
+   *  counting the follows not already open, when the policy arrives and when
+   *  a switch brings another identity's state, rather than leave them unused
+   *  without a word. */
+  private noteUnofferedFollows(): void {
+    const agent = this.agent;
+    const unopened = agent.state.subscriptionList().filter((channelId) => !this.openChannels.has(channelId));
+    if (unopened.length === 0 || this.unofferedFollowsNoted.has(agent)) return;
+    this.unofferedFollowsNoted.add(agent);
+    console.error(
+      `[portal-mcpl] ${unopened.length} followed channel(s), from PORTAL_SUBSCRIPTIONS or follows saved before, ` +
+        "aren't open: this host doesn't grant channels.register, so they can't be offered to it. To open them, " +
+        'grant channels.register, or, where the host has channels.lifecycle, open each from the host with ' +
+        'channels/open.',
+    );
   }
 
   private handleNotification(n: JsonRpcNotification): void {
@@ -874,6 +898,9 @@ export class PortalMcplServer {
       void this.reconcileAfterSwap(epoch).catch((err) =>
         console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
       );
+    } else {
+      // The new identity's follows are as unused as the last one's were.
+      this.noteUnofferedFollows();
     }
     if (this.canPush()) {
       void this.catchUp().catch((err) =>
