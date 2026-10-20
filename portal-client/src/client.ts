@@ -137,6 +137,9 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
    *  calls, as the calls that stood leave it, and the calls still waiting,
    *  oldest first, each with whether it lists the channel. */
   private readonly subscriptionRuns = new Map<string, { before: boolean; calls: SubscriptionCall[] }>();
+  /** The reconnect onClose scheduled, until it runs or cancelReconnect()
+   *  cancels it: close(), a connect(), or onClose scheduling the next. */
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
 
   constructor(options: PortalClientOptions) {
     super();
@@ -174,10 +177,18 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     });
   }
 
+  /** Close the connection, and cancel a reconnect still waiting for its
+   *  backoff, so a closed client stays closed until connect(). */
   close(): void {
     this.closedByUser = true;
     if (this.heartbeat) clearInterval(this.heartbeat);
+    this.cancelReconnect();
     this.ws?.close(1000, 'client closing');
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
   }
 
   /** Typed RPC call. */
@@ -267,6 +278,9 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   // ── Internals ──
 
   private open(): void {
+    // One socket at a time: a connect() while a reconnect waits for its
+    // backoff takes its place.
+    this.cancelReconnect();
     const ws = resolveWsFactory(this.opts.wsFactory)(this.opts.url);
     this.ws = ws;
     ws.on('message', (data) => this.onMessage(data.toString()));
@@ -435,6 +449,9 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
    * or identify asks again.
    */
   private restoreSubscriptions(): void {
+    // After close(), as for a reassert: the next connect() identifies with the
+    // list, and a call now would only start a timer.
+    if (this.closedByUser) return;
     for (const channelId of this.opts.subscriptions ?? []) {
       this.call('subscribe_channel', { channelId }).catch(() => {});
     }
@@ -539,7 +556,10 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       // lockstep — avoids a thundering-herd reconnect + role-rebind burst.
       const delay = capped / 2 + Math.random() * (capped / 2);
       this.backoff = Math.min(this.backoff * 2, this.opts.maxBackoffMs);
-      setTimeout(() => {
+      // One reconnect waits at a time, so close() and connect() reach it.
+      this.cancelReconnect();
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = undefined;
         try {
           this.open();
         } catch (err) {

@@ -410,6 +410,50 @@ test('a call still waiting at close() sends no reassert when it times out', asyn
   assert.equal(pending.size, 0, 'no call left waiting, so no timer');
 });
 
+test('a resumed frame that arrives after close() asks the relay for nothing', async (t) => {
+  // As for a reassert: the next connect() identifies with the list, and a call
+  // now would only start a timer.
+  const { client, sockets } = await connected(t, ['c1']);
+  client.close();
+  sockets[0].frame({ op: 'resumed', d: { replayedEvents: 0 } });
+  assert.deepEqual(sockets[0].subscriptionCalls(), []);
+  const pending = (client as unknown as { pending: Map<string, unknown> }).pending;
+  assert.equal(pending.size, 0, 'no call left waiting, so no timer');
+});
+
+test('close() while a reconnect waits for its backoff cancels it, so a closed client stays closed', async (t) => {
+  // A reconnect would resume the session and ask for the list again, for a
+  // client nobody listens to any more, such as the identity a switch left.
+  const { client, sockets } = await connected(t, ['c1']);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  drop(sockets[0]);
+  assert.ok((client as unknown as { reconnectTimer?: unknown }).reconnectTimer, 'a reconnect is waiting');
+  client.close();
+  t.mock.timers.tick(1000);
+  assert.equal(sockets.length, 1, 'no new socket');
+});
+
+test('a connect() while a reconnect waits for its backoff takes its place, so only one socket opens', async (t) => {
+  const { client, sockets } = await connected(t, ['c1']);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  drop(sockets[0]);
+  void client.connect().catch(() => {});
+  assert.equal(sockets.length, 2, "connect()'s socket");
+  t.mock.timers.tick(1000);
+  assert.equal(sockets.length, 2, 'no socket from the waiting reconnect');
+});
+
+test('a second close while a reconnect waits leaves one reconnect, which close() cancels', async (t) => {
+  // A close event that arrives late, from the same socket or an earlier one.
+  const { client, sockets } = await connected(t, ['c1']);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  drop(sockets[0]);
+  drop(sockets[0]);
+  client.close();
+  t.mock.timers.tick(1000);
+  assert.equal(sockets.length, 1, 'no new socket');
+});
+
 test('a channel the relay refuses on a resume stays in the list, and nothing rejects or reports an error', async (t) => {
   const { client, sockets, errors } = await connected(t, ['c1']);
   drop(sockets[0]);
