@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PortalClient } from '../src/client.js';
@@ -20,7 +20,7 @@ class FakeWs extends EventEmitter {
   }
 }
 
-function makeClient() {
+function makeClient(t: TestContext) {
   const created: FakeWs[] = [];
   const client = new PortalClient({
     url: 'ws://test',
@@ -34,11 +34,21 @@ function makeClient() {
     },
   });
   client.connect().catch(() => {}); // opens ws #1
-  return { client, ws: created[0] };
+  const ws = created[0];
+  // RPCs are held until the session is ready, so bring it up first.
+  ws.feed({ op: 'hello', d: { protocolVersion: 3, heartbeatIntervalMs: 30000 } });
+  ws.feed({
+    op: 'ready',
+    d: { sessionId: 's1', seq: 0, persona: { id: 'p', displayName: 'x', avatarUrl: '' }, guilds: [], channels: [], capabilities: {}, subscriptions: [] },
+  });
+  // Close the client however the test ends: its heartbeat interval would keep
+  // the test process running after a failed assertion.
+  t.after(() => client.close());
+  return { client, ws };
 }
 
-test('reaction_add dispatch → typed reactionAdd event', () => {
-  const { client, ws } = makeClient();
+test('reaction_add dispatch → typed reactionAdd event', (t) => {
+  const { client, ws } = makeClient(t);
   const got: Array<{ channelId: string; messageId: string; reaction: { emoji: string; kind: string } }> = [];
   client.on('reactionAdd', (e) => got.push(e as never));
   ws.feed({
@@ -56,11 +66,10 @@ test('reaction_add dispatch → typed reactionAdd event', () => {
   assert.equal(got[0].messageId, 'm1');
   assert.equal(got[0].reaction.emoji, '👍');
   assert.equal(got[0].reaction.kind, 'native');
-  client.close();
 });
 
-test('reaction_remove dispatch → typed reactionRemove event', () => {
-  const { client, ws } = makeClient();
+test('reaction_remove dispatch → typed reactionRemove event', (t) => {
+  const { client, ws } = makeClient(t);
   const got: Array<{ emoji: string; actor: { kind: string; name: string } }> = [];
   client.on('reactionRemove', (e) => got.push(e as never));
   ws.feed({
@@ -77,11 +86,10 @@ test('reaction_remove dispatch → typed reactionRemove event', () => {
   assert.equal(got.length, 1);
   assert.equal(got[0].emoji, 'party:123');
   assert.equal(got[0].actor.name, 'alice');
-  client.close();
 });
 
-test('react/unreact convenience wrappers send native + visible params', () => {
-  const { client, ws } = makeClient();
+test('react/unreact convenience wrappers send native + visible params', (t) => {
+  const { client, ws } = makeClient(t);
   // The RPC frame is enqueued synchronously in call(); the promise won't resolve
   // (no fake relay), so swallow the eventual timeout rejection.
   client.react('m1', ':tada:', true, true).catch(() => {});
@@ -94,5 +102,4 @@ test('react/unreact convenience wrappers send native + visible params', () => {
   assert.deepEqual(react.d.params, { messageId: 'm1', emoji: ':tada:', visible: true, native: true });
   assert.deepEqual(unreact.d.params, { messageId: 'm1', emoji: ':tada:', native: true });
   assert.deepEqual(listEmojis.d.params, { guildId: 'g1' });
-  client.close();
 });
