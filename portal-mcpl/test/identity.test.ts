@@ -272,6 +272,102 @@ test('swapSession drops every channel: retracts the old set, registers the new v
   assert.equal(notifications.length, before);
 });
 
+/** A server on `client` whose host grants every capability its feature sets
+ *  use but channels.register, as a host that directs lifecycle alone does. */
+function serverWithoutRegister(client: PortalClient, agent: PortalAgent) {
+  const server = new PortalMcplServer(client, agent, { identity: { handleToolCall: async () => ({}) } });
+  const internal = server as unknown as {
+    conn: unknown;
+    mcplEnabled: boolean;
+    policy: { applyRequest(p: unknown): unknown };
+    openChannels: Set<string>;
+    wireClient(): void;
+    onPolicyActivated(): void;
+  };
+  internal.conn = { sendRequest: async () => ({}), sendNotification: () => {} };
+  internal.mcplEnabled = true;
+  internal.policy.applyRequest({
+    effectiveCapabilities: [
+      ...new Set(Object.values({ ...featureSets, ...identityFeatureSets }).flatMap((s) => s.uses as string[])),
+    ].filter((capability) => capability !== 'channels.register'),
+  });
+  internal.wireClient();
+  return { server, internal };
+}
+
+test('without channels.register, a reopen that fails under the new identity stays in the client list', async () => {
+  // The host can't be told the channel closed, so it still holds it open: the
+  // client keeps it listed, and each resume and identify asks for it again.
+  const shared = chan('100', 'shared');
+  const oldClient = readyClient('p_old', [shared]);
+  const newClient = readyClient('p_new', [shared]);
+  const asked: string[] = [];
+  (newClient as unknown as { call: (method: string, params: { channelId?: string }) => Promise<unknown> }).call =
+    async (method, params) => {
+      if (method === 'subscribe_channel') {
+        asked.push(params.channelId!);
+        throw new Error('refused');
+      }
+      return { pings: [] };
+    };
+  const { server, internal } = serverWithoutRegister(
+    oldClient,
+    new PortalAgent(oldClient, { state: new AgentState(), hostOwnsChannelLifecycle: true }),
+  );
+  internal.openChannels.add('100');
+  const errors: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => void errors.push(args);
+  try {
+    await server.swapSession(
+      newClient,
+      new PortalAgent(newClient, { state: new AgentState(), hostOwnsChannelLifecycle: true }),
+    );
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  } finally {
+    console.error = realError;
+  }
+  assert.ok(asked.length >= 1, 'the reopen was asked for');
+  assert.equal(newClient.isSubscribed('100'), true, 'the failed reopen stays listed');
+  assert.deepEqual([...internal.openChannels], ['100']);
+  assert.ok(errors.some((args) => String(args[0]).includes('failed to reopen 100')), 'the failure is logged');
+});
+
+test("a failed reopen that a later close passed over is logged without saying it stays listed", async () => {
+  const shared = chan('100', 'shared');
+  const oldClient = readyClient('p_old', [shared]);
+  const newClient = readyClient('p_new', [shared]);
+  const refuse: Array<(err: Error) => void> = [];
+  (newClient as unknown as { call: (method: string) => Promise<unknown> }).call = (method) =>
+    method === 'subscribe_channel'
+      ? new Promise((_, reject) => void refuse.push(reject))
+      : Promise.resolve({ pings: [] });
+  const { server, internal } = serverWithoutRegister(
+    oldClient,
+    new PortalAgent(oldClient, { state: new AgentState(), hostOwnsChannelLifecycle: true }),
+  );
+  internal.openChannels.add('100');
+  const errors: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => void errors.push(args);
+  try {
+    await server.swapSession(
+      newClient,
+      new PortalAgent(newClient, { state: new AgentState(), hostOwnsChannelLifecycle: true }),
+    );
+    assert.equal(refuse.length, 1, 'the reopen is out');
+    await newClient.unsubscribe('100'); // a close that stands, after the reopen
+    refuse[0]!(new Error('refused'));
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  } finally {
+    console.error = realError;
+  }
+  assert.equal(newClient.isSubscribed('100'), false);
+  const reopen = errors.find((args) => String(args[0]).includes('failed to reopen 100'));
+  assert.ok(reopen, 'the failure is logged');
+  assert.ok(!String(reopen[0]).includes('stays'), 'without saying it stays listed');
+});
+
 test('identity tools are absent — and undeclared — unless a manager is attached', () => {
   const client = readyClient('p', []);
   const server = new PortalMcplServer(client, new PortalAgent(client, { hostOwnsChannelLifecycle: true }));

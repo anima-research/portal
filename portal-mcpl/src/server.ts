@@ -649,9 +649,8 @@ export class PortalMcplServer {
     // subscribed it, and handleChannelClose records it closed only once the
     // unsubscribe succeeds, so the client's list holds every channel opened
     // that way. Subscribing here as well would put back a channel whose close
-    // is still waiting. One case stays open but unlisted: a channel whose
-    // reopen under a new identity failed (swapSession, without
-    // channels.register), which nothing tries again.
+    // is still waiting. A reopen under a new identity (swapSession, without
+    // channels.register) keeps its channel listed even when it fails.
     track(this.client.on('message', (e) => {
       // Self-echo filter: the relay dispatches the persona's OWN webhook posts
       // back to it like any other channel message. Re-ingesting them is pure
@@ -835,15 +834,20 @@ export class PortalMcplServer {
     } else {
       // No channels.register: the host can't be told a channel closed, so keep
       // its open set where the new identity can see it (a fresh relay session
-      // starts with none, so reassert those) and drop what it can't see.
+      // starts with none, so reassert those) and drop what it can't see. A
+      // reopen that fails stays in the client's list, as the host still holds
+      // the channel open, so each resume and identify asks for it again.
       for (const channelId of [...this.openChannels]) {
         if (!visible.has(channelId)) {
           this.openChannels.delete(channelId);
           continue;
         }
-        void client.subscribe(channelId).catch((err) =>
+        void client.subscribe(channelId, { undo: false }).catch((err) =>
           console.error(
-            `[portal-mcpl] failed to reopen ${channelId} under the new identity:`,
+            `[portal-mcpl] failed to reopen ${channelId} under the new identity` +
+              (client.isSubscribed(channelId)
+                ? "; it stays in the client's list, so the next resume or identify asks the relay for it again:"
+                : ':'),
             (err as Error).message,
           ),
         );
