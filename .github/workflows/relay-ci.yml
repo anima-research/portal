@@ -2,8 +2,9 @@ name: Relay CI
 
 # Type-checks the relay and runs its admin-panel tests: the admin API, the
 # slash commands, the permission and invite stores, and the panel's own client
-# scripts (test/admin-spa.test.ts loads portal-admin/*.js in node:vm). The rest
-# of the relay suite (gateway, voice) is not run here; the gateway logging
+# scripts (test/admin-spa.test.ts loads portal-admin/*.js in node:vm). It also
+# runs the channel-creation gate tests and the voice tests. The rest of the
+# relay suite (the gateway's among it) is not run here; the gateway logging
 # test is known to be flaky.
 
 on:
@@ -42,19 +43,8 @@ jobs:
       matrix:
         node: ['22.12.0', '24']
     steps:
-      # portal-relay depends on file:../../voice-kit, a sibling of this
-      # repository, so both are checked out side by side:
-      #   $GITHUB_WORKSPACE/portal/portal-relay  →  ../../voice-kit
-      #   $GITHUB_WORKSPACE/voice-kit
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          path: portal
-          persist-credentials: false
-
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: anima-research/voice-kit
-          path: voice-kit
           persist-credentials: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -62,34 +52,28 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
           cache-dependency-path: |
-            voice-kit/package-lock.json
-            portal/portal-protocol/package-lock.json
-            portal/portal-relay/package-lock.json
+            portal-protocol/package-lock.json
+            portal-relay/package-lock.json
 
-      # The relay imports both packages through their built output (package
+      # The relay imports portal-protocol through its built output (package
       # main/types point into dist/), and its tsconfig references
-      # ../portal-protocol as a project, so they are built first.
-      - name: Build voice-kit
-        working-directory: voice-kit
-        run: |
-          npm ci
-          npm run build
-
+      # ../portal-protocol as a project, so protocol is built first.
+      # @animalabs/voice-kit comes from npm, as relay's lockfile pins it.
       - name: Build protocol
-        working-directory: portal/portal-protocol
+        working-directory: portal-protocol
         run: |
           npm ci
           npm run build
 
       - name: Install & typecheck relay
-        working-directory: portal/portal-relay
+        working-directory: portal-relay
         run: |
           npm ci
           npx tsc --noEmit -p .
 
       # Later phases add their new admin test files to this list.
       - name: Admin tests
-        working-directory: portal/portal-relay
+        working-directory: portal-relay
         run: >-
           node --import tsx --test
           test/admin*.test.ts
@@ -102,5 +86,12 @@ jobs:
       # The gate on create_text_channel (#16): what lets a persona have the
       # shared bot create a channel.
       - name: Channel-creation gate tests
-        working-directory: portal/portal-relay
+        working-directory: portal-relay
         run: node --import tsx --test test/create-text-channel.test.ts
+
+      # Voice output, speech and transcripts. voice-sink.test.ts loads
+      # voice-speaker.ts, the module that loads @animalabs/voice-kit at run
+      # time, so it also checks the installed package loads.
+      - name: Voice tests
+        working-directory: portal-relay
+        run: node --import tsx --test test/voice-*.test.ts
