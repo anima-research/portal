@@ -240,7 +240,7 @@ test("a use that can't be saved leaves an invite's earlier count as it was", asy
   }
 });
 
-test('claim_invite: a claim that fails on a write is answered INTERNAL and audited with the code shortened and the guild; a success keeps only the prefix too', async () => {
+test('claim_invite: a claim that fails on a write, after its use is saved or before, is answered INTERNAL and audited with the code shortened and the guild; a success keeps only the prefix too', async () => {
   const dir = makeDir();
   try {
     const relay = makeRelay(dir);
@@ -261,17 +261,30 @@ test('claim_invite: a claim that fails on a write is answered INTERNAL and audit
       { action: 'claim_invite', ok: false, target: `${LONG_CODE.slice(0, 12)}…`, guildId: GUILD },
     );
     restoreFile(dir, 'permissions.json');
+    // A use that can't be saved: answered INTERNAL, saying trying again is
+    // safe, and audited with that message.
+    breakFile(dir, 'invites.json');
+    const unsaved = await rpc(LONG_CODE_2);
+    assert.equal(unsaved.error.code, 'INTERNAL');
+    assert.match(unsaved.error.message, /stopped before writing anything else; trying again with the same invite is safe/);
+    assert.deepEqual(
+      { ok: records[1].ok, target: records[1].target, guildId: records[1].guildId, error: records[1].detail.error },
+      { ok: false, target: `${LONG_CODE_2.slice(0, 12)}…`, guildId: GUILD, error: unsaved.error.message },
+    );
+    restoreFile(dir, 'invites.json');
     // A refusal (the use is spent) is answered as before and not audited.
     const refused = await rpc(LONG_CODE);
     assert.equal(refused.error.code, 'INVALID_PARAMS');
-    assert.equal(records.length, 1);
+    assert.equal(records.length, 2);
+    // The code whose use couldn't be saved is claimed again, and the success
+    // keeps only its prefix.
     const ok = await rpc(LONG_CODE_2);
     assert.equal(ok.ok, true);
-    assert.deepEqual({ target: records[1].target, guildId: records[1].guildId, ok: records[1].ok }, { target: `${LONG_CODE_2.slice(0, 12)}…`, guildId: GUILD, ok: true });
+    assert.deepEqual({ target: records[2].target, guildId: records[2].guildId, ok: records[2].ok }, { target: `${LONG_CODE_2.slice(0, 12)}…`, guildId: GUILD, ok: true });
     // A short, hand-chosen code is hidden outright.
     const short = await rpc('augment-once');
     assert.equal(short.ok, true);
-    assert.equal(records[2].target, '(code hidden)');
+    assert.equal(records[3].target, '(code hidden)');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

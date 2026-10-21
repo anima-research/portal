@@ -1428,9 +1428,11 @@ export class AdminServer {
     try {
       result = this.deps.applyClaim(personaId, code);
     } catch (e) {
-      // INTERNAL is a claim that failed on a write: it may have spent a use
-      // and given part of the grant, so it's audited, and the panel answers it
-      // as a change that may or may not have been made. Anything else is a
+      // INTERNAL is a claim that failed on a write, and its message says
+      // whether the use was recorded: if so, the use is spent and the claim may
+      // be partly applied; if not, it stopped before writing anything else.
+      // Either way it's audited with that message, and the panel answers it as
+      // a change that may or may not have been made. Anything else is a
       // refusal, which changes nothing.
       if ((e as { code?: string }).code === 'INTERNAL') {
         this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: false, detail: { code: auditCode(code), error: (e as Error).message } });

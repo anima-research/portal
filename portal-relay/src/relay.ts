@@ -1687,16 +1687,17 @@ export class Relay implements GatewayHooks {
       }
       case 'claim_invite': {
         const p = params as RpcParams<'claim_invite'>;
-        // The record keeps the code's prefix only, and the invite's guild, so
-        // the guild's audit view shows it.
+        // The record keeps the code's prefix only, and the invite's guild, if
+        // it has one, so that guild's audit view shows it.
         const guildId = this.invites?.get(p.code)?.guildId;
         let result: ReturnType<Relay['applyInviteAugment']>;
         try {
           result = this.applyInviteAugment(personaId, p.code);
         } catch (e) {
           // A refusal changes nothing and isn't audited. A claim that failed
-          // on a write may have spent a use and given part of the grant, so
-          // the record says it happened.
+          // on a write is, with its message, which says whether the use was
+          // recorded (and the claim may be partly applied) or not (and it
+          // stopped before writing anything else).
           if ((e as { code?: string }).code === 'INTERNAL') {
             this.audit?.append({
               actor: { id: personaId, name: this.displayName(personaId), kind: 'persona' },
