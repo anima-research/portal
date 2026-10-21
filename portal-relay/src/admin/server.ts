@@ -46,7 +46,7 @@ import {
 import type { IdentityStore } from '../identity.js';
 import { inviteShapeProblem, type InviteStore } from '../invites.js';
 import type { PermissionsStore } from '../permissions.js';
-import type { AuditLog, AuditRecord } from './audit.js';
+import { auditCode, type AuditLog, type AuditRecord } from './audit.js';
 import { canManageGuild } from './authz.js';
 import { clipToGuild, type ChannelLabel, type NameMaps, type RoleLabel } from './names.js';
 import { authorizeUrl, completeOAuth, OAuthError, type FetchLike } from './oauth.js';
@@ -1428,9 +1428,17 @@ export class AdminServer {
     try {
       result = this.deps.applyClaim(personaId, code);
     } catch (e) {
+      // INTERNAL is a claim that failed on a write: it may have spent a use
+      // and given part of the grant, so it's audited, and the panel answers it
+      // as a change that may or may not have been made. Anything else is a
+      // refusal, which changes nothing.
+      if ((e as { code?: string }).code === 'INTERNAL') {
+        this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: false, detail: { code: auditCode(code), error: (e as Error).message } });
+        return sendJson(res, 500, err('INTERNAL', (e as Error).message));
+      }
       return sendJson(res, 400, err('INVALID', (e as Error).message));
     }
-    this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code, roles: result.roles, ...(result.liftedBans ? { liftedBans: result.liftedBans } : {}) } });
+    this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code: auditCode(code), roles: result.roles, ...(result.liftedBans ? { liftedBans: result.liftedBans } : {}) } });
     sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, result.roles, session.isSuper), banned: this.deps.permissions.isBanned(personaId, guildId) });
   }
 
@@ -1911,10 +1919,10 @@ export class AdminServer {
     const r = structuredClone(rec);
     // Relay-made codes are inv_ + 24 random characters: 12 shown leave 96
     // bits unknown. A shorter (hand-chosen) code is hidden outright, since a
-    // prefix of it could be most of it. Already-shortened ones stay as they are.
-    const short = (c: unknown) =>
-      typeof c !== 'string' || c.endsWith('…') ? c : c.length >= 28 ? `${c.slice(0, 12)}…` : '(code hidden)';
-    if (r.action.startsWith('invite.') || r.action === 'slash.invite') r.target = short(r.target) as string | undefined;
+    // prefix of it could be most of it (auditCode). Already-shortened ones
+    // stay as they are.
+    const short = (c: unknown) => (typeof c !== 'string' || c.endsWith('…') ? c : auditCode(c));
+    if (r.action.startsWith('invite.') || r.action === 'slash.invite' || r.action === 'claim_invite') r.target = short(r.target) as string | undefined;
     // For a guild admin: another guild's role names are dropped; a role that
     // no longer exists is shown as such (its name may have been another
     // guild's, so it isn't shown).

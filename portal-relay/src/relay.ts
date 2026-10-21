@@ -35,7 +35,7 @@ import { ReadStateStore } from './read-state.js';
 import { RolePool } from './role-pool.js';
 import { WebhookPool } from './webhook-pool.js';
 import { AdminServer, type AdminDeps } from './admin/server.js';
-import { AuditLog } from './admin/audit.js';
+import { AuditLog, auditCode } from './admin/audit.js';
 import { ChannelNameResolver } from './admin/names.js';
 import { nameKeys } from './name-policy.js';
 import { SlashHandler } from './slash.js';
@@ -701,9 +701,9 @@ export class Relay implements GatewayHooks {
   }
 
   /**
-   * Self-registration via an invite template. Validates the invite, mints a
-   * fresh persona id + token, stamps the invite's capability profile as the
-   * persona's default policy, and consumes one use. The agent persists the
+   * Self-registration via an invite template. Validates the invite, consumes
+   * one use, mints a fresh persona id + token, and stamps the invite's
+   * capability profile as the persona's default policy. The agent persists the
    * returned token and uses normal `identify` thereafter.
    */
   async enroll(d: RegisterData): Promise<RegisteredData | { error: string }> {
@@ -739,9 +739,21 @@ export class Relay implements GatewayHooks {
       avatar: d.avatar || '',
       token: hashToken(token), // stored hashed-at-rest (RFC-005 §5.9)
     };
+    // The use is recorded before anything else is written. Each store writes
+    // its file as it changes, and a write can throw (a full disk, a file the
+    // relay can't write), so a claim can stop partway. A stop after the use is
+    // saved costs the claimant the use, rather than leaving the code claimable
+    // again. A use that can't be saved isn't counted (consume puts it back),
+    // and the claim stops before writing anything else, so the answer says
+    // trying again is safe; the gateway's answer for a throw can't say that.
+    try {
+      this.invites.consume(d.invite);
+    } catch (e) {
+      console.error(`[portal-relay] enroll via ${checked.label ?? 'an invite'} failed while recording its use:`, (e as Error).message);
+      return { error: "the relay couldn't save the invite's use, so registration stopped before creating anything; trying again with the same invite is safe once the relay can save, and whoever runs the relay can see why in its log" };
+    }
     this.identity.upsert(identity);
     this.applyInviteGrant(personaId, checked);
-    this.invites.consume(d.invite);
 
     // Carry the invite's default subscriptions through to this session. The
     // frame's own are a list, or '', 0, false or null for none: registerFieldProblem
@@ -1107,9 +1119,12 @@ export class Relay implements GatewayHooks {
   /**
    * Augment an EXISTING persona with an invite's grant (RFC-005 §5.6). Shared by
    * the `claim_invite` op (actor = the persona) and admin-initiated claim (actor =
-   * an admin). Validates the invite + its `mode`, unions roles / merges inline
-   * grant, consumes a use, and returns the resulting role set. Throws rpcError on
-   * any rejection. Auditing is the caller's responsibility (actor differs).
+   * an admin). Validates the invite + its `mode`, consumes a use, unions roles /
+   * merges inline grant, and returns the resulting role set. Throws rpcError on
+   * any rejection, before anything is written, and INTERNAL when a write
+   * fails after the checks, saying whether the use was recorded (the claim
+   * may then be partly applied). Auditing is the caller's responsibility
+   * (actor differs).
    */
   private applyInviteAugment(personaId: string, code: string, opts: { byAdmin?: boolean } = {}): { roles: string[]; liftedBans?: string[] } {
     if (!this.invites) throw rpcError('NOT_FOUND', 'invites not enabled');
@@ -1157,26 +1172,49 @@ export class Relay implements GatewayHooks {
     if (banned.length && !opts.byAdmin) {
       throw rpcError('FORBIDDEN', 'this persona was banned from that server; only an admin there can give it access again');
     }
-    let mirrorRole: string | null = null;
-    if (grant && isMirrorScope(grant.scope)) {
-      // Same live-role materialization as enroll; a silent snapshot here is
-      // strictly worse because an augmented persona has no reason to suspect
-      // its shiny new scope is already fossilizing.
-      mirrorRole = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
-      if (!mirrorRole) throw rpcError('INVALID_PARAMS', 'invite mirror grant is malformed');
+    // The use is recorded before anything is written, as in enroll: a claim
+    // that stops partway on a failed write costs the claimant the use rather
+    // than leaving the code claimable again. A write that throws from here on
+    // is answered as INTERNAL, saying whether the use was recorded, since the
+    // store's own error says neither that nor what the persona now holds; the
+    // relay's log keeps that error.
+    let used = false;
+    try {
+      this.invites.consume(code);
+      used = true;
+      let mirrorRole: string | null = null;
+      if (grant && isMirrorScope(grant.scope)) {
+        // Same live-role materialization as enroll; a silent snapshot here is
+        // strictly worse because an augmented persona has no reason to suspect
+        // its shiny new scope is already fossilizing.
+        mirrorRole = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
+        // A guard: it can't fire after the checks, since its two null cases
+        // (no guild, a colliding role) are refused by inviteGrantProblem first.
+        if (!mirrorRole) throw rpcError('INVALID_PARAMS', 'invite mirror grant is malformed');
+      }
+      const liftedBans = banned.filter((g) => grantsIn.has(g) && this.permissions.liftBan(personaId, g));
+      if (checked.roles?.length) {
+        this.permissions.addPersonaRoles(personaId, checked.roles);
+      }
+      if (mirrorRole) {
+        this.permissions.addPersonaRoles(personaId, [mirrorRole]);
+      } else if (grant) {
+        const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
+        this.permissions.setPersonaPolicy(personaId, this.mergePolicy(this.permissions.basePolicy(personaId), add));
+      }
+      return { roles: this.permissions.getRoleNames(personaId), ...(liftedBans.length ? { liftedBans } : {}) };
+    } catch (e) {
+      console.error(
+        `[portal-relay] claim of ${checked.label ?? 'an invite'} for persona "${personaId}" failed ${used ? 'after' : 'while'} recording its use:`,
+        (e as Error).message,
+      );
+      throw rpcError(
+        'INTERNAL',
+        used
+          ? "the claim stopped after the invite's use was recorded, so the use stays spent and the claim may be partly applied (its roles, its grant or a lifted ban); whoever runs the relay can check the persona's access"
+          : "the relay couldn't save the invite's use, so the claim stopped before writing anything else; trying again with the same invite is safe once the relay can save, and whoever runs the relay can see why in its log",
+      );
     }
-    const liftedBans = banned.filter((g) => grantsIn.has(g) && this.permissions.liftBan(personaId, g));
-    if (checked.roles?.length) {
-      this.permissions.addPersonaRoles(personaId, checked.roles);
-    }
-    if (mirrorRole) {
-      this.permissions.addPersonaRoles(personaId, [mirrorRole]);
-    } else if (grant) {
-      const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
-      this.permissions.setPersonaPolicy(personaId, this.mergePolicy(this.permissions.basePolicy(personaId), add));
-    }
-    this.invites.consume(code);
-    return { roles: this.permissions.getRoleNames(personaId), ...(liftedBans.length ? { liftedBans } : {}) };
   }
 
   /**
@@ -1649,11 +1687,33 @@ export class Relay implements GatewayHooks {
       }
       case 'claim_invite': {
         const p = params as RpcParams<'claim_invite'>;
-        const result = this.applyInviteAugment(personaId, p.code);
+        // The record keeps the code's prefix only, and the invite's guild, so
+        // the guild's audit view shows it.
+        const guildId = this.invites?.get(p.code)?.guildId;
+        let result: ReturnType<Relay['applyInviteAugment']>;
+        try {
+          result = this.applyInviteAugment(personaId, p.code);
+        } catch (e) {
+          // A refusal changes nothing and isn't audited. A claim that failed
+          // on a write may have spent a use and given part of the grant, so
+          // the record says it happened.
+          if ((e as { code?: string }).code === 'INTERNAL') {
+            this.audit?.append({
+              actor: { id: personaId, name: this.displayName(personaId), kind: 'persona' },
+              action: 'claim_invite',
+              target: auditCode(p.code),
+              ...(guildId ? { guildId } : {}),
+              ok: false,
+              detail: { error: (e as Error).message },
+            });
+          }
+          throw e;
+        }
         this.audit?.append({
           actor: { id: personaId, name: this.displayName(personaId), kind: 'persona' },
           action: 'claim_invite',
-          target: p.code,
+          target: auditCode(p.code),
+          ...(guildId ? { guildId } : {}),
           ok: true,
           after: { roles: result.roles },
         });

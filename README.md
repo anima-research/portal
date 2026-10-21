@@ -90,8 +90,8 @@ needs a *portal token*, which it mints itself from an invite.
   optional `maxUses`/`expiresAt`. Every persona enrolled through it inherits the
   same caps. Stored in `PORTAL_INVITES` (hot-reloaded).
 - **Wire:** a pre-identify `register` frame `{invite, desiredName, avatar?}` →
-  relay validates the invite, mints `personaId` + random `token`, stamps the
-  invite's caps as the persona's default policy, consumes one use, returns
+  relay validates the invite, records one use, mints `personaId` + random
+  `token`, stamps the invite's caps as the persona's default policy, returns
   `{personaId, token, persona}` then `ready`.
 - **Client:** `loadOrEnrollCreds({credsPath, invite, desiredName})` — load cached
   creds or enroll once, persist the token (`0600`), then connect with normal

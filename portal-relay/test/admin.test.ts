@@ -1245,6 +1245,8 @@ test("the audit view never shows a whole invite code, nor a guild admin another 
   deps.audit.append({ actor: superActor, action: 'slash.invite', target: code, guildId: 'G1', ok: true, detail: { via: 'slash', roles: ['r-g2', 'r-g1'] } });
   deps.audit.append({ actor: superActor, action: 'persona.claim', target: 'p1', guildId: 'G1', ok: true, after: { code, roles: ['r-g1', 'r-g2'] } });
   deps.audit.append({ actor: superActor, action: 'persona.role.assign', target: 'p1', guildId: 'G1', ok: true, after: { role: 'r-g2' } });
+  // A persona's own claim, as a record written before claims kept only a prefix.
+  deps.audit.append({ actor: { id: 'p1', name: 'P1', kind: 'persona' }, action: 'claim_invite', target: code, guildId: 'G1', ok: true, after: { roles: ['r-g1'] } });
   const server = new AdminServer(deps, fakeDiscordFetch([{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }]));
   await server.listen();
   const base = `http://127.0.0.1:${server.boundPort}`;
@@ -2873,3 +2875,43 @@ for (const asSuper of [false, true]) {
     }
   });
 }
+
+test('a claim that fails on a write is answered INTERNAL and audited; a refused one is 400 INVALID and not audited; a success keeps the code\'s prefix', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  const applyClaim = ctx.deps.applyClaim;
+  try {
+    const audited = () => ctx.deps.audit.read({ guildId: 'G1' }).filter((r) => r.action === 'persona.claim');
+    // As applyInviteAugment answers a claim that stopped after its use was recorded.
+    ctx.deps.applyClaim = () => {
+      throw Object.assign(new Error("the claim stopped after the invite's use was recorded"), { code: 'INTERNAL' });
+    };
+    const failed = await s.call('POST', '/admin/g/G1/personas/p1/claim', { code: 'aug-g1' });
+    assert.equal(failed.status, 500);
+    assert.equal(failed.body.error.code, 'INTERNAL');
+    assert.match(failed.body.error.message, /use was recorded/);
+    const rec = audited()[0];
+    assert.equal(rec.ok, false);
+    // A short, hand-chosen code is kept as '(code hidden)', since a prefix of it could be most of it.
+    assert.deepEqual(rec.detail, { code: '(code hidden)', error: "the claim stopped after the invite's use was recorded" });
+    // A refusal, as applyInviteAugment throws one before anything is written.
+    ctx.deps.applyClaim = () => {
+      throw Object.assign(new Error('invite exhausted'), { code: 'INVALID_PARAMS' });
+    };
+    const refused = await s.call('POST', '/admin/g/G1/personas/p1/claim', { code: 'aug-g1' });
+    assert.equal(refused.status, 400);
+    assert.equal(refused.body.error.code, 'INVALID');
+    assert.equal(audited().length, 1, 'the refusal is not audited');
+    // A success's record, as written to the file, keeps a relay-made code's prefix only.
+    ctx.deps.applyClaim = applyClaim;
+    const long = 'inv_dddddddddddddddddddddddd';
+    ctx.invites.mint({ code: long, guildId: 'G1', roles: ['r-g1'], mode: 'augment' });
+    const ok = await s.call('POST', '/admin/g/G1/personas/p1/claim', { code: long });
+    assert.equal(ok.status, 200, JSON.stringify(ok.body));
+    // The log reads newest first.
+    assert.equal(audited().length, 2);
+    assert.equal((audited()[0].after as { code?: string }).code, `${long.slice(0, 12)}…`);
+  } finally {
+    await s.close();
+  }
+});

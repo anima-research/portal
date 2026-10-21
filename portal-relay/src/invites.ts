@@ -6,8 +6,10 @@
  * without a restart) and persists its own use-count bumps.
  *
  * Separate from identity (who) and permissions (what) on purpose: an invite is
- * the *factory* for both — on a successful claim the relay mints an identity
- * and stamps the invite's caps as that persona's default policy.
+ * the *factory* for both. A claim records a use first, then either mints an
+ * identity and stamps the invite's caps as that persona's default policy
+ * (enroll), or adds the invite's roles and grant to an existing persona
+ * (augment).
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import type { InviteTemplate, InvitesFile } from './config.js';
@@ -168,12 +170,25 @@ export class InviteStore {
     return inv;
   }
 
-  /** Bump an invite's use count and persist. Call after a successful mint. */
+  /** Bump an invite's use count and persist; a use the write doesn't save
+   *  isn't counted. A claim calls it once it has accepted the invite, before
+   *  it writes anything else. */
   consume(code: string): void {
     const inv = this.byCode.get(code);
     if (!inv) return;
-    inv.uses = (inv.uses ?? 0) + 1;
-    this.persist();
+    const had = 'uses' in inv;
+    const before = inv.uses;
+    inv.uses = (before ?? 0) + 1;
+    try {
+      this.persist();
+    } catch (e) {
+      // The use wasn't saved, so it isn't counted: otherwise the next save of
+      // this file would write it, for a claim that stopped before writing
+      // anything else.
+      if (had) inv.uses = before;
+      else delete inv.uses;
+      throw e;
+    }
   }
 
   all(): InviteTemplate[] {
