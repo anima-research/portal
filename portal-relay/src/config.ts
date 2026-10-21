@@ -140,9 +140,12 @@ export interface InviteTemplate {
   subscriptions?: string[];
   /** Prefix for minted persona ids (default derived from the display name). */
   namePrefix?: string;
-  /** Max number of personas this invite may mint. Omit for unlimited. */
+  /** Max number of claims this invite may take, whether they mint a persona
+   *  or augment one. Omit for unlimited. */
   maxUses?: number;
-  /** How many personas have been minted so far (relay-maintained). */
+  /** How many uses have been recorded (relay-maintained): one per claim whose
+   *  use was saved. A claim saves it before anything else it writes, so one
+   *  that failed after that is counted too. */
   uses?: number;
   /** ISO timestamp after which the invite is rejected. Omit for no expiry. */
   expiresAt?: string;

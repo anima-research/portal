@@ -3,9 +3,9 @@ name: Relay CI
 # Type-checks the relay and runs its admin-panel tests: the admin API, the
 # slash commands, the permission and invite stores, and the panel's own client
 # scripts (test/admin-spa.test.ts loads portal-admin/*.js in node:vm). It also
-# runs the channel-creation gate tests and the voice tests. The rest of the
-# relay suite (the gateway's among it) is not run here; the gateway logging
-# test is known to be flaky.
+# runs the channel-creation gate tests, the voice tests and the invite claim
+# tests. The rest of the relay suite (the gateway's among it) is not run here;
+# the gateway logging test is known to be flaky.
 
 on:
   pull_request:
@@ -95,3 +95,10 @@ jobs:
       - name: Voice tests
         working-directory: portal-relay
         run: node --import tsx --test test/voice-*.test.ts
+
+      # An invite claim that stops partway on a failed write (#55): what it
+      # leaves, that a single-use code stays spent once its use is saved, and
+      # that it can be claimed again when its use couldn't be saved.
+      - name: Invite claim tests
+        working-directory: portal-relay
+        run: node --import tsx --test test/claim-write-fails.test.ts
