@@ -388,7 +388,7 @@ test('without channels.register, the follows in the state are reported once as n
   assert.match(String(notes[0]![0]), /^\[portal-mcpl\] 2 followed channel\(s\)/);
   assert.match(
     String(notes[0]![0]),
-    /grant channels\.register and channels\.lifecycle, so they reach the host as initiallyOpen hints it can open, or grant channels\.lifecycle and open each from the host with channels\/open/,
+    /To open the ones this persona can see, grant channels\.register and channels\.lifecycle, so they reach the host as initiallyOpen hints it can open, or grant channels\.lifecycle and open each from the host with channels\/open/,
   );
 });
 

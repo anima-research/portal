@@ -468,12 +468,15 @@ export class PortalMcplServer {
 
   /** Without channels.register the host gets no channel list, so the
    *  state's follows (PORTAL_SUBSCRIPTIONS, and follows saved before host
-   *  mode) reach it as no initiallyOpen hints, and in host mode the client's
-   *  list starts empty: they open nothing. Say so once for each session's
-   *  agent, counting the follows not already open, when the policy arrives and
-   *  when a switch brings another identity's state, rather than leave them
-   *  unused without a word. channels/open needs channels.lifecycle, so the
-   *  advice names it. */
+   *  mode) reach it as no initiallyOpen hints. The portal.messaging set uses
+   *  channels.register too, so it's off, and no message reaches the host as a
+   *  push event (canPush): a follow the host hasn't opened doesn't reach it at
+   *  all, whether or not the client lists it. Say so once for each session's agent,
+   *  counting the follows not already open, when the policy arrives and when a
+   *  switch brings another identity's state, rather than leave them unused
+   *  without a word. channels/open needs channels.lifecycle, so the advice
+   *  names it, and the host is offered only the channels this persona can see
+   *  (allDescriptors). */
   private noteUnofferedFollows(): void {
     const agent = this.agent;
     const unopened = agent.state.subscriptionList().filter((channelId) => !this.openChannels.has(channelId));
@@ -481,9 +484,9 @@ export class PortalMcplServer {
     this.unofferedFollowsNoted.add(agent);
     console.error(
       `[portal-mcpl] ${unopened.length} followed channel(s), from PORTAL_SUBSCRIPTIONS or follows saved before, ` +
-        "aren't open: this host doesn't grant channels.register, so they can't be offered to it. To open them, " +
-        'grant channels.register and channels.lifecycle, so they reach the host as initiallyOpen hints it can ' +
-        'open, or grant channels.lifecycle and open each from the host with channels/open.',
+        "aren't open: this host doesn't grant channels.register, so they can't be offered to it. To open the ones " +
+        'this persona can see, grant channels.register and channels.lifecycle, so they reach the host as ' +
+        'initiallyOpen hints it can open, or grant channels.lifecycle and open each from the host with channels/open.',
     );
   }
 
