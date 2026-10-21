@@ -2,8 +2,9 @@ name: Relay CI
 
 # Type-checks the relay and runs its admin-panel tests: the admin API, the
 # slash commands, the permission and invite stores, and the panel's own client
-# scripts (test/admin-spa.test.ts loads portal-admin/*.js in node:vm). The rest
-# of the relay suite (gateway, voice) is not run here; the gateway logging
+# scripts (test/admin-spa.test.ts loads portal-admin/*.js in node:vm). It also
+# runs the channel-creation gate tests and the voice tests. The rest of the
+# relay suite (the gateway's among it) is not run here; the gateway logging
 # test is known to be flaky.
 
 on:
@@ -87,3 +88,10 @@ jobs:
       - name: Channel-creation gate tests
         working-directory: portal-relay
         run: node --import tsx --test test/create-text-channel.test.ts
+
+      # Voice output, speech and transcripts. voice-sink.test.ts loads
+      # voice-speaker.ts, the module that loads @animalabs/voice-kit at run
+      # time, so it also checks the installed package loads.
+      - name: Voice tests
+        working-directory: portal-relay
+        run: node --import tsx --test test/voice-*.test.ts
