@@ -138,7 +138,8 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
    *  oldest first, each with whether it lists the channel. */
   private readonly subscriptionRuns = new Map<string, { before: boolean; calls: SubscriptionCall[] }>();
   /** The reconnect onClose scheduled, until it runs or cancelReconnect()
-   *  cancels it: close(), a connect(), or onClose scheduling the next. */
+   *  cancels it: close(), a connect() once its own socket exists, or onClose
+   *  scheduling the next. */
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   /** RPC frames waiting for a session that can take them: identified (`ready`
    *  or `resumed`) and on an OPEN socket. Held through startup, reconnects and
@@ -314,10 +315,11 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   // ── Internals ──
 
   private open(): void {
-    // One reconnect at a time: a connect() while a reconnect waits for its
-    // backoff takes its place, so the timer doesn't open a second socket.
-    this.cancelReconnect();
     const ws = resolveWsFactory(this.opts.wsFactory)(this.opts.url);
+    // One reconnect at a time: a connect()'s socket takes the place of a
+    // reconnect waiting for its backoff, so the timer doesn't open a second
+    // one. A factory that throws leaves the waiting reconnect to try again.
+    this.cancelReconnect();
     this.ws = ws;
     ws.on('message', (data) => this.onMessage(data.toString()));
     ws.on('close', (code: number) => this.onClose(code));

@@ -117,7 +117,8 @@ test('a resume asks the relay for each subscription again, before resumed is emi
 
 test('a resume asks for the list as it stands, with changes made while the socket was down', async (t) => {
   const { client, sockets } = await connected(t, ['c1', 'c2']);
-  // The two calls below can only time out, since their frames go nowhere. The
+  // The client holds the two calls below while its socket is down and sends
+  // them after the resume, where nothing answers them, so they time out. The
   // clock is held, so they can't time out before the resume however slowly
   // this runs.
   t.mock.timers.enable({ apis: ['setTimeout'] });
@@ -330,8 +331,11 @@ test('a subscribe whose frame a dropped socket lost times out after a newer one 
   // the resume and the newer call have settled the channel.
   const { client, sockets } = await connected(t, []);
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  drop(sockets[0]);
+  // Sent on the first socket, so its frame goes with it. A call made after
+  // the drop would be held and sent after the resume instead.
   const older = client.subscribe('c1').catch((error: unknown) => error);
+  assert.deepEqual(sockets[0].subscriptionCalls(), [['subscribe_channel', 'c1']], 'its frame went out on the first socket');
+  drop(sockets[0]);
   t.mock.timers.tick(20); // the reconnect, due within maxBackoffMs
   const ws = resume(sockets[1]);
   const newer = client.subscribe('c1');
@@ -348,8 +352,10 @@ test('a call whose frame a dropped socket lost, timing out while a later call on
   // run and changes nothing, though a later call has started a run since.
   const { client, sockets } = await connected(t, []);
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  drop(sockets[0]);
+  // Sent on the first socket, so its frame goes with it.
   const lost = client.unsubscribe('c1').catch((error: unknown) => error);
+  assert.deepEqual(sockets[0].subscriptionCalls(), [['unsubscribe_channel', 'c1']], 'its frame went out on the first socket');
+  drop(sockets[0]);
   t.mock.timers.tick(20); // the reconnect, due within maxBackoffMs
   const ws = resume(sockets[1]);
   const standing = client.unsubscribe('c1');
@@ -442,6 +448,23 @@ test('a connect() while a reconnect waits for its backoff takes its place, so on
   assert.equal(sockets.length, 2, "connect()'s socket");
   t.mock.timers.tick(1000);
   assert.equal(sockets.length, 2, 'no socket from the waiting reconnect');
+});
+
+test("a connect() whose socket the factory can't make, while a reconnect waits, leaves the reconnect to try again", async (t) => {
+  const { client, sockets } = await connected(t, ['c1']);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  drop(sockets[0]);
+  assert.ok((client as unknown as { reconnectTimer?: unknown }).reconnectTimer, 'a reconnect is waiting');
+  const opts = (client as unknown as { opts: { wsFactory: (url: string) => unknown } }).opts;
+  const factory = opts.wsFactory;
+  opts.wsFactory = () => {
+    opts.wsFactory = factory;
+    throw new Error('no socket now');
+  };
+  await assert.rejects(client.connect(), /no socket now/);
+  assert.equal(sockets.length, 1, 'connect() made no socket');
+  t.mock.timers.tick(1000);
+  assert.equal(sockets.length, 2, 'the waiting reconnect opened one');
 });
 
 test('a second close while a reconnect waits leaves one reconnect, which close() cancels', async (t) => {
