@@ -322,16 +322,45 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     // reconnect waiting for its backoff, so the timer doesn't open a second
     // one. A factory that throws leaves the waiting reconnect to try again.
     this.cancelReconnect();
+    // The new socket has no session until its own ready or resumed, and the
+    // replaced socket's close, which the checks below ignore, won't reset
+    // anything through onClose. So mark the client not ready and stop the
+    // replaced session's heartbeat here; otherwise a call, and a heartbeat
+    // with the old seq, would go out on a socket that hasn't identified.
+    this.ready = false;
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
+    const previous = this.ws;
     this.ws = ws;
-    ws.on('message', (data) => this.onMessage(data.toString()));
-    ws.on('close', (code: number) => this.onClose(code));
-    ws.on('error', (err: Error) => this.emit('error', err));
+    // A connect() while the client's socket is still open or connecting
+    // replaces it, so close that socket rather than leave its connection
+    // open. One already closing or closed, as after close() or a drop, starts
+    // no second close. For one still open, connecting or closing, its close
+    // event and any error come after this.ws has moved on, so the checks
+    // below ignore them. One already closed had its close event while it was
+    // this.ws, and the reconnect that scheduled is cancelled above.
+    previous?.close(1000, 'replaced by a new connection');
+    // Each socket acts on the client only while it's this.ws. After close()
+    // and connect(), the old socket can still deliver frames, an error and its
+    // close while its closing handshake runs, and those belong to a session
+    // the client has left. Its rpc_result is the one exception: it settles the
+    // call that socket carried, by id, as close() promises a call already sent.
+    ws.on('message', (data) => this.onMessage(data.toString(), ws === this.ws));
+    ws.on('close', (code: number) => {
+      if (ws === this.ws) this.onClose(code);
+    });
+    ws.on('error', (err: Error) => {
+      if (ws === this.ws) this.emit('error', err);
+    });
   }
 
-  private onMessage(raw: string): void {
+  /** Act on a frame. From a socket the client no longer uses (`current`
+   *  false, see open()), only an rpc_result is taken. */
+  private onMessage(raw: string, current: boolean): void {
     const parsed: unknown = safeParse(raw);
     if (!isServerFrame(parsed)) return;
     const frame = parsed as ServerFrame;
+    if (!current && frame.op !== 'rpc_result') return;
     switch (frame.op) {
       case 'hello':
         this.startHeartbeat(frame.d.heartbeatIntervalMs);
