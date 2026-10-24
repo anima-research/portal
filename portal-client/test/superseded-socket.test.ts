@@ -150,6 +150,7 @@ test("the old socket's late events don't reach listeners", async (t) => {
   // carry its seq.
   b.feed({ op: 'dispatch', seq: 1, d: { type: 'voice_status', channelId: 'c', guildId: null, joined: false } });
   a.feed({ op: 'dispatch', seq: 5, d: { type: 'voice_status', channelId: 'c', guildId: null, joined: true } });
+  a.feed({ op: 'dispatch_ephemeral', d: { type: 'voice_status', channelId: 'c', guildId: null, joined: true } });
 
   assert.deepEqual(events, [{ type: 'voice_status', channelId: 'c', guildId: null, joined: false }]);
   const beats = b.sent.length;
