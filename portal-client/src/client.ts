@@ -346,7 +346,9 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
    *  as it joins, so the channel joins the list a reconnect restores, as with
    *  subscribe(): the relay stays in the channel across a reconnect, and the
    *  new session asks for its transcripts again. A failed join is undone as
-   *  subscriptionCall says. */
+   *  subscriptionCall says. One whose answer was lost may still have joined,
+   *  leaving the relay in the voice channel with the session unsubscribed
+   *  again, so call voiceJoin() again, or voiceLeave(). */
   voiceJoin(channelId: string) {
     return this.subscriptionCall('voice_join', channelId, true, true);
   }
