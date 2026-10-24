@@ -165,24 +165,63 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     };
   }
 
-  /** Connect and resolve once `ready` (or `resumed`) is received. */
+  /** Connect and resolve once `ready` (or `resumed`) is received. A client
+   *  that still holds a session, after close() or while a reconnect waits,
+   *  resumes it, and the relay answers with `resumed` alone: connect() then
+   *  resolves with the session as the client holds it after the relay's
+   *  replay (sessionSnapshot). */
   connect(): Promise<ReadyData> {
     this.closedByUser = false;
     return new Promise<ReadyData>((resolve, reject) => {
-      const onReady = this.on('ready', (d) => {
-        onReady();
-        onErr();
+      const done = () => {
+        offReady();
+        offResumed();
+        offErr();
+      };
+      const offReady = this.on('ready', (d) => {
+        done();
         resolve(d);
       });
-      const onErr = this.on('error', (e) => {
+      const offResumed = this.on('resumed', () => {
+        const snapshot = this.sessionSnapshot();
+        // A `resumed` for no session this client holds answers no resume of
+        // ours, so keep waiting for `ready`.
+        if (!snapshot) return;
+        done();
+        resolve(snapshot);
+      });
+      const offErr = this.on('error', (e) => {
         if (!this.ready) {
-          onReady();
-          onErr();
+          done();
           reject(e);
         }
       });
-      this.open();
+      try {
+        this.open();
+      } catch (err) {
+        // The factory couldn't make a socket: nothing will answer these
+        // listeners, so remove them before the rejection.
+        done();
+        throw err;
+      }
     });
+  }
+
+  /** The session the client holds, as `ready` would describe it: its id, the
+   *  last seq it has seen, and the persona and directory as the cache holds
+   *  them. The relay replays what a resumed session missed before it sends
+   *  `resumed`, so at that point the cache has applied it. Undefined when the
+   *  client holds no session. */
+  private sessionSnapshot(): ReadyData | undefined {
+    const persona = this.cache.persona;
+    if (!this.sessionId || !persona) return undefined;
+    return {
+      sessionId: this.sessionId,
+      persona,
+      guilds: this.cache.allGuilds(),
+      channels: this.cache.allChannels(),
+      seq: this.lastSeq,
+    };
   }
 
   /** Close the connection, and cancel a reconnect still waiting for its
