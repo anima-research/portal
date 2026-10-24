@@ -417,8 +417,9 @@ test('a call still waiting at close() sends no reassert when it times out', asyn
 });
 
 test('a resumed frame that arrives after close() asks the relay for nothing', async (t) => {
-  // As for a reassert: the next connect() identifies with the list, and a call
-  // now would only start a timer.
+  // As for a reassert: the next connect() asks the relay for the list itself
+  // (it resumes and restores it, or identifies with it), and a call now would
+  // only start a timer.
   const { client, sockets } = await connected(t, ['c1']);
   client.close();
   sockets[0].frame({ op: 'resumed', d: { replayedEvents: 0 } });
