@@ -84,19 +84,20 @@ export class PortalAgent {
       // An edit to a message we track refreshes its preview but isn't a new ping.
       this.state.ingest(e.message, false, e.reasons);
     });
-    // A transport `resume` restores the event stream but NOT the relay session's
-    // subscriptions (the new session starts empty). Reapply from durable state.
-    // The fresh-`identify` path already carries them via the client's replay set.
-    if (!this.hostOwnsChannelLifecycle) {
-      this.client.on('resumed', () => this.reapplySubscriptions());
-    }
+    // The client asks the relay for its subscriptions again on every
+    // reconnect, a resume included. Standalone, it's built with this durable
+    // state (session.ts) and each change below goes to both; after a failed
+    // call the state takes the client's word for the channel (followClient).
+    // In host mode the host's opens make the client's list, and this state
+    // only seeds the host's initiallyOpen hints.
   }
 
-  /** Re-assert this agent's durable subscriptions on the live session. */
-  private reapplySubscriptions(): void {
-    for (const channelId of this.state.subscriptionList()) {
-      this.client.subscribe(channelId).catch(() => {});
-    }
+  /** After a failed subscribe or unsubscribe, keep the channel in the state
+   *  exactly when the client's list keeps it: the client undoes a failed
+   *  call's change only while it's the newest call on the channel. */
+  private followClient(channelId: string): void {
+    if (this.client.isListed(channelId)) this.state.subscribe(channelId);
+    else this.state.unsubscribe(channelId);
   }
 
   private ingest(message: PortalMessage, addressedToMe: boolean, reasons: AddressReason[]): void {
@@ -109,7 +110,10 @@ export class PortalAgent {
       if (process.env.PORTAL_DEBUG) {
         console.error(`[portal-cc] auto-subscribed to ${message.channelId} (addressed here)`);
       }
-      this.client.subscribe(message.channelId).catch(() => {});
+      const channelId = message.channelId;
+      // A failed subscribe the client undoes leaves the durable state too, so
+      // the next mention here tries again.
+      this.client.subscribe(channelId).catch(() => this.followClient(channelId));
     }
     const wasPing = this.state.ingest(message, addressedToMe, reasons);
     if (wasPing && this.onPing) {
@@ -323,12 +327,22 @@ export class PortalAgent {
       case 'subscribe_channel': {
         const channelId = str(args.channelId, 'channelId');
         this.state.subscribe(channelId); // durable; persisted via onChange
-        return this.client.subscribe(channelId);
+        try {
+          return await this.client.subscribe(channelId);
+        } catch (error) {
+          this.followClient(channelId);
+          throw error;
+        }
       }
       case 'unsubscribe_channel': {
         const channelId = str(args.channelId, 'channelId');
         this.state.unsubscribe(channelId);
-        return this.client.unsubscribe(channelId);
+        try {
+          return await this.client.unsubscribe(channelId);
+        } catch (error) {
+          this.followClient(channelId);
+          throw error;
+        }
       }
       case 'list_subscriptions':
         // Durable agent state is the source of truth (survives reconnect/restart).

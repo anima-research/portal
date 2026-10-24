@@ -75,6 +75,9 @@ export interface ReadyData {
   seq: number;
 }
 
+/** A resumed session has no ambient subscriptions: the relay restores none
+ *  on resume, so the client sends `subscribe_channel` for each channel again
+ *  (PortalClient does, from its list). */
 export interface ResumedData {
   replayedEvents: number;
 }

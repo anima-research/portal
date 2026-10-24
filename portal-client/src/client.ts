@@ -3,8 +3,11 @@
  *
  * Lifecycle: connect → hello → identify → ready. On an unexpected close it
  * reconnects and `resume`s from the last seq; a non-resumable rejection falls
- * back to a fresh identify. The agent-facing read watermark is NOT here — that
- * lives in portal-mcpl; this layer only does transport-level resume.
+ * back to a fresh identify. Either way the relay session gets this client's
+ * ambient subscriptions back: identify carries them, and a resume replays
+ * them, since a resumed relay session starts with none. The agent-facing read
+ * watermark is NOT here — that lives in portal-mcpl; this layer only does
+ * transport-level resume.
  */
 import { randomUUID } from './uuid.js';
 import { resolveWsFactory, type WsFactory, type WsLike } from './ws-compat.js';
@@ -30,7 +33,10 @@ export interface PortalClientOptions {
   url: string;
   token: string;
   personaId: string;
-  /** Ambient channel subscriptions to request on connect. */
+  /** Ambient channel subscriptions to request on connect. The client keeps
+   *  them, with subscribe() and unsubscribe()'s changes, and asks the relay for
+   *  them again on every reconnect, a resume included; the relay leaves out
+   *  any it refuses. */
   subscriptions?: string[];
   /** RPC timeout in ms (default 15000). */
   rpcTimeoutMs?: number;
@@ -94,6 +100,21 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** Options for PortalClient.subscribe() and unsubscribe(). */
+export interface SubscriptionOptions {
+  /** false: a failed call leaves its change to the list standing, as a
+   *  success would, for a caller whose subscribe or unsubscribe must hold
+   *  whether or not the relay answers. Defaults to true. */
+  undo?: boolean;
+}
+
+/** A subscribe or unsubscribe still waiting, with whether it lists its
+ *  channel (PortalClient.subscriptionCall). Each call is its own object, so a
+ *  run finds a call by identity. */
+interface SubscriptionCall {
+  listed: boolean;
+}
+
 export class PortalClient extends TypedEmitter<PortalClientEvents> {
   readonly cache = new ClientCache();
 
@@ -111,6 +132,15 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   private backoff = 1000;
   private closedByUser = false;
   private ready = false;
+  /** Each channel with a subscribe or unsubscribe still waiting
+   *  (subscriptionCall): whether the list held the channel before those
+   *  calls, as the calls that stood leave it, and the calls still waiting,
+   *  oldest first, each with whether it lists the channel. */
+  private readonly subscriptionRuns = new Map<string, { before: boolean; calls: SubscriptionCall[] }>();
+  /** The reconnect onClose scheduled, until it runs or cancelReconnect()
+   *  cancels it: close(), a connect() once its own socket exists, or onClose
+   *  scheduling the next. */
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
   /** RPC frames waiting for a session that can take them: identified (`ready`
    *  or `resumed`) and on an OPEN socket. Held through startup, reconnects and
    *  a CLOSING socket, and flushed by flushOutbox in call order. Each frame is
@@ -128,7 +158,8 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       rpcTimeoutMs: options.rpcTimeoutMs ?? 15_000,
       maxBackoffMs: options.maxBackoffMs ?? 30_000,
       // Kept as a mutable set so subscribe/unsubscribe stay durable across
-      // reconnects (identify replays this list).
+      // reconnects: identify carries this list, and a resume replays it
+      // (restoreSubscriptions).
       subscriptions: options.subscriptions ? [...options.subscriptions] : [],
       wsFactory: options.wsFactory,
     };
@@ -154,6 +185,8 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     });
   }
 
+  /** Close the connection, and cancel a reconnect still waiting for its
+   *  backoff, so a closed client stays closed until connect(). */
   close(): void {
     this.closedByUser = true;
     // A real socket's close event comes only after its closing handshake, so
@@ -161,6 +194,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     // holds calls until its own session is ready.
     this.ready = false;
     if (this.heartbeat) clearInterval(this.heartbeat);
+    this.cancelReconnect();
     // Unsent work dies with the client: a later connect() must not run an
     // operation the caller issued before shutting down. Calls already sent
     // keep their timers, since a result can still arrive before the socket
@@ -176,6 +210,11 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       }
     }
     this.ws?.close(1000, 'client closing');
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
   }
 
   /** Typed RPC call. */
@@ -224,26 +263,26 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   fetchHistory(params: RpcParams<'fetch_history'>) {
     return this.call('fetch_history', params);
   }
-  async subscribe(channelId: string) {
-    const subs = (this.opts.subscriptions ??= []);
-    const added = !subs.includes(channelId);
-    if (added) subs.push(channelId);
-    try {
-      return await this.call('subscribe_channel', { channelId });
-    } catch (error) {
-      if (added) this.opts.subscriptions = subs.filter((c) => c !== channelId);
-      throw error;
-    }
+  /** Subscribe to a channel's ambient events. The channel joins the list a
+   *  reconnect restores at once. A failed call is undone as subscriptionCall
+   *  says, unless `undo` is false: then the channel stays listed, as after a
+   *  success, and the next resume or identify asks the relay for it again. */
+  async subscribe(channelId: string, options: SubscriptionOptions = {}) {
+    return this.subscriptionCall('subscribe_channel', channelId, true, options.undo !== false);
   }
-  async unsubscribe(channelId: string) {
-    const previous = [...(this.opts.subscriptions ?? [])];
-    this.opts.subscriptions = previous.filter((c) => c !== channelId);
-    try {
-      return await this.call('unsubscribe_channel', { channelId });
-    } catch (error) {
-      this.opts.subscriptions = previous;
-      throw error;
-    }
+  /** Unsubscribe from a channel's ambient events. The channel leaves the list
+   *  a reconnect restores at once. A failed call is undone as subscriptionCall
+   *  says, unless `undo` is false: then the channel stays out of the list, as
+   *  after a success. */
+  async unsubscribe(channelId: string, options: SubscriptionOptions = {}) {
+    return this.subscriptionCall('unsubscribe_channel', channelId, false, options.undo !== false);
+  }
+  /** Whether the channel is in the list a reconnect restores, as subscribe()
+   *  and unsubscribe() leave it. That's this client's request, not the
+   *  relay's state: the relay may have refused the channel, as the list keeps
+   *  a refused one. `list_subscriptions` gives the relay's own view. */
+  isListed(channelId: string): boolean {
+    return (this.opts.subscriptions ?? []).includes(channelId);
   }
   /** Ask the relay to join a voice channel and stream transcripts here
    *  (auto-subscribes this session to the channel). Requires VOICE_LISTEN. */
@@ -279,6 +318,10 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
 
   private open(): void {
     const ws = resolveWsFactory(this.opts.wsFactory)(this.opts.url);
+    // One reconnect at a time: a connect()'s socket takes the place of a
+    // reconnect waiting for its backoff, so the timer doesn't open a second
+    // one. A factory that throws leaves the waiting reconnect to try again.
+    this.cancelReconnect();
     this.ws = ws;
     ws.on('message', (data) => this.onMessage(data.toString()));
     ws.on('close', (code: number) => this.onClose(code));
@@ -311,6 +354,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         this.ready = true;
         this.backoff = 1000;
         this.flushOutbox();
+        this.restoreSubscriptions();
         this.emit('resumed', frame.d.replayedEvents);
         return;
       case 'invalid_session':
@@ -438,6 +482,99 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     });
   }
 
+  /**
+   * A resumed relay session starts with no ambient subscriptions (identify
+   * carries them, a resume doesn't), so ask for each channel in the list again,
+   * before `resumed` is emitted. The answers aren't awaited. A channel the relay
+   * refuses, such as one this persona can no longer view, stays in the list, as
+   * identify's restore drops a refused channel without a word: the next resume
+   * or identify asks again. After close(), call() refuses each of these, so a
+   * `resumed` frame that arrives then asks the relay for nothing.
+   */
+  private restoreSubscriptions(): void {
+    for (const channelId of this.opts.subscriptions ?? []) {
+      this.call('subscribe_channel', { channelId }).catch(() => {});
+    }
+  }
+
+  /**
+   * Send a subscribe or unsubscribe, putting its change in the list at once.
+   * While calls on the channel are waiting, the list holds what the newest of
+   * them that hasn't failed asks for. A call that succeeds stands, as does one
+   * that fails with `undo` false, and the calls before it no longer count.
+   * Once every call made since the last one that stood has failed, the list
+   * holds what it held before them, so failed calls change nothing. When a
+   * failed call was the newest on the channel, the relay is told the list's
+   * state for it.
+   */
+  private async subscriptionCall(
+    method: 'subscribe_channel' | 'unsubscribe_channel',
+    channelId: string,
+    listed: boolean,
+    undo: boolean,
+  ) {
+    let run = this.subscriptionRuns.get(channelId);
+    if (!run) {
+      run = { before: this.isListed(channelId), calls: [] };
+      this.subscriptionRuns.set(channelId, run);
+    }
+    const call: SubscriptionCall = { listed };
+    run.calls.push(call);
+    this.setListed(channelId, listed);
+    try {
+      const result = await this.call(method, { channelId });
+      this.settleSubscriptionCall(channelId, call, 'stood');
+      return result;
+    } catch (error) {
+      this.settleSubscriptionCall(channelId, call, undo ? 'failed' : 'failed, stands');
+      throw error;
+    }
+  }
+
+  /** Apply a settled subscribe or unsubscribe to the list (subscriptionCall).
+   *  A call that a later call's standing has already passed over changes
+   *  nothing. */
+  private settleSubscriptionCall(
+    channelId: string,
+    call: SubscriptionCall,
+    outcome: 'stood' | 'failed' | 'failed, stands',
+  ): void {
+    const run = this.subscriptionRuns.get(channelId);
+    const at = run ? run.calls.indexOf(call) : -1;
+    if (!run || at === -1) return;
+    const wasNewest = at === run.calls.length - 1;
+    if (outcome === 'failed') {
+      run.calls.splice(at, 1);
+    } else {
+      run.before = call.listed;
+      run.calls.splice(0, at + 1);
+    }
+    const newest = run.calls.at(-1);
+    this.setListed(channelId, newest ? newest.listed : run.before);
+    if (!newest) this.subscriptionRuns.delete(channelId);
+    if (outcome !== 'stood' && wasNewest) this.reassertSubscription(channelId);
+  }
+
+  private setListed(channelId: string, listed: boolean): void {
+    if (this.isListed(channelId) === listed) return;
+    if (listed) (this.opts.subscriptions ??= []).push(channelId);
+    else this.opts.subscriptions = (this.opts.subscriptions ?? []).filter((c) => c !== channelId);
+  }
+
+  /**
+   * After a subscribe or unsubscribe fails while it's still the newest call on
+   * its channel (subscriptionCall), tell the relay the list's state for the
+   * channel once, its answer ignored. A failed call can still have reached
+   * the relay, with only its reply lost, so without this the relay could keep a
+   * subscription the list has dropped, or have dropped one the list keeps.
+   * After close(), call() refuses it, and the next connect() rebuilds the
+   * relay's set from the list.
+   */
+  private reassertSubscription(channelId: string): void {
+    const listed = (this.opts.subscriptions ?? []).includes(channelId);
+    this.call(listed ? 'subscribe_channel' : 'unsubscribe_channel', { channelId }).catch(() => {});
+  }
+
   private startHeartbeat(intervalMs: number): void {
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = setInterval(() => this.sendFrame({ op: 'heartbeat', d: { seq: this.lastSeq } }), intervalMs);
@@ -458,7 +595,10 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       // lockstep — avoids a thundering-herd reconnect + role-rebind burst.
       const delay = capped / 2 + Math.random() * (capped / 2);
       this.backoff = Math.min(this.backoff * 2, this.opts.maxBackoffMs);
-      setTimeout(() => {
+      // One reconnect waits at a time, so close() and connect() reach it.
+      this.cancelReconnect();
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = undefined;
         try {
           this.open();
         } catch (err) {

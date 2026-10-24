@@ -76,7 +76,11 @@ export function buildSession(creds: PortalCredentials, opts: BuildSessionOptions
     url: opts.url,
     token: creds.token,
     personaId: creds.personaId,
-    subscriptions: state.subscriptionList(), // identify replays these on (re)connect
+    // Identify carries this list and a resume replays it. When the host owns
+    // channel lifecycle, the channels it opens make the list, and the state's
+    // follows reach it only as initiallyOpen hints, where it grants
+    // channels.register (server.ts), so the list starts empty.
+    subscriptions: opts.agent?.hostOwnsChannelLifecycle ? [] : state.subscriptionList(),
   });
   const agent = new PortalAgent(client, { ...opts.agent, state });
   return {

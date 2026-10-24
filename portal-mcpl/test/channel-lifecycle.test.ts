@@ -59,8 +59,8 @@ function message(id: string, createdAt: string): PortalMessage {
   };
 }
 
-function clientWithChannel(): PortalClient {
-  const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
+function clientWithChannel(subscriptions?: string[]): PortalClient {
+  const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p', subscriptions });
   client.cache.hydrate({
     sessionId: 's1',
     persona: { id: 'p', displayName: 'Test', avatarUrl: 'https://example.test/a.png' },
@@ -70,6 +70,29 @@ function clientWithChannel(): PortalClient {
   });
   return client;
 }
+
+/**
+ * Stub only the client's RPCs, so its own subscribe and unsubscribe logic runs
+ * (the list, each failed call's undo, the newest call deciding), and the test
+ * answers each call when it chooses.
+ */
+function heldCalls(client: PortalClient) {
+  const calls: Array<{ method: string; channelId?: string; answer(ok: boolean): void }> = [];
+  (client as unknown as { call(method: string, params: { channelId?: string }): Promise<unknown> }).call = (method, params) =>
+    new Promise((resolve, reject) => {
+      calls.push({
+        method,
+        channelId: params?.channelId,
+        answer: (ok) => (ok ? resolve({}) : reject(new Error(`refused ${params?.channelId}`))),
+      });
+    });
+  /** The nth (from 0) call of `method` on `channelId`. */
+  const nth = (method: string, channelId: string, n = 0) =>
+    calls.filter((c) => c.method === method && c.channelId === channelId)[n];
+  return { calls, nth };
+}
+
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 test('initial registration migrates legacy subscriptions and advertises capabilities', async () => {
   const client = clientWithChannel();
@@ -122,12 +145,14 @@ test('open fetches requested backscroll then subscribes; close unsubscribes', as
     calls.push(`history:${params.before}:${params.limit}`);
     return { messages: [newer, older] };
   };
-  client.subscribe = async (channelId) => {
-    calls.push(`subscribe:${channelId}`);
-    return {};
-  };
-  client.unsubscribe = async (channelId) => {
-    calls.push(`unsubscribe:${channelId}`);
+  // The relay's answers, under the real subscribe and unsubscribe, so the
+  // client's list moves as it does in use: the open stands only while the
+  // list holds the channel.
+  (client as unknown as { call(method: string, params: { channelId?: string }): Promise<unknown> }).call = async (
+    method,
+    params,
+  ) => {
+    calls.push(`${method.replace(/_channel$/, '')}:${params?.channelId}`);
     return {};
   };
   const server = new PortalMcplServer(
@@ -253,11 +278,15 @@ test('a ping in a closed channel carries its exact MCPL channel id', async () =>
   assert.equal(params.origin.isExplicitMention, true);
 });
 
-test('relay resume reasserts channels that the host still has open', async () => {
+test("a relay resume doesn't make the server subscribe its open channels again: the client restores its own", async () => {
+  // The client asks the relay for its list again on a resume (portal-client's
+  // restoreSubscriptions), and a host-open channel is in it. A server that
+  // subscribed its open channels too would put back one whose close was still
+  // waiting on its unsubscribe (portal #50).
   const client = clientWithChannel();
-  const restored: string[] = [];
+  const subscribed: string[] = [];
   client.subscribe = async (channelId) => {
-    restored.push(channelId);
+    subscribed.push(channelId);
     return {};
   };
   const server = new PortalMcplServer(
@@ -274,53 +303,7 @@ test('relay resume reasserts channels that the host still has open', async () =>
   client.emit('resumed', 0);
   await new Promise<void>((resolve) => setImmediate(resolve));
 
-  assert.deepEqual(restored, [channel.id]);
-});
-
-test('a resume while a close waits on its unsubscribe skips the channel, and the close then closes it', async () => {
-  const client = clientWithChannel();
-  const restored: string[] = [];
-  client.subscribe = async (channelId) => {
-    restored.push(channelId);
-    return {};
-  };
-  // An unsubscribe can still be waiting when a resume lands: one sent between
-  // the client's `resume` and the relay's `resumed`, or one a client that holds
-  // calls until its session is ready flushes just before it emits `resumed`.
-  // Its result comes back after.
-  let finish!: () => void;
-  const unsubscribed = new Promise<void>((resolve) => {
-    finish = resolve;
-  });
-  client.unsubscribe = async () => {
-    await unsubscribed;
-    return {};
-  };
-  const server = new PortalMcplServer(
-    client,
-    new PortalAgent(client, { hostOwnsChannelLifecycle: true }),
-  );
-  const internal = server as unknown as {
-    openChannels: Set<string>;
-    wireClient(): void;
-    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
-  };
-  // A second open channel, with no close waiting, which the same resume reasserts.
-  const other = '1526659685036331059';
-  internal.openChannels.add(channel.id);
-  internal.openChannels.add(other);
-  internal.wireClient();
-
-  const closing = internal.handleChannelClose({ channelId: `portal:${channel.id}` });
-  client.emit('resumed', 0);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(internal.openChannels.has(channel.id), true, 'open until the close succeeds');
-  assert.deepEqual(restored, [other], 'the resume reasserts only the channel that is not closing');
-  finish();
-
-  assert.deepEqual(await closing, { closed: true });
-  assert.deepEqual(restored, [other], 'a resume must not subscribe a channel that is closing');
-  assert.equal(internal.openChannels.has(channel.id), false);
+  assert.deepEqual(subscribed, []);
 });
 
 type WsFactory = NonNullable<ConstructorParameters<typeof PortalClient>[0]['wsFactory']>;
@@ -447,139 +430,115 @@ test('with the real client, a close made between its resume and the relay\'s res
   }
 });
 
-test('a close that succeeds clears its mark, so a resume after a reopen reasserts the channel', async () => {
+test("a standalone agent doesn't subscribe its durable channels again on a resume: the client restores them", async () => {
+  // The client is built with the durable list (session.ts) and restores it on
+  // every reconnect, so the agent asks for nothing itself.
   const client = clientWithChannel();
-  const restored: string[] = [];
+  const subscribed: string[] = [];
   client.subscribe = async (channelId) => {
-    restored.push(channelId);
+    subscribed.push(channelId);
     return {};
   };
-  client.unsubscribe = async () => ({});
-  const server = new PortalMcplServer(
-    client,
-    new PortalAgent(client, { hostOwnsChannelLifecycle: true }),
-  );
-  const internal = server as unknown as {
-    openChannels: Set<string>;
-    wireClient(): void;
-    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
-  };
-  internal.openChannels.add(channel.id);
-  internal.wireClient();
+  const state = new AgentState();
+  state.subscribe(channel.id);
+  new PortalAgent(client, { state });
 
-  assert.deepEqual(await internal.handleChannelClose({ channelId: `portal:${channel.id}` }), { closed: true });
-  // The host opens the channel again, as channels/open would leave it.
-  internal.openChannels.add(channel.id);
   client.emit('resumed', 0);
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(restored, [channel.id], 'a reopened channel is reasserted like any open channel');
+
+  assert.deepEqual(subscribed, []);
 });
 
-test('a close that fails after a resume skipped it subscribes the channel again', async () => {
+test("a standalone agent's auto-subscribe keeps the durable state as the client's list leaves the channel", async () => {
   const client = clientWithChannel();
-  const restored: string[] = [];
-  client.subscribe = async (channelId) => {
-    restored.push(channelId);
-    return {};
-  };
-  let fail!: (error: Error) => void;
-  const unsubscribed = new Promise<void>((_, reject) => {
-    fail = reject;
+  const { calls, nth } = heldCalls(client);
+  const state = new AgentState();
+  const agent = new PortalAgent(client, { state });
+  const mention = (id: string) => client.emit('message', {
+    message: message(id, '2026-01-01T00:00:00Z'),
+    addressedToMe: true,
+    reasons: ['role_mention'],
   });
-  client.unsubscribe = async () => {
-    await unsubscribed;
-    return {};
-  };
-  const server = new PortalMcplServer(
-    client,
-    new PortalAgent(client, { hostOwnsChannelLifecycle: true }),
-  );
-  const internal = server as unknown as {
-    openChannels: Set<string>;
-    wireClient(): void;
-    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
-  };
-  internal.openChannels.add(channel.id);
-  internal.wireClient();
+  const subscribes = () => calls.filter((c) => c.method === 'subscribe_channel').length;
 
-  const closing = internal.handleChannelClose({ channelId: `portal:${channel.id}` });
-  client.emit('resumed', 0);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(restored, [], 'the resume skips a channel that is closing');
+  // Refused: the client takes the channel back, so the state does, and the
+  // next mention tries again.
+  mention('m1');
+  assert.deepEqual(state.subscriptionList(), [channel.id], 'followed at once');
+  nth('subscribe_channel', channel.id, 0).answer(false);
+  await settle();
+  assert.deepEqual(state.subscriptionList(), [], "the failed subscribe isn't kept as durable");
+  mention('m2');
+  assert.equal(subscribes(), 2, 'the next mention subscribes again');
 
-  fail(new Error('rpc unsubscribe_channel timed out'));
-  await assert.rejects(closing, /timed out/);
-  assert.equal(internal.openChannels.has(channel.id), true);
-  assert.deepEqual(restored, [channel.id], 'the failed close subscribes it again, since the resume skipped it');
-
-  client.emit('resumed', 0);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(restored, [channel.id, channel.id], 'a later resume reasserts it as open');
+  // That one fails after a newer subscribe of the channel succeeded: the client
+  // keeps the channel for the newer call, and so does the state.
+  const tool = agent.handleToolCall('subscribe_channel', { channelId: channel.id });
+  nth('subscribe_channel', channel.id, 2).answer(true);
+  await tool;
+  nth('subscribe_channel', channel.id, 1).answer(false);
+  await settle();
+  assert.deepEqual(state.subscriptionList(), [channel.id]);
 });
 
-/** A server with one open channel whose unsubscribe waits until the test settles it. */
-function closingHarness() {
-  const client = clientWithChannel();
-  const restored: string[] = [];
-  client.subscribe = async (channelId) => {
-    restored.push(channelId);
-    return {};
-  };
-  const pending: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
-  client.unsubscribe = () =>
-    new Promise((resolve, reject) => {
-      pending.push({ resolve: () => resolve({}), reject });
-    });
-  const server = new PortalMcplServer(
-    client,
-    new PortalAgent(client, { hostOwnsChannelLifecycle: true }),
-  );
-  const internal = server as unknown as {
-    openChannels: Set<string>;
-    wireClient(): void;
-    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
-  };
-  internal.openChannels.add(channel.id);
-  internal.wireClient();
-  const close = () => internal.handleChannelClose({ channelId: `portal:${channel.id}` });
-  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-  return { client, restored, pending, internal, close, tick };
-}
+test("a standalone agent's subscription tools keep the durable state as the client's list leaves each channel", async () => {
+  // The client is built with the state's list (session.ts). A failed
+  // unsubscribe puts its channel back, since its caller still holds it.
+  const c = channel.id;
+  const [a, d] = ['1526659685036331001', '1526659685036331004'];
+  const client = clientWithChannel([c]);
+  const { nth } = heldCalls(client);
+  const state = new AgentState();
+  state.subscribe(c);
+  const agent = new PortalAgent(client, { state });
 
-test('a close that fails with no resume subscribes the channel again', async () => {
-  // The unsubscribe may have reached the relay before it failed.
-  const { restored, pending, internal, close, tick } = closingHarness();
-  const closing = close();
-  await tick();
-  pending[0]!.reject(new Error('relay refused unsubscribe_channel'));
-  await assert.rejects(closing, /refused/);
-  assert.equal(internal.openChannels.has(channel.id), true);
-  assert.deepEqual(restored, [channel.id]);
-});
+  // The state changes as each call starts, and stays as a call that succeeds
+  // left it.
+  const subscribing = agent.handleToolCall('subscribe_channel', { channelId: a });
+  assert.deepEqual(state.subscriptionList().sort(), [a, c].sort(), 'followed before the answer');
+  nth('subscribe_channel', a).answer(true);
+  await subscribing;
+  const unsubscribing = agent.handleToolCall('unsubscribe_channel', { channelId: a });
+  assert.deepEqual(state.subscriptionList(), [c], 'dropped before the answer');
+  nth('unsubscribe_channel', a).answer(true);
+  await unsubscribing;
 
-test('a failed resubscribe after a failed close is logged, not thrown', async (t) => {
-  const { client, pending, close, tick } = closingHarness();
-  const logged: string[] = [];
-  t.mock.method(console, 'error', (...args: unknown[]) => {
-    logged.push(args.map(String).join(' '));
-  });
-  client.subscribe = async () => {
-    throw new Error('socket closed');
-  };
-  const closing = close();
-  await tick();
-  pending[0]!.reject(new Error('rpc unsubscribe_channel timed out'));
-  await assert.rejects(closing, /timed out/);
-  await tick();
-  assert.equal(logged.length, 1);
-  assert.match(logged[0]!, new RegExp(`failed to restore open channel ${channel.id}: socket closed`));
+  // Refused: the client takes the subscribe back, and so does the state.
+  const refused = agent.handleToolCall('subscribe_channel', { channelId: d });
+  nth('subscribe_channel', d, 0).answer(false);
+  await assert.rejects(refused, /refused/);
+  assert.deepEqual(state.subscriptionList(), [c]);
+
+  // Failed: the client puts the channel back, and so does the state.
+  const failing = agent.handleToolCall('unsubscribe_channel', { channelId: c });
+  nth('unsubscribe_channel', c, 0).answer(false);
+  await assert.rejects(failing, /refused/);
+  assert.deepEqual(state.subscriptionList(), [c]);
+
+  // An older call that fails after a newer one on its channel succeeded: the
+  // client leaves the channel as the newer call left it, and so does the state.
+  const olderSubscribe = agent.handleToolCall('subscribe_channel', { channelId: d });
+  const newerSubscribe = agent.handleToolCall('subscribe_channel', { channelId: d });
+  nth('subscribe_channel', d, 2).answer(true);
+  await newerSubscribe;
+  nth('subscribe_channel', d, 1).answer(false);
+  await assert.rejects(olderSubscribe, /refused/);
+  assert.deepEqual(state.subscriptionList().sort(), [c, d].sort(), 'kept for the newer subscribe');
+
+  const olderUnsubscribe = agent.handleToolCall('unsubscribe_channel', { channelId: c });
+  const newerUnsubscribe = agent.handleToolCall('unsubscribe_channel', { channelId: c });
+  nth('unsubscribe_channel', c, 2).answer(true);
+  await newerUnsubscribe;
+  nth('unsubscribe_channel', c, 1).answer(false);
+  await assert.rejects(olderUnsubscribe, /refused/);
+  assert.deepEqual(state.subscriptionList(), [d], 'left out for the newer unsubscribe');
 });
 
 // ── Live rights propagation (issue #5) ──
 
 /** Harness with a captured conn + wired client events (post-initial-registration). */
-async function registeredServer() {
-  const client = clientWithChannel();
+async function registeredServer(subscriptions?: string[]) {
+  const client = clientWithChannel(subscriptions);
   const state = new AgentState();
   const agent = new PortalAgent(client, { state, hostOwnsChannelLifecycle: true });
   const server = new PortalMcplServer(client, agent);
@@ -675,41 +634,180 @@ test('channelRemove retracts an advertised channel and cleans local state', asyn
   assert.equal(t.notifications.length, 1);
 });
 
-test('a close that fails after its channel was removed leaves the channel closed', async () => {
-  const t = await registeredServer();
-  t.internal.openChannels.add(channel.id);
-  const restored: string[] = [];
-  t.client.subscribe = async (channelId) => {
-    restored.push(channelId);
-    return {};
-  };
-  let fail!: (error: Error) => void;
-  const unsubscribed = new Promise<void>((_, reject) => {
-    fail = reject;
-  });
-  t.client.unsubscribe = async () => {
-    await unsubscribed;
-    return {};
-  };
-  const internal = t.internal as typeof t.internal & {
-    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
-  };
+test("channelRemove takes a removed channel out of the client's list for good", async () => {
+  // A reconnect asks for every listed channel, so a removed one left listed
+  // would be subscribed again if it came back into view.
+  const remove = (t: Awaited<ReturnType<typeof registeredServer>>) =>
+    (t.client as unknown as { onEvent(e: unknown): void }).onEvent({
+      type: 'channel_delete',
+      channelId: channel.id,
+      guildId: channel.guildId,
+    });
 
-  const closing = internal.handleChannelClose({ channelId: `portal:${channel.id}` });
+  // Listed, and its unsubscribe fails: the removal's unsubscribe stands
+  // whatever the relay answers, so the channel isn't put back.
+  {
+    const t = await registeredServer([channel.id]);
+    t.internal.openChannels.add(channel.id);
+    const { nth } = heldCalls(t.client);
+    remove(t);
+    assert.deepEqual(t.notifications[0]?.params, { removed: [`portal:${channel.id}`] });
+    assert.equal(t.client.isListed(channel.id), false);
+    nth('unsubscribe_channel', channel.id, 0).answer(false);
+    await settle();
+    assert.equal(t.client.isListed(channel.id), false, 'not put back after the failure');
+  }
+
+  // A close still waiting when the removal lands, which then fails: the
+  // removal's unsubscribe is the newest call, so nothing puts the channel back.
+  {
+    const t = await registeredServer([channel.id]);
+    t.internal.openChannels.add(channel.id);
+    const { nth } = heldCalls(t.client);
+    const closing = t.client.unsubscribe(channel.id).catch(() => {});
+    remove(t);
+    nth('unsubscribe_channel', channel.id, 0).answer(false);
+    await closing;
+    nth('unsubscribe_channel', channel.id, 1).answer(true);
+    await settle();
+    assert.equal(t.client.isListed(channel.id), false);
+  }
+
+  // Never listed: the unsubscribe goes out all the same, and changes nothing.
+  {
+    const t = await registeredServer();
+    const { calls } = heldCalls(t.client);
+    remove(t);
+    assert.deepEqual(calls.map((c) => [c.method, c.channelId]), [['unsubscribe_channel', channel.id]]);
+    assert.equal(t.client.isListed(channel.id), false);
+  }
+});
+
+/** A host connection the test scripts: the messages the server reads, in
+ *  order, and the responses it sends. */
+function scriptedHost() {
+  const queue: unknown[] = [];
+  let waiting: { resolve(m: unknown): void; reject(e: Error): void } | null = null;
+  let closed = false;
+  const responses: Array<{ id: unknown; result?: unknown; error?: unknown }> = [];
+  const closedError = () => Object.assign(new Error('closed'), { name: 'ConnectionClosedError' });
+  const conn = {
+    get isClosed() { return closed; },
+    nextMessage: () =>
+      queue.length > 0
+        ? Promise.resolve(queue.shift())
+        : closed
+          ? Promise.reject(closedError())
+          : new Promise((resolve, reject) => { waiting = { resolve, reject }; }),
+    sendResponse: (id: unknown, result: unknown) => void responses.push({ id, result }),
+    sendError: (id: unknown, code: unknown, message: unknown) => void responses.push({ id, error: { code, message } }),
+    sendNotification: () => {},
+    sendRequest: async () => ({}),
+    close: () => { closed = true; },
+  };
+  const deliver = (message: unknown) => {
+    if (waiting) {
+      const w = waiting;
+      waiting = null;
+      w.resolve(message);
+    } else queue.push(message);
+  };
+  return {
+    conn,
+    responses,
+    request: (id: number, method: string, params: unknown) => deliver({ type: 'request', request: { jsonrpc: '2.0', id, method, params } }),
+    notify: (method: string) => deliver({ type: 'notification', notification: { jsonrpc: '2.0', method, params: {} } }),
+    end: () => {
+      closed = true;
+      if (waiting) waiting.reject(closedError());
+    },
+  };
+}
+
+test("serve() reads a host's next request only once the last one is answered, so its opens and closes never overlap", async () => {
+  // The client's list holds every channel the host opened only because of
+  // this: a close sent while an open waits would otherwise race it.
+  const client = clientWithChannel();
+  const server = new PortalMcplServer(client, new PortalAgent(client, { hostOwnsChannelLifecycle: true }));
+  const { calls, nth } = heldCalls(client);
+  const host = scriptedHost();
+  const serving = server.serve(host.conn as unknown as Parameters<PortalMcplServer['serve']>[0]);
+  host.request(0, 'initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 't', version: '0' } });
+  host.notify('notifications/initialized');
+  host.request(1, 'channels/open', { channelId: `portal:${channel.id}`, type: 'portal', address: {} });
+  host.request(2, 'channels/close', { channelId: `portal:${channel.id}` });
+  for (let i = 0; i < 5; i++) await settle();
+  assert.deepEqual(calls.map((c) => c.method), ['subscribe_channel'], 'the close waits for the open');
+  nth('subscribe_channel', channel.id, 0).answer(true);
+  for (let i = 0; i < 5; i++) await settle();
+  assert.deepEqual(calls.map((c) => c.method), ['subscribe_channel', 'unsubscribe_channel']);
+  nth('unsubscribe_channel', channel.id, 0).answer(true);
+  for (let i = 0; i < 5; i++) await settle();
+  assert.deepEqual(host.responses.map((r) => [r.id, r.error === undefined]), [[0, true], [1, true], [2, true]]);
+  host.end();
+  await serving;
+});
+
+test('a removal that lands while an open waits for its subscribe leaves the channel neither open nor listed', async () => {
+  // The relay's answer to the subscribe and the channel's removal can reach
+  // the client in one read, so the removal runs before the open resumes.
+  const t = await registeredServer();
+  const { nth } = heldCalls(t.client);
+  const open = (t.server as unknown as {
+    handleChannelOpen(params: { channelId: string; type: string; address: unknown }): Promise<unknown>;
+  }).handleChannelOpen({ channelId: `portal:${channel.id}`, type: 'portal', address: {} });
+  await settle();
+  const subscribing = nth('subscribe_channel', channel.id, 0);
+  assert.ok(subscribing, "the open's subscribe went out");
   (t.client as unknown as { onEvent(e: unknown): void }).onEvent({
     type: 'channel_delete',
     channelId: channel.id,
     guildId: channel.guildId,
   });
-  assert.deepEqual(t.notifications.at(-1)?.params, { removed: [`portal:${channel.id}`] });
+  subscribing.answer(true);
+  await assert.rejects(open, /Nothing was opened: portal:\S+ was removed from this persona's view while it was being opened/);
+  assert.equal(t.internal.openChannels.has(channel.id), false, 'not open');
+  assert.equal(t.client.isListed(channel.id), false, 'not listed');
+  assert.deepEqual(t.notifications.at(-1)?.params, { removed: [`portal:${channel.id}`] }, 'the host was told');
+});
 
-  fail(new Error('rpc unsubscribe_channel timed out'));
-  await assert.rejects(closing, /timed out/);
-  assert.equal(t.internal.openChannels.has(channel.id), false, 'the host was told the channel is gone');
+test("an open whose subscribe fails leaves the channel closed and out of the client's list", async () => {
+  // openChannels changes only once the call has succeeded.
+  const t = await registeredServer();
+  const { nth } = heldCalls(t.client);
+  const open = (t.server as unknown as {
+    handleChannelOpen(params: { channelId: string; type: string; address: unknown }): Promise<unknown>;
+  }).handleChannelOpen({ channelId: `portal:${channel.id}`, type: 'portal', address: {} });
+  await settle();
+  const subscribing = nth('subscribe_channel', channel.id, 0);
+  assert.ok(subscribing, "the open's subscribe went out");
+  assert.equal(t.internal.openChannels.has(channel.id), false, 'not open while the subscribe waits');
+  subscribing.answer(false);
+  await assert.rejects(open, /refused/);
+  assert.equal(t.internal.openChannels.has(channel.id), false, 'not open');
+  assert.equal(t.client.isListed(channel.id), false, 'not listed');
+});
 
-  t.client.emit('resumed', 0);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(restored, []);
+test('a close whose unsubscribe fails leaves the channel open and listed, and subscribes it again', async () => {
+  // The host still holds the channel open, as the failure tells it.
+  const t = await registeredServer();
+  const { nth } = heldCalls(t.client);
+  const handlers = t.server as unknown as {
+    handleChannelOpen(params: { channelId: string; type: string; address: unknown }): Promise<unknown>;
+    handleChannelClose(params: { channelId: string }): Promise<unknown>;
+  };
+  const open = handlers.handleChannelOpen({ channelId: `portal:${channel.id}`, type: 'portal', address: {} });
+  await settle();
+  nth('subscribe_channel', channel.id, 0).answer(true);
+  await open;
+  const close = handlers.handleChannelClose({ channelId: `portal:${channel.id}` });
+  await settle();
+  assert.equal(t.internal.openChannels.has(channel.id), true, 'still open while the unsubscribe waits');
+  nth('unsubscribe_channel', channel.id, 0).answer(false);
+  await assert.rejects(close, /refused/);
+  assert.equal(t.internal.openChannels.has(channel.id), true, 'still open');
+  assert.equal(t.client.isListed(channel.id), true, 'listed again');
+  assert.ok(nth('subscribe_channel', channel.id, 1), 'subscribed again on the relay');
 });
 
 test('a channel arriving via live channel_create is announced as added', async () => {

@@ -14,7 +14,7 @@ import { browserWsFactory } from './ws-browser.js';
 setDefaultWsFactory(browserWsFactory);
 
 export { PortalClient } from './client.js';
-export type { PortalClientOptions, PortalClientEvents } from './client.js';
+export type { PortalClientOptions, PortalClientEvents, SubscriptionOptions } from './client.js';
 export { ClientCache } from './cache.js';
 export { TypedEmitter } from './emitter.js';
 export { enroll, loadOrEnroll, webStorageCredsStore } from './enroll.js';

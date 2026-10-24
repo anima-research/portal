@@ -127,20 +127,15 @@ export class PortalMcplServer {
    *  (a removal can land while channels/register is in flight, before
    *  `advertised` is stamped — retracting inline would silently miss it). */
   private pendingRemovals = new Set<string>();
+  /** Agents whose follows noteUnofferedFollows has already reported. Each
+   *  session, a persona switch's included, brings an agent of its own. */
+  private readonly unofferedFollowsNoted = new WeakSet<PortalAgent>();
   private initialRegistrationComplete = false;
   private registrationInFlight: Promise<void> | null = null;
   /** Portal channel ids the host has opened — routed via channels/incoming so
    *  ambient traffic folds into the open conversation; closed channels use
    *  push/event (which the host's wake gate evaluates). Mirrors discord-mcpl. */
   private openChannels = new Set<string>();
-  /** Channels whose close waits on its unsubscribe. They stay in
-   *  openChannels until the close succeeds, but a resume doesn't reassert
-   *  them, so after a resume the relay sends no ambient events for them until
-   *  the close settles. A close that fails subscribes its channel again if
-   *  it is still open. Host requests are handled one at a time, so a channel
-   *  has at most one close waiting, and a persona switch, which arrives as a
-   *  host request too, never lands while one waits. */
-  private closingChannels = new Set<string>();
   /** Per persona: ping message ids already surfaced as a wake (live or
    *  catch-up), so a reconnect doesn't re-wake for the same offline-accrued
    *  pings. Keyed by persona because the host's context does not change on an
@@ -186,7 +181,6 @@ export class PortalMcplServer {
     this.rejected.clear();
     this.pendingRemovals.clear();
     this.openChannels.clear();
-    this.closingChannels.clear();
     this.initialRegistrationComplete = false;
     this.registrationInFlight = null;
     this.policy.reset();
@@ -462,12 +456,38 @@ export class PortalMcplServer {
       void this.registerChannels().catch((err) =>
         console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
       );
+    } else {
+      this.noteUnofferedFollows();
     }
     if (this.canPush()) {
       void this.catchUp().catch((err) =>
         console.error('[portal-mcpl] catch-up failed:', (err as Error).message),
       );
     }
+  }
+
+  /** Without channels.register the host gets no channel list, so the
+   *  state's follows (PORTAL_SUBSCRIPTIONS, and follows saved before host
+   *  mode) reach it as no initiallyOpen hints. The portal.messaging set uses
+   *  channels.register too, so it's off, and no message reaches the host as a
+   *  push event (canPush): a follow the host hasn't opened doesn't reach it at
+   *  all, whether or not the client lists it. Say so once for each session's agent,
+   *  counting the follows not already open, when the policy arrives and when a
+   *  switch brings another identity's state, rather than leave them unused
+   *  without a word. channels/open needs channels.lifecycle, so the advice
+   *  names it, and the host is offered only the channels this persona can see
+   *  (allDescriptors). */
+  private noteUnofferedFollows(): void {
+    const agent = this.agent;
+    const unopened = agent.state.subscriptionList().filter((channelId) => !this.openChannels.has(channelId));
+    if (unopened.length === 0 || this.unofferedFollowsNoted.has(agent)) return;
+    this.unofferedFollowsNoted.add(agent);
+    console.error(
+      `[portal-mcpl] ${unopened.length} followed channel(s), from PORTAL_SUBSCRIPTIONS or follows saved before, ` +
+        "aren't open: this host doesn't grant channels.register, so they can't be offered to it. To open the ones " +
+        'this persona can see, grant channels.register and channels.lifecycle, so they reach the host as ' +
+        'initiallyOpen hints it can open, or grant channels.lifecycle and open each from the host with channels/open.',
+    );
   }
 
   private handleNotification(n: JsonRpcNotification): void {
@@ -556,6 +576,16 @@ export class PortalMcplServer {
 
     // Commit actual lifecycle only after requested history succeeds.
     await this.client.subscribe(channelId);
+    // serve() handles one host request at a time, so only a removal of the
+    // channel (flushRemovals, which tells the host it's gone) can have taken it
+    // out of the client's list meanwhile: then the open doesn't stand.
+    if (!this.client.isListed(channelId)) {
+      throw new Error(
+        `Nothing was opened: ${portalChannelId(channelId)} was removed from this persona's view while it was being ` +
+          "opened, and the host has been told it's gone. If it comes back into view, it's offered again and can be " +
+          'opened then.',
+      );
+    }
     this.openChannels.add(channelId);
     return result;
   }
@@ -568,35 +598,9 @@ export class PortalMcplServer {
           "look like portal:<id>; your host's channel list shows the ones you can close.",
       );
     }
-    // A resume can land while the unsubscribe waits, and the relay then applies
-    // the unsubscribe after the resume: one the client sent between its `resume`
-    // and the relay's `resumed`, or one a client that holds calls until its
-    // session is ready flushes just before it emits `resumed`. The resume
-    // reasserts every open channel, so it skips this one, which would otherwise
-    // be subscribed again once its close had gone through.
-    this.closingChannels.add(channelId);
-    try {
-      await this.client.unsubscribe(channelId);
-    } catch (error) {
-      this.closingChannels.delete(channelId);
-      // The channel is still open, but a resume may have skipped it, or the
-      // unsubscribe may have reached the relay: subscribe it again.
-      if (this.openChannels.has(channelId)) this.reassertOpenChannel(channelId);
-      throw error;
-    }
-    this.closingChannels.delete(channelId);
+    await this.client.unsubscribe(channelId);
     this.openChannels.delete(channelId);
     return { closed: true };
-  }
-
-  /** Subscribe an open channel on the relay again, as a resume does. */
-  private reassertOpenChannel(channelId: string): void {
-    void this.client.subscribe(channelId).catch((err) =>
-      console.error(
-        `[portal-mcpl] failed to restore open channel ${channelId}:`,
-        (err as Error).message,
-      ),
-    );
   }
 
   private async handleChannelAcknowledge(
@@ -678,15 +682,17 @@ export class PortalMcplServer {
         );
       }
     }));
-    track(this.client.on('resumed', () => {
-      // A Portal transport resume restores event delivery but the relay session
-      // starts with no ambient subscriptions. Reassert actual host-open state,
-      // except a channel whose close waits: its close subscribes it again if it
-      // fails. A fresh identify already receives the client's mutable replay set.
-      for (const channelId of this.openChannels) {
-        if (!this.closingChannels.has(channelId)) this.reassertOpenChannel(channelId);
-      }
-    }));
+    // No `resumed` handler subscribes the open channels again: the client asks
+    // the relay for its own list on a resume, as identify carries it.
+    // handleChannelOpen records a channel open only once the client has
+    // subscribed it, and only if a removal hasn't taken it out of the list
+    // meanwhile; handleChannelClose records it closed only once the
+    // unsubscribe succeeds. serve() handles one host request at a time, so the
+    // host's opens and closes of a channel never overlap, and the client's
+    // list holds every channel opened that way. A reopen under a new identity
+    // (swapSession, without channels.register) keeps its channel listed even
+    // when it fails. Subscribing here as well would put back a channel whose
+    // close is still waiting.
     track(this.client.on('message', (e) => {
       // Self-echo filter: the relay dispatches the persona's OWN webhook posts
       // back to it like any other channel message. Re-ingesting them is pure
@@ -870,15 +876,20 @@ export class PortalMcplServer {
     } else {
       // No channels.register: the host can't be told a channel closed, so keep
       // its open set where the new identity can see it (a fresh relay session
-      // starts with none, so reassert those) and drop what it can't see.
+      // starts with none, so reassert those) and drop what it can't see. A
+      // reopen that fails stays in the client's list, as the host still holds
+      // the channel open, so each resume and identify asks for it again.
       for (const channelId of [...this.openChannels]) {
         if (!visible.has(channelId)) {
           this.openChannels.delete(channelId);
           continue;
         }
-        void client.subscribe(channelId).catch((err) =>
+        void client.subscribe(channelId, { undo: false }).catch((err) =>
           console.error(
-            `[portal-mcpl] failed to reopen ${channelId} under the new identity:`,
+            `[portal-mcpl] failed to reopen ${channelId} under the new identity` +
+              (client.isListed(channelId)
+                ? "; it stays in the client's list, so the next resume or identify asks the relay for it again:"
+                : ':'),
             (err as Error).message,
           ),
         );
@@ -892,6 +903,9 @@ export class PortalMcplServer {
       void this.reconcileAfterSwap(epoch).catch((err) =>
         console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
       );
+    } else {
+      // The new identity's follows are as unused as the last one's were.
+      this.noteUnofferedFollows();
     }
     if (this.canPush()) {
       void this.catchUp().catch((err) =>
@@ -1298,6 +1312,12 @@ export class PortalMcplServer {
       removed.push(id);
       this.openChannels.delete(channelId); // openChannels holds RAW relay ids
       this.agent.state.unsubscribe(channelId);
+      // Out of the client's list too, whatever it holds now: a reconnect asks
+      // for every listed channel, and would subscribe this one again if it came
+      // back into view. With undo false the removal stands even if the call
+      // fails, and as the newest call on the channel it leaves a close still
+      // waiting nothing to put back.
+      void this.client.unsubscribe(channelId, { undo: false }).catch(() => {});
     }
     this.pendingRemovals.clear();
     if (removed.length) {

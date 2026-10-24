@@ -29,7 +29,8 @@ test('failed unsubscribe restores reconnect state', async () => {
   internal.call = async () => {
     throw new Error('relay unavailable');
   };
-
+  // Before any ready the cache is empty, and the undo reads no cache.
   await assert.rejects(client.unsubscribe('c1'), /relay unavailable/);
-  assert.deepEqual(internal.opts.subscriptions, ['c1', 'c2']);
+  // Back in the list, at its end: the order a reconnect asks in means nothing.
+  assert.deepEqual([...(internal.opts.subscriptions ?? [])].sort(), ['c1', 'c2']);
 });

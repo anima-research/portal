@@ -13,9 +13,11 @@
  *
  * Durable agent state (watermarks + pending pings + channel SUBSCRIPTIONS) is
  * persisted at PORTAL_STATE (default <creds-dir>/<personaId>.state.json) — the
- * portal analogue of discord-mcpl's subscriptions/watermark files. Subscriptions
- * made via tools are reapplied on every (re)connect, so PORTAL_SUBSCRIPTIONS is
- * just an optional first-run seed.
+ * portal analogue of discord-mcpl's subscriptions/watermark files. Here the
+ * host owns channel lifecycle: the state's subscriptions, which
+ * PORTAL_SUBSCRIPTIONS seeds once, are offered to it as initiallyOpen hints
+ * where it grants channels.register, and the channels it opens are what the
+ * client asks the relay for on every (re)connect.
  *
  * connectome-host recipe (mcpServers entry):
  *   "portal": {
