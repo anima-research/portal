@@ -494,3 +494,71 @@ test('a channel the relay refuses on a resume stays in the list, and nothing rej
   assert.deepEqual(second.subscriptionCalls(), [['subscribe_channel', 'c1']]);
   second.answer('subscribe_channel', 'c1', true);
 });
+
+// voice_join subscribes the session to its channel as the relay joins it
+// (portal-relay relay.ts, voice_join), and the relay stays in the channel
+// across a reconnect, so the channel goes in the list like a subscribe's.
+// Issue #77.
+
+test('a voice_join that succeeded is listed, so a resume asks for its transcripts again', async (t) => {
+  const { client, sockets } = await connected(t, ['c1']);
+  const joining = client.voiceJoin('c3');
+  sockets[0].answer('voice_join', 'c3', true);
+  await joining;
+  assert.deepEqual(listOf(client), ['c1', 'c3']);
+
+  drop(sockets[0]);
+  const next = await resumedSocket(sockets, 1);
+  assert.deepEqual(next.subscriptionCalls(), [['subscribe_channel', 'c1'], ['subscribe_channel', 'c3']]);
+});
+
+test('after a voice_join, an identify the relay asks for carries its channel', async (t) => {
+  const { client, sockets } = await connected(t, ['c1']);
+  const joining = client.voiceJoin('c3');
+  sockets[0].answer('voice_join', 'c3', true);
+  await joining;
+
+  drop(sockets[0]);
+  for (let i = 0; i < 100 && sockets.length === 1; i++) await new Promise((r) => setTimeout(r, 5));
+  const next = sockets[1];
+  next.frame({ op: 'hello', d: { heartbeatIntervalMs: 60_000 } });
+  next.frame({ op: 'invalid_session', d: { resumable: false, reason: 'resume window exceeded' } });
+  const identify = next.sent.find((f) => f.op === 'identify') as { d: { subscriptions?: string[] } } | undefined;
+  assert.deepEqual([...(identify?.d.subscriptions ?? [])].sort(), ['c1', 'c3']);
+});
+
+test('a voice_join that fails leaves the list as it was, and the relay is told so', async (t) => {
+  const { client, sockets } = await connected(t, ['c1']);
+  const joining = client.voiceJoin('c3').catch((error: unknown) => error);
+  assert.deepEqual(listOf(client), ['c1', 'c3'], 'listed while it waits, as a subscribe is');
+  sockets[0].answer('voice_join', 'c3', false);
+  assert.match(String(await joining), /refused c3/);
+  assert.deepEqual(listOf(client), ['c1']);
+  assert.deepEqual(sockets[0].subscriptionCalls(), [['unsubscribe_channel', 'c3']]);
+});
+
+test('a voice_join and an unsubscribe made after it leave the channel as the newer one asks, whichever answer comes first', async (t) => {
+  const { client, sockets } = await connected(t, ['c1']);
+  const joining = client.voiceJoin('c3');
+  const unsubscribing = client.unsubscribe('c3');
+  sockets[0].answer('unsubscribe_channel', 'c3', true);
+  sockets[0].answer('voice_join', 'c3', true);
+  await Promise.all([joining, unsubscribing]);
+  assert.deepEqual(listOf(client), ['c1']);
+});
+
+test('a voice_leave leaves the joined channel listed, as the relay leaves it subscribed, until unsubscribe()', async (t) => {
+  const { client, sockets } = await connected(t, ['c1']);
+  const joining = client.voiceJoin('c3');
+  sockets[0].answer('voice_join', 'c3', true);
+  await joining;
+  const leaving = client.voiceLeave('c3');
+  sockets[0].answer('voice_leave', 'c3', true);
+  await leaving;
+  assert.deepEqual(listOf(client), ['c1', 'c3']);
+
+  const unsubscribing = client.unsubscribe('c3');
+  sockets[0].answer('unsubscribe_channel', 'c3', true);
+  await unsubscribing;
+  assert.deepEqual(listOf(client), ['c1']);
+});

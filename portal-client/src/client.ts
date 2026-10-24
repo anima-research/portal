@@ -34,9 +34,9 @@ export interface PortalClientOptions {
   token: string;
   personaId: string;
   /** Ambient channel subscriptions to request on connect. The client keeps
-   *  them, with subscribe() and unsubscribe()'s changes, and asks the relay for
-   *  them again on every reconnect, a resume included; the relay leaves out
-   *  any it refuses. */
+   *  them, with the changes subscribe(), unsubscribe() and voiceJoin() make,
+   *  and asks the relay for them again on every reconnect, a resume included;
+   *  the relay leaves out any it refuses. */
   subscriptions?: string[];
   /** RPC timeout in ms (default 15000). */
   rpcTimeoutMs?: number;
@@ -108,9 +108,9 @@ export interface SubscriptionOptions {
   undo?: boolean;
 }
 
-/** A subscribe or unsubscribe still waiting, with whether it lists its
- *  channel (PortalClient.subscriptionCall). Each call is its own object, so a
- *  run finds a call by identity. */
+/** A subscribe, unsubscribe or voice_join still waiting, with whether it
+ *  lists its channel (PortalClient.subscriptionCall). Each call is its own
+ *  object, so a run finds a call by identity. */
 interface SubscriptionCall {
   listed: boolean;
 }
@@ -132,7 +132,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   private backoff = 1000;
   private closedByUser = false;
   private ready = false;
-  /** Each channel with a subscribe or unsubscribe still waiting
+  /** Each channel with a subscribe, unsubscribe or voice_join still waiting
    *  (subscriptionCall): whether the list held the channel before those
    *  calls, as the calls that stood leave it, and the calls still waiting,
    *  oldest first, each with whether it lists the channel. */
@@ -334,18 +334,24 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   async unsubscribe(channelId: string, options: SubscriptionOptions = {}) {
     return this.subscriptionCall('unsubscribe_channel', channelId, false, options.undo !== false);
   }
-  /** Whether the channel is in the list a reconnect restores, as subscribe()
-   *  and unsubscribe() leave it. That's this client's request, not the
+  /** Whether the channel is in the list a reconnect restores, as subscribe(),
+   *  unsubscribe() and voiceJoin() leave it. That's this client's request, not the
    *  relay's state: the relay may have refused the channel, as the list keeps
    *  a refused one. `list_subscriptions` gives the relay's own view. */
   isListed(channelId: string): boolean {
     return (this.opts.subscriptions ?? []).includes(channelId);
   }
-  /** Ask the relay to join a voice channel and stream transcripts here
-   *  (auto-subscribes this session to the channel). Requires VOICE_LISTEN. */
+  /** Ask the relay to join a voice channel and stream transcripts here.
+   *  Requires VOICE_LISTEN. The relay subscribes this session to the channel
+   *  as it joins, so the channel joins the list a reconnect restores, as with
+   *  subscribe(): the relay stays in the channel across a reconnect, and the
+   *  new session asks for its transcripts again. A failed join is undone as
+   *  subscriptionCall says. */
   voiceJoin(channelId: string) {
-    return this.call('voice_join', { channelId });
+    return this.subscriptionCall('voice_join', channelId, true, true);
   }
+  /** Ask the relay to stop listening in a voice channel. The relay leaves the
+   *  session subscribed to it, and the list keeps it too, until unsubscribe(). */
   voiceLeave(channelId: string) {
     return this.call('voice_leave', { channelId });
   }
@@ -584,7 +590,8 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   }
 
   /**
-   * Send a subscribe or unsubscribe, putting its change in the list at once.
+   * Send a subscribe, an unsubscribe or a voice_join (which subscribes as it
+   * joins), putting its change in the list at once.
    * While calls on the channel are waiting, the list holds what the newest of
    * them that hasn't failed asks for. A call that succeeds stands, as does one
    * that fails with `undo` false, and the calls before it no longer count.
@@ -593,12 +600,12 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
    * failed call was the newest on the channel, the relay is told the list's
    * state for it.
    */
-  private async subscriptionCall(
-    method: 'subscribe_channel' | 'unsubscribe_channel',
+  private async subscriptionCall<M extends 'subscribe_channel' | 'unsubscribe_channel' | 'voice_join'>(
+    method: M,
     channelId: string,
     listed: boolean,
     undo: boolean,
-  ) {
+  ): Promise<RpcResult<M>> {
     let run = this.subscriptionRuns.get(channelId);
     if (!run) {
       run = { before: this.isListed(channelId), calls: [] };
@@ -608,7 +615,8 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     run.calls.push(call);
     this.setListed(channelId, listed);
     try {
-      const result = await this.call(method, { channelId });
+      // Each of these methods takes just the channel.
+      const result = await this.call(method, { channelId } as RpcParams<M>);
       this.settleSubscriptionCall(channelId, call, 'stood');
       return result;
     } catch (error) {
@@ -617,7 +625,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     }
   }
 
-  /** Apply a settled subscribe or unsubscribe to the list (subscriptionCall).
+  /** Apply a settled subscriptionCall to the list.
    *  A call that a later call's standing has already passed over changes
    *  nothing. */
   private settleSubscriptionCall(
@@ -648,8 +656,8 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   }
 
   /**
-   * After a subscribe or unsubscribe fails while it's still the newest call on
-   * its channel (subscriptionCall), tell the relay the list's state for the
+   * After a subscriptionCall fails while it's still the newest call on its
+   * channel, tell the relay the list's state for the
    * channel once, its answer ignored. A failed call can still have reached
    * the relay, with only its reply lost, so without this the relay could keep a
    * subscription the list has dropped, or have dropped one the list keeps.
