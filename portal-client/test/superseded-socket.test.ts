@@ -146,10 +146,45 @@ test("the old socket's late events don't reach listeners", async (t) => {
   b.feed(readyFrame('s2'));
   await second;
 
-  a.feed({ op: 'dispatch', seq: 5, d: { type: 'voice_status', channelId: 'c', guildId: null, joined: true } });
+  // The old socket's comes last, so if it moved lastSeq the heartbeat would
+  // carry its seq.
   b.feed({ op: 'dispatch', seq: 1, d: { type: 'voice_status', channelId: 'c', guildId: null, joined: false } });
+  a.feed({ op: 'dispatch', seq: 5, d: { type: 'voice_status', channelId: 'c', guildId: null, joined: true } });
 
   assert.deepEqual(events, [{ type: 'voice_status', channelId: 'c', guildId: null, joined: false }]);
+  const beats = b.sent.length;
+  await sleep(30); // the heartbeat runs every 10 ms
+  const heartbeat = b.sent.slice(beats).map((f) => JSON.parse(f)).find((f) => f.op === 'heartbeat');
+  assert.equal(heartbeat?.d.seq, 1, "the new session's heartbeat carries its own seq, not the old socket's");
+});
+
+test("the old socket's late invalid_session and resumed don't act on the new connection", async (t) => {
+  const { client, a, b } = await supersede(t, true);
+  b.feed(HELLO);
+  assert.deepEqual(b.ops(), ['resume'], 'the client holds a session, so it resumes it');
+
+  a.feed({ op: 'invalid_session', d: { resumable: false, reason: 'old' } });
+  a.feed({ op: 'resumed', d: { replayedEvents: 0 } });
+
+  assert.deepEqual(b.ops(), ['resume'], 'no identify on the new socket for the old one\'s refusal');
+  assert.equal(readyOf(client), false, "the old socket's resumed doesn't make the new session ready");
+});
+
+test("a connect() while the client's socket is still open closes that socket", async (t) => {
+  const { client, created } = makeClient(t);
+  const first = client.connect();
+  const a = created[0];
+  a.feed(HELLO);
+  a.feed(readyFrame('s1'));
+  await first;
+
+  const second = client.connect();
+  second.catch(() => {});
+  assert.equal(created.length, 2, 'a new socket');
+  assert.equal(a.readyState, 2, 'the replaced socket was asked to close');
+  a.finish(1000);
+  await sleep(60); // past any reconnect's backoff (maxBackoffMs 20)
+  assert.equal(created.length, 2, "its close doesn't schedule a reconnect");
 });
 
 test('a call sent on the old socket still settles from its answer there', async (t) => {

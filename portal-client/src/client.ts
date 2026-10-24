@@ -322,7 +322,14 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     // reconnect waiting for its backoff, so the timer doesn't open a second
     // one. A factory that throws leaves the waiting reconnect to try again.
     this.cancelReconnect();
+    const previous = this.ws;
     this.ws = ws;
+    // A connect() while the client's socket is still open or connecting
+    // replaces it, so close that socket rather than leave its relay session
+    // running. One already closing or closed, as after close() or a drop,
+    // starts no second close. Its close event and any error come after
+    // this.ws has moved on, so the checks below ignore them.
+    previous?.close(1000, 'replaced by a new connection');
     // Each socket acts on the client only while it's this.ws. After close()
     // and connect(), the old socket can still deliver frames, an error and its
     // close while its closing handshake runs, and those belong to a session
