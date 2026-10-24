@@ -148,6 +148,9 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
    *  afterwards can't change what gets sent. Each call's own timer still
    *  bounds how long it waits; close() rejects them. */
   private outbox: Array<{ id: string; json: string }> = [];
+  /** Each connect() still waiting to settle: what close() calls to reject
+   *  it. */
+  private readonly connecting = new Set<() => void>();
 
   constructor(options: PortalClientOptions) {
     super();
@@ -167,9 +170,12 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
 
   /** Connect and resolve once `ready` (or `resumed`) is received. A client
    *  that still holds a session, after close() or while a reconnect waits,
-   *  resumes it, and the relay answers with `resumed` alone: connect() then
-   *  resolves with the session as the client holds it after the relay's
-   *  replay (sessionSnapshot). */
+   *  resumes it. The relay answers a resume it honours with `resumed`, and no
+   *  `ready`: connect() then resolves with the session as the client holds it
+   *  after the relay's replay (sessionSnapshot). A resume it refuses gets
+   *  `invalid_session`, the client identifies, and connect() resolves on that
+   *  fresh session's `ready`. An error before then rejects it, and so does
+   *  close(). */
   connect(): Promise<ReadyData> {
     this.closedByUser = false;
     return new Promise<ReadyData>((resolve, reject) => {
@@ -177,7 +183,13 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         offReady();
         offResumed();
         offErr();
+        this.connecting.delete(cancel);
       };
+      const cancel = () => {
+        done();
+        reject(new Error('connect() cancelled: client closed'));
+      };
+      this.connecting.add(cancel);
       const offReady = this.on('ready', (d) => {
         done();
         resolve(d);
@@ -212,7 +224,9 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   /** The session the client holds, as `ready` would describe it: its id, the
    *  last seq it has seen, and the persona and directory as the cache holds
    *  them. The relay replays what a resumed session missed before it sends
-   *  `resumed`, so at that point the cache has applied it. Undefined when the
+   *  `resumed`, so at that point the cache has applied it. Like ready's, the
+   *  channels are those the persona has a capability in: the cache keeps a
+   *  channel whose capabilities were revoked, with none. Undefined when the
    *  client holds no session. */
   private sessionSnapshot(): ReadyData | undefined {
     const persona = this.cache.persona;
@@ -221,7 +235,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       sessionId: this.sessionId,
       persona,
       guilds: this.cache.allGuilds(),
-      channels: this.cache.allChannels(),
+      channels: this.cache.allChannels().filter((c) => c.capabilities.length > 0),
       seq: this.lastSeq,
     };
   }
@@ -236,6 +250,8 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     this.ready = false;
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.cancelReconnect();
+    // A connect() still waiting for its session won't get one now.
+    for (const cancel of [...this.connecting]) cancel();
     // Unsent work dies with the client: a later connect() must not run an
     // operation the caller issued before shutting down. Calls already sent
     // keep their timers, since a result can still arrive before the socket
