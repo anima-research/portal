@@ -190,11 +190,13 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         done();
         resolve(snapshot);
       });
+      // An error before this connect() settles rejects it. Its listeners go
+      // once it settles, so a later error doesn't reach it. `ready` can't
+      // stand in for settled here: a `resumed` for no session the client
+      // holds sets it while this connect() keeps waiting.
       const offErr = this.on('error', (e) => {
-        if (!this.ready) {
-          done();
-          reject(e);
-        }
+        done();
+        reject(e);
       });
       try {
         this.open();

@@ -45,7 +45,7 @@ const READY = {
     channels: [CHANNEL],
   },
 };
-const RESUMED = { op: 'resumed', d: { replayedEvents: 1 } };
+const CHANNEL_2 = { id: 'c2', guildId: 'g1', name: 'random', type: 'text' };
 const RENAMED = { id: 'p', displayName: 'After', avatarUrl: '' };
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -95,11 +95,30 @@ test('a connect() after close() resolves when the relay resumes the session, wit
   b.feed(HELLO);
   assert.equal(b.ops()[0], 'resume', 'the client still holds its session, so it resumes');
   b.feed({ op: 'dispatch', seq: 4, d: { type: 'persona_update', persona: RENAMED } });
-  b.feed(RESUMED);
+  b.feed({ op: 'dispatch', seq: 5, d: { type: 'channel_create', channel: CHANNEL_2 } });
+  b.feed({ op: 'resumed', d: { replayedEvents: 2 } });
 
   assert.deepEqual(await settled(second), {
-    value: { sessionId: 's1', seq: 4, persona: RENAMED, guilds: [GUILD], channels: [CHANNEL] },
+    value: { sessionId: 's1', seq: 5, persona: RENAMED, guilds: [GUILD], channels: [CHANNEL, CHANNEL_2] },
   });
+});
+
+test('a connect() after close() whose resume the relay refuses resolves with the fresh session', async (t) => {
+  const { client, created } = await connectedClient(t);
+  client.close();
+  created[0].finish(1000);
+
+  const second = client.connect();
+  const b = created[1];
+  b.feed(HELLO);
+  b.feed({ op: 'invalid_session', d: { resumable: false, reason: 'unknown session' } });
+  assert.deepEqual(b.ops(), ['resume', 'identify'], 'a refused resume starts a fresh session');
+  const fresh = { ...READY.d, sessionId: 's2', seq: 0, persona: RENAMED, channels: [CHANNEL_2] };
+  b.feed({ op: 'ready', d: fresh });
+
+  assert.deepEqual(await settled(second), { value: fresh });
+  const listeners = (client as unknown as { listeners: Map<string, Set<unknown>> }).listeners;
+  assert.equal(listeners.get('resumed')?.size ?? 0, 0, "connect()'s resumed listener is gone");
 });
 
 test('a connect() while a reconnect waits resolves when the relay resumes the session', async (t) => {
@@ -127,6 +146,19 @@ test("a resumed frame for no session the client holds doesn't settle connect(), 
 
   a.feed(READY);
   assert.deepEqual(await settled(first), { value: READY.d });
+});
+
+test("a socket error after a resumed for no session the client holds still rejects connect()", async (t) => {
+  const { client, created } = makeClient(t);
+  const first = client.connect();
+  const a = created[0];
+  a.feed(HELLO);
+  a.feed({ op: 'resumed', d: { replayedEvents: 0 } });
+  a.emit('error', new Error('connect ECONNRESET'));
+
+  const outcome = await settled(first);
+  assert.ok(typeof outcome === 'object' && 'error' in outcome, 'connect() rejected');
+  assert.match(String((outcome as { error: unknown }).error), /ECONNRESET/);
 });
 
 test("a connect() whose socket the factory can't make leaves none of its listeners behind", async (t) => {
