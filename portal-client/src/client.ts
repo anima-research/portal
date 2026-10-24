@@ -323,15 +323,27 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     // one. A factory that throws leaves the waiting reconnect to try again.
     this.cancelReconnect();
     this.ws = ws;
-    ws.on('message', (data) => this.onMessage(data.toString()));
-    ws.on('close', (code: number) => this.onClose(code));
-    ws.on('error', (err: Error) => this.emit('error', err));
+    // Each socket acts on the client only while it's this.ws. After close()
+    // and connect(), the old socket can still deliver frames, an error and its
+    // close while its closing handshake runs, and those belong to a session
+    // the client has left. Its rpc_result is the one exception: it settles the
+    // call that socket carried, by id, as close() promises a call already sent.
+    ws.on('message', (data) => this.onMessage(data.toString(), ws === this.ws));
+    ws.on('close', (code: number) => {
+      if (ws === this.ws) this.onClose(code);
+    });
+    ws.on('error', (err: Error) => {
+      if (ws === this.ws) this.emit('error', err);
+    });
   }
 
-  private onMessage(raw: string): void {
+  /** Act on a frame. From a socket the client no longer uses (`current`
+   *  false, see open()), only an rpc_result is taken. */
+  private onMessage(raw: string, current: boolean): void {
     const parsed: unknown = safeParse(raw);
     if (!isServerFrame(parsed)) return;
     const frame = parsed as ServerFrame;
+    if (!current && frame.op !== 'rpc_result') return;
     switch (frame.op) {
       case 'hello':
         this.startHeartbeat(frame.d.heartbeatIntervalMs);
