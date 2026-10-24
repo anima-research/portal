@@ -537,6 +537,15 @@ test('a voice_join that fails leaves the list as it was, and the relay is told s
   assert.deepEqual(sockets[0].subscriptionCalls(), [['unsubscribe_channel', 'c3']]);
 });
 
+test('a voice_join that fails on a channel already listed keeps it listed, and the relay is told so', async (t) => {
+  const { client, sockets } = await connected(t, ['c1']);
+  const joining = client.voiceJoin('c1');
+  sockets[0].answer('voice_join', 'c1', false);
+  await assert.rejects(joining, /refused c1/);
+  assert.deepEqual(listOf(client), ['c1']);
+  assert.deepEqual(sockets[0].subscriptionCalls(), [['subscribe_channel', 'c1']]);
+});
+
 test('a voice_join and an unsubscribe made after it leave the channel unlisted when the unsubscribe answers first', async (t) => {
   const { client, sockets } = await connected(t, ['c1']);
   const joining = client.voiceJoin('c3');
