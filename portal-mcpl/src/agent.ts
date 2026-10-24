@@ -96,7 +96,7 @@ export class PortalAgent {
    *  exactly when the client's list keeps it: the client undoes a failed
    *  call's change only while it's the newest call on the channel. */
   private followClient(channelId: string): void {
-    if (this.client.isSubscribed(channelId)) this.state.subscribe(channelId);
+    if (this.client.isListed(channelId)) this.state.subscribe(channelId);
     else this.state.unsubscribe(channelId);
   }
 

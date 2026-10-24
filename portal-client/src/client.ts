@@ -278,8 +278,10 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     return this.subscriptionCall('unsubscribe_channel', channelId, false, options.undo !== false);
   }
   /** Whether the channel is in the list a reconnect restores, as subscribe()
-   *  and unsubscribe() leave it. */
-  isSubscribed(channelId: string): boolean {
+   *  and unsubscribe() leave it. That's this client's request, not the
+   *  relay's state: the relay may have refused the channel, as the list keeps
+   *  a refused one. `list_subscriptions` gives the relay's own view. */
+  isListed(channelId: string): boolean {
     return (this.opts.subscriptions ?? []).includes(channelId);
   }
   /** Ask the relay to join a voice channel and stream transcripts here
@@ -513,7 +515,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   ) {
     let run = this.subscriptionRuns.get(channelId);
     if (!run) {
-      run = { before: this.isSubscribed(channelId), calls: [] };
+      run = { before: this.isListed(channelId), calls: [] };
       this.subscriptionRuns.set(channelId, run);
     }
     const call: SubscriptionCall = { listed };
@@ -554,7 +556,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   }
 
   private setListed(channelId: string, listed: boolean): void {
-    if (this.isSubscribed(channelId) === listed) return;
+    if (this.isListed(channelId) === listed) return;
     if (listed) (this.opts.subscriptions ??= []).push(channelId);
     else this.opts.subscriptions = (this.opts.subscriptions ?? []).filter((c) => c !== channelId);
   }

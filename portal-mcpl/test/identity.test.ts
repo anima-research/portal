@@ -328,7 +328,7 @@ test('without channels.register, a reopen that fails under the new identity stay
     console.error = realError;
   }
   assert.ok(asked.length >= 1, 'the reopen was asked for');
-  assert.equal(newClient.isSubscribed('100'), true, 'the failed reopen stays listed');
+  assert.equal(newClient.isListed('100'), true, 'the failed reopen stays listed');
   assert.deepEqual([...internal.openChannels], ['100']);
   assert.ok(errors.some((args) => String(args[0]).includes('failed to reopen 100')), 'the failure is logged');
 });
@@ -362,7 +362,7 @@ test("a failed reopen that a later close passed over is logged without saying it
   } finally {
     console.error = realError;
   }
-  assert.equal(newClient.isSubscribed('100'), false);
+  assert.equal(newClient.isListed('100'), false);
   const reopen = errors.find((args) => String(args[0]).includes('failed to reopen 100'));
   assert.ok(reopen, 'the failure is logged');
   assert.ok(!String(reopen[0]).includes('stays'), 'without saying it stays listed');
@@ -575,11 +575,11 @@ test("a session whose host owns channel lifecycle starts its client's list empty
     url: 'ws://test', stateDir: dir, seedSubscriptions: ['111'], agent: { hostOwnsChannelLifecycle: true },
   });
   assert.deepEqual(hosted.agent.state.subscriptionList(), ['111']);
-  assert.equal(hosted.client.isSubscribed('111'), false);
+  assert.equal(hosted.client.isListed('111'), false);
   hosted.close?.();
   const standalone = buildSession(ROOT, { url: 'ws://test', stateDir: dir });
   assert.deepEqual(standalone.agent.state.subscriptionList(), ['111']);
-  assert.equal(standalone.client.isSubscribed('111'), true);
+  assert.equal(standalone.client.isListed('111'), true);
   standalone.close?.();
   rmSync(dir, { recursive: true, force: true });
 });

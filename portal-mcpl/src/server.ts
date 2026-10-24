@@ -579,7 +579,7 @@ export class PortalMcplServer {
     // serve() handles one host request at a time, so only a removal of the
     // channel (flushRemovals, which tells the host it's gone) can have taken it
     // out of the client's list meanwhile: then the open doesn't stand.
-    if (!this.client.isSubscribed(channelId)) {
+    if (!this.client.isListed(channelId)) {
       throw new Error(
         `Nothing was opened: ${portalChannelId(channelId)} was removed from this persona's view while it was being ` +
           "opened, and the host has been told it's gone. If it comes back into view, it's offered again and can be " +
@@ -887,7 +887,7 @@ export class PortalMcplServer {
         void client.subscribe(channelId, { undo: false }).catch((err) =>
           console.error(
             `[portal-mcpl] failed to reopen ${channelId} under the new identity` +
-              (client.isSubscribed(channelId)
+              (client.isListed(channelId)
                 ? "; it stays in the client's list, so the next resume or identify asks the relay for it again:"
                 : ':'),
             (err as Error).message,

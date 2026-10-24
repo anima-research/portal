@@ -652,10 +652,10 @@ test("channelRemove takes a removed channel out of the client's list for good", 
     const { nth } = heldCalls(t.client);
     remove(t);
     assert.deepEqual(t.notifications[0]?.params, { removed: [`portal:${channel.id}`] });
-    assert.equal(t.client.isSubscribed(channel.id), false);
+    assert.equal(t.client.isListed(channel.id), false);
     nth('unsubscribe_channel', channel.id, 0).answer(false);
     await settle();
-    assert.equal(t.client.isSubscribed(channel.id), false, 'not put back after the failure');
+    assert.equal(t.client.isListed(channel.id), false, 'not put back after the failure');
   }
 
   // A close still waiting when the removal lands, which then fails: the
@@ -670,7 +670,7 @@ test("channelRemove takes a removed channel out of the client's list for good", 
     await closing;
     nth('unsubscribe_channel', channel.id, 1).answer(true);
     await settle();
-    assert.equal(t.client.isSubscribed(channel.id), false);
+    assert.equal(t.client.isListed(channel.id), false);
   }
 
   // Never listed: the unsubscribe goes out all the same, and changes nothing.
@@ -679,7 +679,7 @@ test("channelRemove takes a removed channel out of the client's list for good", 
     const { calls } = heldCalls(t.client);
     remove(t);
     assert.deepEqual(calls.map((c) => [c.method, c.channelId]), [['unsubscribe_channel', channel.id]]);
-    assert.equal(t.client.isSubscribed(channel.id), false);
+    assert.equal(t.client.isListed(channel.id), false);
   }
 });
 
@@ -767,7 +767,7 @@ test('a removal that lands while an open waits for its subscribe leaves the chan
   subscribing.answer(true);
   await assert.rejects(open, /Nothing was opened: portal:\S+ was removed from this persona's view while it was being opened/);
   assert.equal(t.internal.openChannels.has(channel.id), false, 'not open');
-  assert.equal(t.client.isSubscribed(channel.id), false, 'not listed');
+  assert.equal(t.client.isListed(channel.id), false, 'not listed');
   assert.deepEqual(t.notifications.at(-1)?.params, { removed: [`portal:${channel.id}`] }, 'the host was told');
 });
 
@@ -785,7 +785,7 @@ test("an open whose subscribe fails leaves the channel closed and out of the cli
   subscribing.answer(false);
   await assert.rejects(open, /refused/);
   assert.equal(t.internal.openChannels.has(channel.id), false, 'not open');
-  assert.equal(t.client.isSubscribed(channel.id), false, 'not listed');
+  assert.equal(t.client.isListed(channel.id), false, 'not listed');
 });
 
 test('a close whose unsubscribe fails leaves the channel open and listed, and subscribes it again', async () => {
@@ -806,7 +806,7 @@ test('a close whose unsubscribe fails leaves the channel open and listed, and su
   nth('unsubscribe_channel', channel.id, 0).answer(false);
   await assert.rejects(close, /refused/);
   assert.equal(t.internal.openChannels.has(channel.id), true, 'still open');
-  assert.equal(t.client.isSubscribed(channel.id), true, 'listed again');
+  assert.equal(t.client.isListed(channel.id), true, 'listed again');
   assert.ok(nth('subscribe_channel', channel.id, 1), 'subscribed again on the relay');
 });
 
