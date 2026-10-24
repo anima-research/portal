@@ -86,10 +86,11 @@ export class PortalAgent {
     });
     // The client asks the relay for its subscriptions again on every
     // reconnect, a resume included. Standalone, it's built with this durable
-    // state (session.ts) and each change below goes to both; after a failed
-    // call the state takes the client's word for the channel (followClient).
-    // In host mode the host's opens make the client's list, and this state
-    // only seeds the host's initiallyOpen hints.
+    // state (session.ts) and each change below goes to both, a voice_join's
+    // included; after a failed call the state takes the client's word for the
+    // channel (followClient). In host mode the host's opens make the client's
+    // list, with the channel of each voice_join added (voiceJoin()), and this
+    // state only seeds the host's initiallyOpen hints.
   }
 
   /** After a failed subscribe or unsubscribe, keep the channel in the state
@@ -374,8 +375,22 @@ export class PortalAgent {
       }
       case 'list_pins':
         return this.client.call('list_pins', { channelId: str(args.channelId, 'channelId') });
-      case 'voice_join':
-        return this.client.call('voice_join', { channelId: str(args.channelId, 'channelId') });
+      case 'voice_join': {
+        // voiceJoin(), not call(): the relay subscribes this session as it
+        // joins, so the client lists the channel and a reconnect asks again.
+        // Standalone, the durable state follows, as the subscribe tools keep
+        // it; in host mode it only seeds the host's opens, which a join
+        // doesn't make.
+        const channelId = str(args.channelId, 'channelId');
+        if (this.hostOwnsChannelLifecycle) return this.client.voiceJoin(channelId);
+        this.state.subscribe(channelId);
+        try {
+          return await this.client.voiceJoin(channelId);
+        } catch (error) {
+          this.followClient(channelId);
+          throw error;
+        }
+      }
       case 'voice_leave':
         return this.client.call('voice_leave', { channelId: str(args.channelId, 'channelId') });
       case 'voice_speak':

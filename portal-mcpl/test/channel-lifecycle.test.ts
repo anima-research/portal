@@ -928,3 +928,45 @@ test('a catch-up wake names the thread of each message in one, and says to pass 
   assert.ok(ccLines.some((l) => l.includes('message m2') && !l.includes('[thread')), wakes[0].content);
   assert.ok(wakes[0].content.includes('send_message with the channel as channelId and the thread as threadId'), wakes[0].content);
 });
+
+test("the voice_join tool in host mode lists its channel in the client, and leaves the durable state alone", async () => {
+  // The relay subscribes the session as it joins (issue #77), so the tool goes
+  // through voiceJoin(), whose channel joins the list a reconnect restores.
+  // In host mode the state only seeds the host's opens, which a join doesn't
+  // make.
+  const client = clientWithChannel();
+  const { nth } = heldCalls(client);
+  const state = new AgentState();
+  const agent = new PortalAgent(client, { state, hostOwnsChannelLifecycle: true });
+
+  const joining = agent.handleToolCall('voice_join', { channelId: channel.id });
+  assert.equal(client.isListed(channel.id), true, 'listed while the join waits');
+  nth('voice_join', channel.id).answer(true);
+  await joining;
+  assert.equal(client.isListed(channel.id), true);
+  assert.deepEqual(state.subscriptionList(), []);
+});
+
+test("a standalone agent's voice_join tool keeps the durable state as the client's list leaves the channel", async () => {
+  const client = clientWithChannel();
+  const { nth } = heldCalls(client);
+  const state = new AgentState();
+  const agent = new PortalAgent(client, { state });
+
+  const joining = agent.handleToolCall('voice_join', { channelId: channel.id });
+  assert.deepEqual(state.subscriptionList(), [channel.id], 'followed at once');
+  nth('voice_join', channel.id).answer(true);
+  await joining;
+  assert.equal(client.isListed(channel.id), true);
+  assert.deepEqual(state.subscriptionList(), [channel.id]);
+
+  // A failed join the client undoes leaves the durable state too.
+  const leaving = agent.handleToolCall('unsubscribe_channel', { channelId: channel.id });
+  nth('unsubscribe_channel', channel.id).answer(true);
+  await leaving;
+  const rejoining = agent.handleToolCall('voice_join', { channelId: channel.id });
+  nth('voice_join', channel.id, 1).answer(false);
+  await assert.rejects(rejoining, /refused/);
+  assert.equal(client.isListed(channel.id), false);
+  assert.deepEqual(state.subscriptionList(), [], "the failed join isn't kept as durable");
+});
