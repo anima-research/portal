@@ -115,6 +115,11 @@ async function supersede(t: TestContext, readyOnA: boolean) {
   }
   client.close();
   const second = client.connect();
+  // A test that checks only the sockets can end with this connect() still
+  // waiting, and the close() at its end may settle it by rejecting; that
+  // isn't what such a test is about. A test that awaits it still sees how
+  // it settles.
+  second.catch(() => {});
   const b = created[1];
   return { client, created, a, b, second };
 }
