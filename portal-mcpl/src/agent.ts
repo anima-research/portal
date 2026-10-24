@@ -375,7 +375,9 @@ export class PortalAgent {
       case 'list_pins':
         return this.client.call('list_pins', { channelId: str(args.channelId, 'channelId') });
       case 'voice_join':
-        return this.client.call('voice_join', { channelId: str(args.channelId, 'channelId') });
+        // voiceJoin(), not call(): the relay subscribes this session as it
+        // joins, so the client lists the channel and a reconnect asks again.
+        return this.client.voiceJoin(str(args.channelId, 'channelId'));
       case 'voice_leave':
         return this.client.call('voice_leave', { channelId: str(args.channelId, 'channelId') });
       case 'voice_speak':

@@ -35,12 +35,12 @@ class FakeWs extends EventEmitter {
       .map((f) => [f.d.method!, f.d.params?.channelId]);
   }
   /** Answer the nth (from 0, or from the end when negative) RPC this socket
-   *  carried for `method` and `channelId`. */
-  answer(method: string, channelId: string, ok: boolean, nth = 0): void {
+   *  carried for `method` and `channelId`, a success with `result`. */
+  answer(method: string, channelId: string, ok: boolean, nth = 0, result: unknown = {}): void {
     const rpc = this.sent.filter((f) => f.op === 'rpc' && f.d.method === method && f.d.params?.channelId === channelId).at(nth);
     assert.ok(rpc, `no ${method} for ${channelId} (#${nth}) was sent`);
     this.frame(ok
-      ? { op: 'rpc_result', d: { id: rpc.d.id, ok: true, result: {} } }
+      ? { op: 'rpc_result', d: { id: rpc.d.id, ok: true, result } }
       : { op: 'rpc_result', d: { id: rpc.d.id, ok: false, error: { code: 'forbidden', message: `refused ${channelId}` } } });
   }
 }
@@ -503,8 +503,8 @@ test('a channel the relay refuses on a resume stays in the list, and nothing rej
 test('a voice_join that succeeded is listed, so a resume asks for its transcripts again', async (t) => {
   const { client, sockets } = await connected(t, ['c1']);
   const joining = client.voiceJoin('c3');
-  sockets[0].answer('voice_join', 'c3', true);
-  await joining;
+  sockets[0].answer('voice_join', 'c3', true, 0, { listening: true });
+  assert.deepEqual(await joining, { listening: true }, "voiceJoin() resolves with the relay's answer");
   assert.deepEqual(listOf(client), ['c1', 'c3']);
 
   drop(sockets[0]);
@@ -529,21 +529,34 @@ test('after a voice_join, an identify the relay asks for carries its channel', a
 
 test('a voice_join that fails leaves the list as it was, and the relay is told so', async (t) => {
   const { client, sockets } = await connected(t, ['c1']);
-  const joining = client.voiceJoin('c3').catch((error: unknown) => error);
+  const joining = client.voiceJoin('c3');
   assert.deepEqual(listOf(client), ['c1', 'c3'], 'listed while it waits, as a subscribe is');
   sockets[0].answer('voice_join', 'c3', false);
-  assert.match(String(await joining), /refused c3/);
+  await assert.rejects(joining, /refused c3/);
   assert.deepEqual(listOf(client), ['c1']);
   assert.deepEqual(sockets[0].subscriptionCalls(), [['unsubscribe_channel', 'c3']]);
 });
 
-test('a voice_join and an unsubscribe made after it leave the channel as the newer one asks, whichever answer comes first', async (t) => {
+test('a voice_join and an unsubscribe made after it leave the channel unlisted when the unsubscribe answers first', async (t) => {
   const { client, sockets } = await connected(t, ['c1']);
   const joining = client.voiceJoin('c3');
   const unsubscribing = client.unsubscribe('c3');
   sockets[0].answer('unsubscribe_channel', 'c3', true);
+  assert.deepEqual(listOf(client), ['c1']);
   sockets[0].answer('voice_join', 'c3', true);
   await Promise.all([joining, unsubscribing]);
+  assert.deepEqual(listOf(client), ['c1'], "the older join's answer changes nothing");
+});
+
+test('a voice_join and an unsubscribe made after it leave the channel unlisted when the join answers first', async (t) => {
+  const { client, sockets } = await connected(t, ['c1']);
+  const joining = client.voiceJoin('c3');
+  const unsubscribing = client.unsubscribe('c3');
+  sockets[0].answer('voice_join', 'c3', true);
+  await joining;
+  assert.deepEqual(listOf(client), ['c1'], 'the newer unsubscribe still decides while it waits');
+  sockets[0].answer('unsubscribe_channel', 'c3', true);
+  await unsubscribing;
   assert.deepEqual(listOf(client), ['c1']);
 });
 
@@ -556,9 +569,15 @@ test('a voice_leave leaves the joined channel listed, as the relay leaves it sub
   sockets[0].answer('voice_leave', 'c3', true);
   await leaving;
   assert.deepEqual(listOf(client), ['c1', 'c3']);
+  drop(sockets[0]);
+  const next = await resumedSocket(sockets, 1);
+  assert.deepEqual(next.subscriptionCalls(), [['subscribe_channel', 'c1'], ['subscribe_channel', 'c3']], 'a resume asks for it again');
+  next.answer('subscribe_channel', 'c1', true);
+  next.answer('subscribe_channel', 'c3', true);
+  await tick();
 
   const unsubscribing = client.unsubscribe('c3');
-  sockets[0].answer('unsubscribe_channel', 'c3', true);
+  next.answer('unsubscribe_channel', 'c3', true);
   await unsubscribing;
   assert.deepEqual(listOf(client), ['c1']);
 });

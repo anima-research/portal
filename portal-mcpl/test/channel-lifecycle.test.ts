@@ -928,3 +928,17 @@ test('a catch-up wake names the thread of each message in one, and says to pass 
   assert.ok(ccLines.some((l) => l.includes('message m2') && !l.includes('[thread')), wakes[0].content);
   assert.ok(wakes[0].content.includes('send_message with the channel as channelId and the thread as threadId'), wakes[0].content);
 });
+
+test("the voice_join tool lists its channel in the client, so a reconnect asks for its transcripts again", async () => {
+  // The relay subscribes the session as it joins (issue #77), so the tool goes
+  // through voiceJoin(), whose channel joins the list a reconnect restores.
+  const client = clientWithChannel();
+  const { nth } = heldCalls(client);
+  const agent = new PortalAgent(client, { hostOwnsChannelLifecycle: true });
+
+  const joining = agent.handleToolCall('voice_join', { channelId: channel.id });
+  assert.equal(client.isListed(channel.id), true, 'listed while the join waits');
+  nth('voice_join', channel.id).answer(true);
+  await joining;
+  assert.equal(client.isListed(channel.id), true);
+});
