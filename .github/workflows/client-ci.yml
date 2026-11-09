@@ -81,6 +81,43 @@ jobs:
           npm run build
           npm test
 
+  client-floors:
+    name: Client at its dependencies' floors, build & test (Node 22.12.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: portal-client/package-lock.json
+
+      - name: Install each dependency at the lowest release its range admits
+        working-directory: portal-client
+        run: |
+          npm ci
+          floors=$(node -e '
+            const { execFileSync } = require("node:child_process");
+            for (const [name, range] of Object.entries(require("./package.json").dependencies)) {
+              // npm view prints a bare string when one release matches, and an array when several do.
+              const releases = [JSON.parse(execFileSync("npm", ["view", `${name}@${range}`, "version", "--json"], { encoding: "utf8" }))].flat();
+              releases.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+              console.log(`${name}@${releases[0]}`);
+            }
+          ')
+          npm install --no-save $floors
+          npm ls --depth=0
+
+      - name: Build & test client
+        working-directory: portal-client
+        run: |
+          npm run build
+          npm test
+
   mcpl:
     name: MCPL strict install, build & test (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
