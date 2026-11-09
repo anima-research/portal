@@ -168,6 +168,51 @@ connectome-host (one per agent recipe)
 Wiring examples: `portal-mcpl/examples/mcpl-servers.json`,
 `examples/recipe.portal-test.json`.
 
+## Digest view for history (opt-in)
+
+`portal-mcpl` can return a message history as one short entry per message instead of the whole message objects, which
+cost an agent's context far more than they tell it (ids, duplicated `content` and `cleanContent`, empty reaction lists,
+avatar fields). **It is off unless the server turns it on**, with `PORTAL_DIGEST_VIEW=1` (or `true`) in the
+environment, or `digestView: true` in `PortalAgentOptions` (the option wins over the environment).
+
+- **Off (the default):** the served tools are exactly as before: `JSON.stringify(agent.tools)` is byte-identical to what
+  it was, and so is the exported `toolDefinitions`, which never lists `fetch_message` or a `view`/`words` property. One
+  behaviour does change, on purpose: a call that passes `view` or `words`, or calls `fetch_message`, used to be ignored or
+  unknown and is now refused before anything is fetched, with a message that says the view is not enabled and how to turn
+  it on. It is never answered with the full messages instead, which would let an agent believe it had a view the server
+  does not offer. A host that builds its own `tools/list` can use the exported `toolDefinitions`, `digestToolDefinitions`
+  (the one extra tool) and `withDigestView` (what the two history fetches gain); `agent.tools` is the assembled surface.
+- **On:** `fetch_history` and `fetch_around` accept `view: "digest"` and `words` (an integer, 1 to 500, default 30). `view`
+  is still chosen per call and defaults to `"full"`, as today. `fetch_message` reads one message in full.
+- **What a digest returns:** `{ view, count, note, ids, lines }`. An entry reads
+  `#3 10-20 14:09 hesperus[persona] ↩#1 👍2 :party:1 📎1: Nissa, I've read parts 1 and 2… (+41 words, full: rm_…)`:
+  numbered oldest first; time is **UTC** (month-day hour:minute, no year); `↩#1` is the message it replies to
+  (`↩(not in batch)` when that one was not fetched); reactions are emoji and count; `📎` counts attachments.
+  **`ids[N-1]` is the relay id of `#N`**, which is what `react`, `send_message` (`replyToId`), `edit_message` and the
+  `before`/`after` cursors take, so an agent can act on a message it has only read in digest form.
+- **Cutting.** An entry keeps `words` words, and at most 12 characters per word of the limit, so text with no spaces (CJK,
+  a long URL, code) is bounded too. A cut entry is flattened to one line, says what it lost, `(+41 words` or `(+380 chars`,
+  and prints the relay id to read the rest with. **A cut never lands inside a character as a person sees it:** an emoji,
+  a flag or a joined family is kept or dropped whole, and `chars` counts those, not UTF-16 units. A lone surrogate that
+  arrives in the source text is replaced with U+FFFD, because the Anthropic API refuses a request body that contains one,
+  and a line that carried one would fail every later request in that context.
+- **Whole messages.** An entry with no cut marker is the whole message, **as written, line breaks and indentation
+  included**; only a cut message is flattened. A message addressed to the agent is whole, marked `★to-you`, and so is the
+  message an addressed message replies to, marked `★replied-to`, unless that message is the agent's own post (a reply to
+  the agent would otherwise bring its own words back, whole, in every conversation it is in). "Addressed" is what a
+  history message shows: another author's message that mentions this persona (`mentions.personas`), or that replies to a
+  message this persona wrote. The persona's own messages are never addressed to it. The relay computes `addressedToMe`
+  only for live events, so a reply's parent is found in the same batch, or among the ids of messages this server has sent
+  or an earlier digest has shown (the newest 2,000 are remembered; past that, the oldest are forgotten). **Not seen:** a
+  name typed without a mention, and a reply to an older post of the agent's that this process has neither sent nor shown.
+- **Where it runs:** in `portal-mcpl`, from the full messages the relay already returns. It saves the agent's context,
+  not relay bandwidth, and changes nothing in the protocol, the relay or the client.
+- **`fetch_message` is a live read.** It keeps no copy of any message. A bounded index remembers only *where* the last 500
+  messages a digest showed live (relay id, snowflake, channel, thread), and `fetch_message` asks the relay for that one
+  message through `fetch_history` (`before` the snowflake plus one, limit 1, and an id match). So it shows edits and
+  reactions as they are now, says so when the message is gone, and is refused when the agent can no longer read the
+  channel. A restart empties the index, and a miss says so and points back at `fetch_history`.
+
 ## Capability coverage
 
 | Capability | Outbound (agent→Discord) | Inbound (Discord→agent) |

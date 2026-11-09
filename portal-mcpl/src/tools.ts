@@ -420,9 +420,63 @@ const definitions: ToolDefinition[] = [
   },
 ];
 
+/** Tools that exist only while the digest view is on (agent.ts). Kept out of `toolDefinitions`, which stays the
+ *  surface a server without the view offers, so a host that serves it directly serves exactly that. */
+const digestOnlyDefinitions: ToolDefinition[] = [
+  {
+    name: 'fetch_message',
+    description:
+      'Read one message in full, by relay id or Discord snowflake: the message a digest cut short ' +
+      '(fetch_history or fetch_around with view "digest" prints "full: <id>" on every cut line). It reads the ' +
+      'message from the relay now, so it shows edits and reactions as they are, and is refused if the message is gone ' +
+      'or you can no longer read the channel. Works only for messages a digest has shown this server recently; for ' +
+      'any other, fetch it again with fetch_history or fetch_around. Offered only where the server has turned the ' +
+      'digest view on.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string', description: 'Relay message id or Discord snowflake, as a digest line prints it' },
+      },
+      required: ['messageId'],
+    },
+  },
+];
+
+/** The names the digest view adds a property to. */
+const DIGEST_VIEW_TOOLS = new Set(['fetch_history', 'fetch_around']);
+
+/** What a tool offers once the server has turned the digest view on (agent.ts): `view` and `words` on the two history
+ *  fetches. Off, the static definitions are served exactly as they are above, with none of this. */
+export function withDigestView(tool: ToolDefinition): ToolDefinition {
+  if (!DIGEST_VIEW_TOOLS.has(tool.name)) return tool;
+  return {
+    ...tool,
+    description:
+      `${tool.description} With view "digest" it returns one line per message instead of the whole objects ` +
+      '(time, author, reply marker, reactions, attachments, then the first `words` words); a cut line says how many ' +
+      'words it lost and prints "full: <id>" for fetch_message, and a message addressed to you comes back whole. ' +
+      'Default view is "full", as before.',
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...tool.inputSchema.properties,
+        view: {
+          type: 'string',
+          enum: ['full', 'digest'],
+          description: '"full" (default) returns the whole message objects; "digest" returns one short line per message.',
+        },
+        words: { type: 'integer', minimum: 1, maximum: 500, description: 'With view "digest": words kept of each cut message (default 30).' },
+      },
+    },
+  };
+}
+
 /**
  * The served tool surface. Every definition carries its MCPL RFC-008 class in
  * `_meta` (see tool-classes.ts). Both tools/list paths — the MCPL server and the
  * Claude Code channel — serve these objects via `PortalAgent.tools`.
  */
 export const toolDefinitions: ToolDefinition[] = definitions.map(withToolClass);
+
+/** What the digest view adds to the served surface when it is on: `fetch_message`. Classed like the rest. */
+export const digestToolDefinitions: ToolDefinition[] = digestOnlyDefinitions.map(withToolClass);
