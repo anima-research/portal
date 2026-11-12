@@ -1113,6 +1113,16 @@ export class PortalMcplServer {
           channelId: portalChannelId(latest.channelId),
           mcplChannelId: portalChannelId(latest.channelId),
           messageId: latest.id,
+          // What the live push carries for one message, for the newest of
+          // these: the host's closed-channel invitation names the author
+          // ("Someone" without one) and, from missedMessages, says how many
+          // the catch-up holds.
+          channelName: this.channelLabel(latest.channelId),
+          guildId: latest.guildId,
+          threadId: latest.threadId,
+          authorId: authorOf(latest).id,
+          authorName: authorOf(latest).name,
+          missedMessages: fresh.length,
           isMention: true,
           isExplicitMention: true,
           isReplyToBot: false,
