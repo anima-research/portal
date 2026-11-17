@@ -827,7 +827,8 @@ export class DiscordBot implements WebhookOps, RoleOps {
       id: String(raw.id),
       name: typeof raw.name === 'string' ? raw.name : null,
       type,
-      parentId: isThread && raw.parent_id ? String(raw.parent_id) : undefined,
+      // Same shape as metaOf: thread parent or category heading (#95).
+      parentId: raw.parent_id ? String(raw.parent_id) : undefined,
       guildId: String(raw.guild_id),
       archived: isThread ? !!raw.thread_metadata?.archived : undefined,
       isThread,

@@ -88,3 +88,22 @@ test('voice and forum channels carry their category too', () => {
   assert.equal(metas['voice-1'].parentId, 'cat-live');
   assert.equal(metas['forum-1'].parentId, 'cat-live');
 });
+
+test('webhook targeting: a categorized text channel posts to itself, a thread to its parent', async () => {
+  // Finding 6 of the #99 review: a parentId no longer implies a thread, and
+  // the webhook route must key on isThread, never on parentId presence.
+  const route = async (meta: Record<string, unknown>) => {
+    const fake = Object.create(DiscordBot.prototype) as Record<string, unknown>;
+    fake.getChannelMeta = async () => meta;
+    return DiscordBot.prototype.resolveTarget.call(fake as unknown as DiscordBot, meta.id as string);
+  };
+  assert.deepEqual(
+    await route({ id: 'filed', type: 'text', parentId: 'cat-1', isThread: false, guildId: 'g1', name: 'filed' }),
+    { parentChannelId: 'filed' },
+    'a category parent never becomes a webhook target',
+  );
+  assert.deepEqual(
+    await route({ id: 'thr', type: 'thread', parentId: 'general', isThread: true, guildId: 'g1', name: 'thr' }),
+    { parentChannelId: 'general', threadId: 'thr' },
+  );
+});

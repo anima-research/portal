@@ -1407,16 +1407,17 @@ const CH = {
 const G1_CHANNELS = [
   { id: CH.welcome, name: 'welcome', type: 'text' },
   { id: CH.catGeneral, name: 'General', type: 'category' },
-  { id: CH.general, name: 'general', type: 'text' },
-  { id: CH.random, name: 'random', type: 'text' },
-  { id: CH.lounge, name: 'lounge', type: 'voice' },
+  // Since #95 categorized channels carry their category as parentId.
+  { id: CH.general, name: 'general', type: 'text', parentId: CH.catGeneral },
+  { id: CH.random, name: 'random', type: 'text', parentId: CH.catGeneral },
+  { id: CH.lounge, name: 'lounge', type: 'voice', parentId: CH.catGeneral },
   { id: CH.catResearch, name: 'Research', type: 'category' },
-  { id: CH.research, name: 'research', type: 'text' },
+  { id: CH.research, name: 'research', type: 'text', parentId: CH.catResearch },
   { id: CH.designReview, name: 'design-review', type: 'thread', parentId: CH.research },
-  { id: CH.labNotes, name: 'lab-notes', type: 'text' },
-  { id: CH.ideas, name: 'ideas', type: 'forum' },
+  { id: CH.labNotes, name: 'lab-notes', type: 'text', parentId: CH.catResearch },
+  { id: CH.ideas, name: 'ideas', type: 'forum', parentId: CH.catResearch },
   { id: CH.catArchive, name: 'Archive', type: 'category' },
-  { id: CH.oldLogs, name: 'old-logs', type: 'text' },
+  { id: CH.oldLogs, name: 'old-logs', type: 'text', parentId: CH.catArchive },
 ];
 const G1_CATALOG = {
   'g1-readers': { caps: LEVEL_CAPS.read, scope: { all: true }, guildId: G1 },
