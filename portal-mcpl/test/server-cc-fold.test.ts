@@ -59,8 +59,15 @@ function relayClient(opts: RelayOpts) {
     store.filter((m) => m.channelId === channelId && (!watermarks[channelId] || m.createdAt > watermarks[channelId]))
       .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
   Object.assign(client, {
-    async fetchHistory(p: { channelId: string; threadId?: string; limit?: number; before?: string }) {
+    async fetchHistory(p: { channelId: string; threadId?: string; limit?: number; before?: string; after?: string }) {
       fetches.push({ channelId: p.channelId, threadId: p.threadId });
+      // The relay's paging contract (#91): before-only and bare calls serve
+      // the newest page below the cursor; an after-only call serves the
+      // OLDEST page above it (that is what makes forward pagination work);
+      // both cursors bound a window from the top. An `after` cursor is a
+      // message id when it names one, else a snowflake whose timestamp is
+      // the bound (sinceCursor builds those).
+      const snowMs = (snow: string) => Number((BigInt(snow) >> 22n) + 1420070400000n);
       let newestFirst = store
         .filter((m) => m.channelId === p.channelId && (p.threadId ? m.threadId === p.threadId : !m.threadId))
         .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
@@ -68,7 +75,18 @@ function relayClient(opts: RelayOpts) {
         const idx = newestFirst.findIndex((m) => m.id === p.before);
         newestFirst = idx >= 0 ? newestFirst.slice(idx + 1) : [];
       }
-      return { messages: newestFirst.slice(0, p.limit ?? 50) };
+      if (p.after) {
+        const byId = newestFirst.findIndex((m) => m.id === p.after);
+        if (byId >= 0) newestFirst = newestFirst.slice(0, byId);
+        else {
+          const ms = snowMs(p.after);
+          newestFirst = newestFirst.filter((m) => Date.parse(m.createdAt) > ms);
+        }
+      }
+      const slice = p.after && !p.before
+        ? newestFirst.slice(-(p.limit ?? 50)) // oldest page above the cursor
+        : newestFirst.slice(0, p.limit ?? 50);
+      return { messages: slice };
     },
     async call(method: string, params: Record<string, unknown>) {
       switch (method) {
@@ -164,6 +182,26 @@ test('a live message newer than an unseen gap does not move the watermark past t
   await h.settle();
   const next = shownIds(h.wakes[1].content).filter((id) => /^b\d+$/.test(id));
   assert.equal(next[0], `b${Number(lastPrefix.id.slice(1)) + 1}`);
+});
+
+test('a backlog wider than one relay page is fetched whole, oldest first (#98 blocker)', async () => {
+  // 150 missed with FOLD_PAGE = 100 forces a second forward page. Before
+  // the fix, the walk's after-only first call took the oldest 100 and the
+  // next `before` page above the watermark was empty, so the newest 50
+  // were never fetched — and the whole-backlog branch could mark through
+  // them.
+  const backlog = Array.from({ length: 150 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)));
+  const r = relayClient({ messages: [...backlog, msg('a1', A, S(0))], watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 400 });
+  ping(r.client, msg('a99', A, S(200), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  assert.equal(shown.length, 150, 'every missed message is folded');
+  assert.deepEqual(shown, backlog.map((m) => m.id), 'oldest first, none skipped, none duplicated');
+  const markB = r.marked.find((m) => m.channelId === B)!;
+  assert.equal(markB.uptoCreatedAt, S(150), 'marked through the newest actually shown');
+  assert.equal(markB.count, 150);
 });
 
 test('thread replies under a followed channel are folded (fetched by threadId), not marked read unseen', async () => {

@@ -322,10 +322,9 @@ export class PortalCcChannelServer {
    * ambient traffic silently vanished — a catch-up wake carried only the pings.
    *
    * The relay keeps tallies, not bodies (Discord is the durable store). Each
-   * followed channel with unread is paged back to its watermark with `before`
-   * cursors (chosen when the relay's `after` was only a stopping point; kept
-   * because it is still correct, and works against relays from before
-   * `after` paged forward) — and so is
+   * followed channel with unread is paged FORWARD from its watermark —
+   * since #91 an `after`-only fetch serves the window just above the
+   * cursor, so the oldest unseen arrives first by construction — and so is
    * every thread under it with missed replies, because a thread reply counts
    * toward (and shares the watermark of) its parent channel but is not in the
    * parent's own history. A channel with more missed than FOLD_BOUND, or more
@@ -377,11 +376,11 @@ export class PortalCcChannelServer {
         }
         // The channel's own history, then each thread with replies past `since`.
         const threads = missed.threads ?? [];
-        const pages: Array<PortalMessage[] | null> = [await this.pageBack(b, u.channelId, undefined, floor, upto)];
+        const pages: Array<PortalMessage[] | null> = [await this.pageWindow(b, u.channelId, undefined, floor, upto)];
         for (const th of threads) {
           if (th.lastAt <= floor) continue;
           const threadFloor = since ?? (th.firstAt ? justBefore(th.firstAt) : floor);
-          pages.push(await this.pageBack(b, u.channelId, th.threadId, threadFloor, upto));
+          pages.push(await this.pageWindow(b, u.channelId, th.threadId, threadFloor, upto));
         }
         const unseen = pages.includes(null)
           ? null
@@ -403,10 +402,14 @@ export class PortalCcChannelServer {
     return out;
   }
 
-  /** One container's messages in (since, upto], oldest first — paged back from
-   *  the newest until the page reaches the watermark (the relay's `after` stops
-   *  the page there too). null when FOLD_BOUND is hit before the watermark. */
-  private async pageBack(
+  /** One container's messages in (since, upto], oldest first. With a
+   *  watermark, pages FORWARD from it: since #91 an `after`-only fetch
+   *  serves the window just above the cursor, so the oldest unseen always
+   *  arrives first and each page's newest id is the next cursor. Without
+   *  one, pages back from the newest with `before` cursors until a short
+   *  page. null when FOLD_BOUND is hit before the window closes (folding
+   *  a slice would skip what lies beyond it). */
+  private async pageWindow(
     b: Bound,
     channelId: string,
     threadId: string | undefined,
@@ -414,6 +417,25 @@ export class PortalCcChannelServer {
     upto: string,
   ): Promise<PortalMessage[] | null> {
     const fresh: PortalMessage[] = [];
+    if (since) {
+      let after = sinceCursor(since);
+      while (fresh.length <= FOLD_BOUND) {
+        const { messages } = await b.client.fetchHistory({
+          channelId,
+          ...(threadId ? { threadId } : {}),
+          limit: FOLD_PAGE,
+          after,
+        });
+        if (messages.length === 0) return fresh;
+        const page = [...messages].sort(byCreatedAt);
+        fresh.push(...page.filter((m) => m.createdAt > since && m.createdAt <= upto));
+        // Everything from here up is newer than the fold's ceiling.
+        if (page[0].createdAt > upto) return fresh;
+        if (messages.length < FOLD_PAGE) return fresh;
+        after = page[page.length - 1].id;
+      }
+      return null;
+    }
     let before: string | undefined;
     while (fresh.length < FOLD_BOUND) {
       const { messages } = await b.client.fetchHistory({
@@ -421,12 +443,10 @@ export class PortalCcChannelServer {
         ...(threadId ? { threadId } : {}),
         limit: FOLD_PAGE,
         ...(before ? { before } : {}),
-        ...(since ? { after: sinceCursor(since) } : {}),
       });
       if (messages.length === 0) return fresh;
       const page = [...messages].sort(byCreatedAt);
-      fresh.unshift(...page.filter((m) => (!since || m.createdAt > since) && m.createdAt <= upto));
-      if (since && page[0].createdAt <= since) return fresh;
+      fresh.unshift(...page.filter((m) => m.createdAt <= upto));
       if (messages.length < FOLD_PAGE) return fresh;
       before = page[0].id;
     }

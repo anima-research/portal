@@ -172,7 +172,21 @@ function bigHarness(opts: { missed: number; cap: number; watermark?: string }) {
           const idx = newestFirst.findIndex((m) => m.id === p.before);
           newestFirst = idx >= 0 ? newestFirst.slice(idx + 1) : [];
         }
-        return { messages: newestFirst.slice(0, p.limit ?? 50) };
+        // The relay's paging contract (#91): an after-only call serves the
+        // OLDEST page above the cursor (id, or a sinceCursor snowflake
+        // bounding by time); before-only and bare calls the newest below.
+        if (p.after) {
+          const byId = newestFirst.findIndex((m) => m.id === p.after);
+          if (byId >= 0) newestFirst = newestFirst.slice(0, byId);
+          else {
+            const ms = Number((BigInt(p.after) >> 22n) + 1420070400000n);
+            newestFirst = newestFirst.filter((m) => Date.parse(m.createdAt) > ms);
+          }
+        }
+        const slice = p.after && !p.before
+          ? newestFirst.slice(-(p.limit ?? 50))
+          : newestFirst.slice(0, p.limit ?? 50);
+        return { messages: slice };
       },
       async call(method: string, params: Record<string, unknown>) {
         switch (method) {
@@ -214,9 +228,13 @@ test('200 missed, cap 50: the OLDEST are delivered, the watermark advances only 
     [{ channelId: B, uptoCreatedAt: S(48), count: 48, since: S(0), keepPings: true }],
     'watermark = last message shown, not the relay lastAt; the relay is told how many it covers',
   );
-  // Paged back to the watermark with cursors, not one uncursored newest-N call.
+  // Paged FORWARD from the watermark with after cursors (#91), not one
+  // uncursored newest-N call and not before pages from the top.
   const bFetches = h.fetches.filter((f) => f.after !== undefined);
-  assert.ok(bFetches.length >= 2 && bFetches[1].before !== undefined, `paged with before (${JSON.stringify(bFetches)})`);
+  assert.ok(
+    bFetches.length >= 2 && bFetches.every((f) => f.before === undefined) && bFetches[1].after === 'b100',
+    `paged forward with after cursors (${JSON.stringify(bFetches)})`,
+  );
 
   // Next wake: the local watermark is now S(50); the next oldest fold in.
   h.client.emit('message', { message: msg('a10', A, S(501), '@P again'), addressedToMe: true, reasons: ['role_mention'] });
