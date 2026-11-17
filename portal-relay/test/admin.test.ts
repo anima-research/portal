@@ -214,8 +214,10 @@ function setupDeps(
   // kind the relay doesn't know. G2: one text channel.
   const channelTable: Record<string, Array<{ id: string; name: string; type: string; parentId?: string }>> = {
     G1: [
-      { id: 'c1', name: 'c1', type: 'text' },
-      { id: 'c2', name: 'c2', type: 'text' },
+      // Since #95 the wire carries each channel's category (categoryOf
+      // below is the same placement; production sends it as parentId).
+      { id: 'c1', name: 'c1', type: 'text', parentId: 'cat1' },
+      { id: 'c2', name: 'c2', type: 'text', parentId: 'cat1' },
       { id: 'th-c1', name: 'th-c1', type: 'thread', parentId: 'c1' },
       { id: 'cat1', name: 'cat1', type: 'category' },
       { id: 'odd1', name: 'odd1', type: 'unknown' },
@@ -2111,7 +2113,7 @@ test('access reads: who can act where and why — only G’s access roles named,
     const c1 = await s.get('/admin/g/G1/channels/c1/access');
     assert.equal(c1.status, 200);
     assert.match(c1.headers.get('server-timing') ?? '', /^access;dur=\d+(\.\d+)?$/);
-    assert.deepEqual(c1.body.channel, { id: 'c1', name: 'c1', type: 'text', categoryId: 'cat1', position: 0, announcement: false, grantable: true });
+    assert.deepEqual(c1.body.channel, { id: 'c1', name: 'c1', type: 'text', parentId: 'cat1', categoryId: 'cat1', position: 0, announcement: false, grantable: true });
     assert.equal(c1.body.botBase, 'full');
     const row = c1.body.rows.find((r: { personaId: string }) => r.personaId === 'p1');
     assert.deepEqual(row.effective, WRITE);
@@ -2183,7 +2185,7 @@ test('/channels: each channel’s place in Discord, whether it can hold access, 
   try {
     const r = await s.get('/admin/g/G1/channels');
     const byId = Object.fromEntries(r.body.channels.map((c: { id: string }) => [c.id, c]));
-    assert.deepEqual(byId.c2, { id: 'c2', name: 'c2', type: 'text', categoryId: 'cat1', position: 1, announcement: false, grantable: true });
+    assert.deepEqual(byId.c2, { id: 'c2', name: 'c2', type: 'text', parentId: 'cat1', categoryId: 'cat1', position: 1, announcement: false, grantable: true });
     assert.equal(byId['th-c1'].grantable, false);
     assert.equal(byId['th-c1'].parentId, 'c1');
     assert.equal(byId.cat1.grantable, false);
