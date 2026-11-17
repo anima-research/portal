@@ -305,9 +305,11 @@ export class PortalCcChannelServer {
    * non-resumable reconnect, an identity switch. Before this, all of that
    * ambient traffic silently vanished — a catch-up wake carried only the pings.
    *
-   * The relay keeps tallies, not bodies (Discord is the durable store), and
-   * its fetch_history pages newest-first (`after` is only a stop), so each
-   * followed channel with unread is paged back to its watermark — and so is
+   * The relay keeps tallies, not bodies (Discord is the durable store). Each
+   * followed channel with unread is paged back to its watermark with `before`
+   * cursors (chosen when the relay's `after` was only a stopping point; kept
+   * because it is still correct, and works against relays from before
+   * `after` paged forward) — and so is
    * every thread under it with missed replies, because a thread reply counts
    * toward (and shares the watermark of) its parent channel but is not in the
    * parent's own history. A channel with more missed than FOLD_BOUND, or more

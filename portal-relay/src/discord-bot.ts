@@ -906,6 +906,28 @@ export class DiscordBot implements WebhookOps, RoleOps {
   ): Promise<IncomingMessage[]> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('messages' in channel)) throw new Error(`Channel ${channelId} not found`);
+    if (after && !before) {
+      // Scroll FORWARD from the cursor (issue #91). Discord's `after` fetch
+      // option serves the oldest messages above the id, so advancing the
+      // cursor to each page's max id walks chronologically. Collect
+      // ascending, return newest-first — the order every other call returns.
+      const ascending: IncomingMessage[] = [];
+      let fwd: string | undefined = after;
+      while (ascending.length < limit) {
+        const pageLimit = Math.min(100, limit - ascending.length);
+        const page: Map<string, Message> = await (channel as TextChannel).messages.fetch({ limit: pageLimit, after: fwd });
+        if (page.size === 0) break;
+        const arr: Message[] = [...page.values()].sort((a, b) => a.id.localeCompare(b.id, 'en-US-u-kn-true'));
+        for (const m of arr) {
+          ascending.push(this.convert(m));
+          if (ascending.length >= limit) break;
+        }
+        if (page.size < pageLimit) break;
+        fwd = arr[arr.length - 1]?.id;
+        if (!fwd) break;
+      }
+      return ascending.reverse();
+    }
     const collected: IncomingMessage[] = [];
     let cursor = before;
     while (collected.length < limit) {
