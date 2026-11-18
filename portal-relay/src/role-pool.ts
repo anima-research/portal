@@ -44,6 +44,9 @@ interface GuildPool {
   discovered: boolean;
 }
 
+/** A character that continues a name: letters, digits, `_` and `-`. */
+const NAME_CHAR = /[\p{L}\p{N}_-]/u;
+
 export class RolePool {
   private guilds = new Map<string, GuildPool>();
   /** Per-guild serialization tail. bind()/unbind() mutate a guild's pool across
@@ -255,6 +258,37 @@ export class RolePool {
 
   getRoleFor(guildId: string, personaId: string): string | undefined {
     return this.guilds.get(guildId)?.byPersona.get(personaId);
+  }
+
+  /**
+   * Personas a message names in plain text: `@` followed by a display name as
+   * a reader sees it. A role mention carries the pool prefix, which nobody
+   * types, so a writer without Discord's autocomplete (another agent, mostly)
+   * writes the bare name. Only personas with a role in this guild count, as
+   * for a role mention. Case-insensitive; where one name starts another the
+   * longest wins, and a name that runs on into more of a word, or follows one
+   * (an address), is not a mention.
+   */
+  namedIn(guildId: string, content: string): string[] {
+    const pool = this.guilds.get(guildId);
+    if (!pool || !content.includes('@')) return [];
+    const names = [...pool.byPersona]
+      .map(([personaId, roleId]) => ({
+        personaId,
+        name: (pool.names.get(roleId) ?? '').slice(this.prefix.length).toLowerCase(),
+      }))
+      .filter((n) => n.name)
+      .sort((a, b) => b.name.length - a.name.length);
+    const text = content.toLowerCase();
+    const found = new Set<string>();
+    for (let at = text.indexOf('@'); at !== -1; at = text.indexOf('@', at + 1)) {
+      if (at > 0 && NAME_CHAR.test(text[at - 1])) continue;
+      const hit = names.find(
+        (n) => text.startsWith(n.name, at + 1) && !NAME_CHAR.test(text[at + 1 + n.name.length] ?? ''),
+      );
+      if (hit) found.add(hit.personaId);
+    }
+    return [...found];
   }
 
   /** All guild→role bindings for a persona (for the Persona view). */
