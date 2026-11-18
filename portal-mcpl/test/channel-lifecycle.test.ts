@@ -929,6 +929,37 @@ test('a catch-up wake names the thread of each message in one, and says to pass 
   assert.ok(wakes[0].content.includes('send_message with the channel as channelId and the thread as threadId'), wakes[0].content);
 });
 
+test("a catch-up wake's origin carries the newest ping's author and the count, as a live push's does, so the host's invitation names them", async () => {
+  // The host's closed-channel invitation reads origin.authorName ("Someone"
+  // without one) and origin.missedMessages; a catch-up gave it neither.
+  const client = clientWithChannel();
+  const agent = new PortalAgent(client, { hostOwnsChannelLifecycle: true });
+  const older = message('m1', '2026-01-01T00:00:00Z');
+  const newest = { ...message('m2', '2026-01-01T00:01:00Z'), author: { kind: 'user' as const, userId: 'u2', username: 'alice', displayName: 'Alice', bot: false } };
+  (agent as unknown as { pendingPingsFromRelay(): Promise<unknown> }).pendingPingsFromRelay = async () => [
+    { message: newest, reasons: ['mention'], at: newest.createdAt },
+    { message: older, reasons: ['mention'], at: older.createdAt },
+  ];
+  const server = new PortalMcplServer(client, agent);
+  const pushes: Array<{ method: string; params: unknown }> = [];
+  const internal = server as unknown as {
+    conn: { sendRequest(method: string, params: unknown): Promise<unknown>; sendNotification(): void };
+    catchUp(): Promise<void>;
+  };
+  internal.conn = { async sendRequest(method, params) { pushes.push({ method, params }); return {}; }, sendNotification() {} };
+  grant(server);
+  await internal.catchUp();
+  assert.equal(pushes.length, 1);
+  const origin = (pushes[0].params as { origin: Record<string, unknown> }).origin;
+  assert.equal(origin.messageId, 'm2', 'the newest ping, as before');
+  assert.equal(origin.authorName, 'Alice');
+  assert.equal(origin.authorId, 'u2');
+  assert.ok(String(origin.channelName).startsWith(`#${channel.name}`), String(origin.channelName));
+  assert.equal(origin.guildId, channel.guildId);
+  assert.equal(origin.missedMessages, 2);
+  assert.equal(origin.catchup, true);
+});
+
 test("the voice_join tool in host mode lists its channel in the client, and leaves the durable state alone", async () => {
   // The relay subscribes the session as it joins (issue #77), so the tool goes
   // through voiceJoin(), whose channel joins the list a reconnect restores.
