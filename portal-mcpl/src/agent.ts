@@ -6,7 +6,9 @@
  * read-state is AgentState's; this class is the glue + the tool dispatch table.
  *
  * The remaining integration seam is binding this to an McplConnection (from
- * @animalabs/mcpl-core): forward tools/list → `toolDefinitions`, tools/call →
+ * @animalabs/mcpl-core): forward tools/list → `agent.tools` (the surface this
+ * agent serves: `toolDefinitions` less what the host retires, plus the digest
+ * view's `fetch_message` and `view`/`words` when it is on), tools/call →
  * `handleToolCall`, and emit a PUSH_EVENT whenever `onPing` fires. That binding
  * is intentionally not done here so this package stays transport-agnostic and
  * unit-testable. See README for the ~30-line adapter sketch.
@@ -23,7 +25,8 @@ import {
   type ResolveResult,
 } from './channel-names.js';
 import { chunkText } from './chunk.js';
-import { toolDefinitions } from './tools.js';
+import { digestToolDefinitions, toolDefinitions, withDigestView } from './tools.js';
+import { DigestIndex, RecentIds, checkedWords, digestMessages } from './digest.js';
 import { resolveOutgoingFiles, type ResolveFilesOptions } from './files.js';
 
 /**
@@ -47,9 +50,27 @@ const RETIRED_WHEN_HOST_OWNS_CHANNELS: Readonly<Record<string, string>> = {
     'own channel tools, such as channel_open and channel_close.',
 };
 
+const DIGEST_NOTE =
+  'Numbered oldest first; times are UTC (month-day hour:minute). ids[N-1] is the relay id of #N: use it to react, ' +
+  'reply, edit, or page from that message. A line ending "(+N words, full: ID)" or "(+N chars, full: ID)" was cut: ' +
+  'fetch_message with that ID reads the message from the relay now, so it shows edits and reactions as they are, and ' +
+  'says so if the message is gone or you can no longer read it. A line with no cut marker is the whole message and ' +
+  'keeps its own line breaks. Lines marked ★ are whole because they are addressed to you (★to-you) or are what an ' +
+  'addressed message replies to (★replied-to).';
+
+/** PORTAL_DIGEST_VIEW=1 (or true) turns the digest view on at this server. Anything else leaves it off. */
+function digestViewFromEnv(): boolean {
+  const v = process.env.PORTAL_DIGEST_VIEW?.trim().toLowerCase();
+  return v === '1' || v === 'true';
+}
+
 export interface PortalAgentOptions {
   /** Restore persisted read-state (watermarks + pings). */
   state?: AgentState;
+  /** The digest view (portal#79): `view: "digest"` and `words` on fetch_history and fetch_around, and fetch_message.
+   *  Off by default, and then none of it is served and a call that asks for it is refused. Left out, it follows
+   *  PORTAL_DIGEST_VIEW; an explicit value here wins over the environment. */
+  digestView?: boolean;
   /** Called when a new message is addressed to this persona — wire to a push. */
   onPing?: (ping: PendingPing) => void;
   /** The surrounding MCPL host owns open/close state in Chronicle. This
@@ -69,6 +90,11 @@ export class PortalAgent {
   private hostOwnsChannelLifecycle: boolean;
   private fileOpts: ResolveFilesOptions;
   private onPublicActivity?: (kind: 'message' | 'reaction' | 'edit') => void;
+  private readonly digestView: boolean;
+  /** Where the messages a digest showed live, for fetch_message to read again. No content. */
+  private readonly digestIndex = new DigestIndex();
+  /** Relay ids of messages this persona wrote that this process has seen: what it sent, and what a digest showed. */
+  private readonly ownMessageIds = new RecentIds();
 
   constructor(
     private client: PortalClient,
@@ -79,6 +105,7 @@ export class PortalAgent {
     this.hostOwnsChannelLifecycle = opts.hostOwnsChannelLifecycle === true;
     this.fileOpts = opts.files ?? {};
     this.onPublicActivity = opts.onPublicActivity;
+    this.digestView = opts.digestView ?? digestViewFromEnv();
     this.client.on('message', (e) => this.ingest(e.message, e.addressedToMe, e.reasons));
     this.client.on('messageUpdate', (e) => {
       // An edit to a message we track refreshes its preview but isn't a new ping.
@@ -123,8 +150,56 @@ export class PortalAgent {
   }
 
   get tools(): typeof toolDefinitions {
-    if (!this.hostOwnsChannelLifecycle) return toolDefinitions;
-    return toolDefinitions.filter((tool) => !Object.hasOwn(RETIRED_WHEN_HOST_OWNS_CHANNELS, tool.name));
+    const base = toolDefinitions.filter(
+      (tool) => !(this.hostOwnsChannelLifecycle && Object.hasOwn(RETIRED_WHEN_HOST_OWNS_CHANNELS, tool.name)),
+    );
+    if (!this.digestView) return base;
+    return [...base.map(withDigestView), ...digestToolDefinitions];
+  }
+
+  /** While the digest view is off, a call that asks for any of it is refused before a fetch, a channel lookup or
+   *  anything else runs, and says how to turn it on. It is never answered with the full messages instead, which
+   *  would let an agent believe it had a view this server does not offer. */
+  private refuseDigestWhileOff(name: string, args: Record<string, unknown>): void {
+    if (this.digestView) return;
+    const given = (v: unknown): boolean => v !== undefined && v !== null;
+    if (name === 'fetch_message') {
+      throw new Error(
+        'Nothing ran: fetch_message is not enabled on this server, because it reads messages a digest view has shown ' +
+          'and the digest view is off. Whoever runs this server turns it on with PORTAL_DIGEST_VIEW=1.',
+      );
+    }
+    if ((name === 'fetch_history' || name === 'fetch_around') && (given(args.view) || given(args.words))) {
+      throw new Error(
+        `Nothing ran: the digest view is not enabled on this server, so view and words are not options here and ${name} ` +
+          'was not called. Call it without them for the full messages. Whoever runs this server turns the view on with ' +
+          'PORTAL_DIGEST_VIEW=1.',
+      );
+    }
+  }
+
+  /** With the view on: whether this fetch asks for the digest, and its word limit, checked before anything is fetched. */
+  private digestRequest(args: Record<string, unknown>): { digest: boolean; words?: number } {
+    const view = args.view === undefined || args.view === null ? 'full' : args.view;
+    if (view !== 'full' && view !== 'digest') {
+      throw new Error(`Nothing ran: view must be "full" or "digest" when given, got ${shortJson(view)}.`);
+    }
+    const words = optNum(args.words, 'words');
+    if (view === 'full') {
+      if (words !== undefined) throw new Error('Nothing ran: words only applies to view "digest".');
+      return { digest: false };
+    }
+    return { digest: true, words: checkedWords(words) };
+  }
+
+  /** The digest of a fetch's messages, and the cache `fetch_message` reads them back from. */
+  private digestOf(messages: readonly PortalMessage[], words: number | undefined): unknown {
+    const self = this.client.personaId;
+    const { lines, ids, ordered } = digestMessages(messages, { words, selfPersonaId: self, ownMessageIds: this.ownMessageIds });
+    // Oldest first, so that past the bound it is the oldest ids that are forgotten, whatever order the relay returned them in.
+    for (const m of ordered) if (m.author.kind === 'persona' && m.author.personaId === self) this.ownMessageIds.add(m.id);
+    this.digestIndex.put(ordered);
+    return { view: 'digest', count: lines.length, note: DIGEST_NOTE, ids, lines };
   }
 
   /** Server-authoritative pending pings, including any accrued while this
@@ -180,9 +255,10 @@ export class PortalAgent {
     if (this.hostOwnsChannelLifecycle && Object.hasOwn(RETIRED_WHEN_HOST_OWNS_CHANNELS, name)) {
       throw new Error(RETIRED_WHEN_HOST_OWNS_CHANNELS[name]);
     }
-    if (!toolDefinitions.some((tool) => tool.name === name)) {
+    if (!toolDefinitions.some((tool) => tool.name === name) && !digestToolDefinitions.some((tool) => tool.name === name)) {
       throw new Error(unknownToolMessage(name));
     }
+    this.refuseDigestWhileOff(name, args);
     // THE chokepoint for channel addressing: every tool that takes a channelId
     // goes through here, so a name is resolved exactly once, before any side
     // effect, or the call fails audibly — never a silent pick, never a name
@@ -262,7 +338,10 @@ export class PortalAgent {
             );
           }
           const id = (result as { messageId?: unknown } | undefined)?.messageId;
-          if (typeof id === 'string') posted.push(id);
+          if (typeof id === 'string') {
+            posted.push(id);
+            this.ownMessageIds.add(id);
+          }
           first ??= result;
         }
         this.onPublicActivity?.('message');
@@ -287,21 +366,55 @@ export class PortalAgent {
       }
       case 'unreact':
         return this.client.unreact(str(args.messageId, 'messageId'), str(args.emoji, 'emoji'), optBool(args.native, 'native') ?? false);
-      case 'fetch_history':
-        return this.client.fetchHistory({
+      case 'fetch_history': {
+        const mode = this.digestRequest(args);
+        const history = await this.client.fetchHistory({
           channelId: str(args.channelId, 'channelId'),
           threadId: optStr(args.threadId, 'threadId'),
           limit: optNum(args.limit, 'limit'),
           before: optStr(args.before, 'before'),
           after: optStr(args.after, 'after'),
         });
-      case 'fetch_around':
-        return this.fetchAround(
+        return mode.digest ? this.digestOf(history.messages, mode.words) : history;
+      }
+      case 'fetch_around': {
+        const mode = this.digestRequest(args);
+        const around = await this.fetchAround(
           str(args.channelId, 'channelId'),
           str(args.messageId, 'messageId'),
           optNum(args.limit, 'limit') ?? 50,
           optStr(args.threadId, 'threadId'),
         );
+        return mode.digest ? this.digestOf(around.messages, mode.words) : around;
+      }
+      case 'fetch_message': {
+        const ref = str(args.messageId, 'messageId');
+        const place = this.digestIndex.get(ref);
+        if (!place) {
+          throw new Error(
+            `Nothing ran: ${shortJson(ref)} isn't one this server has shown in a digest. It remembers where the last ${this.digestIndex.capacity} ` +
+              'messages a digest showed are, and starts empty after a restart. Fetch it again with fetch_history or fetch_around.',
+          );
+        }
+        // A live read, so what comes back is what the relay says now: edits and reactions as they are, and a refusal
+        // if the agent can no longer read the channel. `before` is an exclusive snowflake cursor and history pages
+        // newest-first, so the first message before the snowflake plus one is this message if it still exists.
+        if (!/^\d+$/.test(place.nativeId)) throw new Error(`Nothing ran: ${shortJson(ref)} has no snowflake to read it by. Fetch it again with fetch_history.`);
+        const page = await this.client.fetchHistory({
+          channelId: place.channelId,
+          threadId: place.threadId,
+          before: String(BigInt(place.nativeId) + 1n),
+          limit: 1,
+        });
+        const found = page.messages[0];
+        if (!found || found.nativeId !== place.nativeId) {
+          throw new Error(
+            `Nothing ran: ${shortJson(ref)} is no longer there: it was deleted, or you can no longer read it. ` +
+              'fetch_history shows what the channel holds now.',
+          );
+        }
+        return { message: found };
+      }
       case 'list_guilds':
         return this.client.call('list_guilds', {});
       case 'list_channels': {

@@ -16,7 +16,7 @@
  */
 import type { TagOntology, TreatmentRule } from '@animalabs/mcpl-core';
 import type { CapabilityPath } from './policy.js';
-import { toolDefinitions } from './tools.js';
+import { digestToolDefinitions, toolDefinitions } from './tools.js';
 
 /**
  * RFC-001 rev 2 §5.1 renamed the ontology's rule list `defaultTreatment` →
@@ -146,6 +146,7 @@ export const TOOL_FEATURE_SETS: Readonly<Record<string, string>> = {
 
   fetch_history: 'portal.history',
   fetch_around: 'portal.history',
+  fetch_message: 'portal.history',
   list_pins: 'portal.history',
 
   voice_join: 'portal.voice',
@@ -165,7 +166,7 @@ export const TOOL_FEATURE_SETS: Readonly<Record<string, string>> = {
 export function toolFeatureSetCoverage(): { unmapped: string[]; unknownSets: string[] } {
   const declared = new Set(Object.keys(featureSets));
   return {
-    unmapped: toolDefinitions.map((t) => t.name).filter((name) => !Object.hasOwn(TOOL_FEATURE_SETS, name)),
+    unmapped: [...toolDefinitions, ...digestToolDefinitions].map((t) => t.name).filter((name) => !Object.hasOwn(TOOL_FEATURE_SETS, name)),
     unknownSets: Object.values(TOOL_FEATURE_SETS).filter((name) => !declared.has(name)),
   };
 }
