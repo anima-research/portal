@@ -3,11 +3,14 @@ import assert from 'node:assert/strict';
 import { DiscordBot } from '../src/discord-bot.js';
 
 // fetchHistory against a fake channel that serves pages the way Discord's
-// REST endpoint does (issue #91). The fake encodes the documented semantics:
-// every page is returned newest-first; `before` selects the newest messages
-// below the cursor; `after` selects the OLDEST messages above the cursor
-// (that is what makes forward pagination possible). Not run against live
-// Discord; the live boundary is discord.js's `messages.fetch`.
+// REST endpoint does (issues #91/#98). The fake encodes the documented
+// semantics: every page is returned newest-first; `before` selects the
+// newest messages below the cursor; `after` selects the OLDEST messages
+// above the cursor (that is what makes forward pagination possible) — but
+// the bot walks forward only when the caller opted in via the `forward`
+// flag (`direction: 'forward'` on the wire); without it an `after`-only
+// call keeps its pre-v6 meaning, the newest page above the cursor. Not run
+// against live Discord; the live boundary is discord.js's `messages.fetch`.
 
 type FetchOpts = { limit: number; before?: string; after?: string };
 
@@ -49,27 +52,41 @@ const idsOf = (msgs: Array<{ id: string }>) => msgs.map((m) => m.id);
 const range = (lo: number, hi: number) =>
   Array.from({ length: hi - lo + 1 }, (_, i) => String(lo + i));
 
-test('after without before returns the messages just after the cursor, newest-first', async () => {
+test('forward: after-only with the forward flag returns the messages just after the cursor, newest-first', async () => {
+  const bot = botOver(range(101, 140));
+  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 5, undefined, '110', true);
+  assert.deepEqual(idsOf(got), ['115', '114', '113', '112', '111']);
+});
+
+test('after-only WITHOUT the forward flag keeps the pre-v6 contract: the newest page above the cursor (#98)', async () => {
   const bot = botOver(range(101, 140));
   const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 5, undefined, '110');
-  assert.deepEqual(idsOf(got), ['115', '114', '113', '112', '111']);
+  assert.deepEqual(idsOf(got), ['140', '139', '138', '137', '136']);
+});
+
+test('after-only without the forward flag honors the cursor as a stop across page boundaries', async () => {
+  const bot = botOver(range(1001, 1220));
+  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 150, undefined, '1100');
+  // The newest 120 above the cursor — the walk stops at the cursor, not at
+  // the limit, exactly as every pre-v6 consumer expects.
+  assert.deepEqual(idsOf(got), range(1101, 1220).reverse());
 });
 
 test('after with fewer than limit remaining returns all of them', async () => {
   const bot = botOver(range(101, 140));
-  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 5, undefined, '138');
+  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 5, undefined, '138', true);
   assert.deepEqual(idsOf(got), ['140', '139']);
 });
 
 test('after at the newest message returns empty', async () => {
   const bot = botOver(range(101, 140));
-  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 5, undefined, '140');
+  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 5, undefined, '140', true);
   assert.deepEqual(idsOf(got), []);
 });
 
 test('forward paging crosses the 100-message page boundary', async () => {
   const bot = botOver(range(1001, 1220));
-  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 150, undefined, '1010');
+  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 150, undefined, '1010', true);
   // The whole window, not endpoints and a count (review finding 5): the
   // 150 ids just after the cursor, descending, no gaps or duplicates.
   assert.deepEqual(idsOf(got), range(1011, 1160).reverse());
@@ -104,7 +121,7 @@ test('adjacent snowflake-width ids stay distinct (no Number collapse)', async ()
   // the former must still admit the latter.
   const ids = ['1000000000000000000', '1000000000000000001', '1000000000000000002'];
   const bot = botOver(ids);
-  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 5, undefined, '1000000000000000000');
+  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 5, undefined, '1000000000000000000', true);
   assert.deepEqual(idsOf(got), ['1000000000000000002', '1000000000000000001']);
 });
 
@@ -112,6 +129,6 @@ test('a digit-length boundary does not reorder the walk', async () => {
   // 95..105 cross the two-to-three-digit boundary, where a lexicographic
   // sort would interleave ('100' < '95' as strings).
   const bot = botOver(range(95, 105));
-  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 4, undefined, '98');
+  const got = await DiscordBot.prototype.fetchHistory.call(bot, 'c', 4, undefined, '98', true);
   assert.deepEqual(idsOf(got), ['102', '101', '100', '99']);
 });

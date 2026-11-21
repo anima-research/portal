@@ -903,11 +903,15 @@ export class DiscordBot implements WebhookOps, RoleOps {
     limit: number,
     before?: string,
     after?: string,
+    forward = false,
   ): Promise<IncomingMessage[]> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('messages' in channel)) throw new Error(`Channel ${channelId} not found`);
-    if (after && !before) {
-      // Scroll FORWARD from the cursor (issue #91). Discord's `after` fetch
+    if (forward && after && !before) {
+      // Scroll FORWARD from the cursor (issue #91), only when the caller
+      // opted in via `direction: 'forward'` (portal#98 — an `after`-only
+      // call without it keeps the pre-v6 newest-first meaning that every
+      // older consumer was written against). Discord's `after` fetch
       // option serves the oldest messages above the id, so advancing the
       // cursor to each page's max id walks chronologically. Collect
       // ascending, return newest-first — the order every other call returns.
