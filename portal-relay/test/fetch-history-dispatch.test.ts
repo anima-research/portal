@@ -113,6 +113,29 @@ test('direction is ignored when before is present (the bounded window never echo
   } finally { h.cleanup(); }
 });
 
+test('direction with NO after serves the plain newest page and does not echo (the gate needs a cursor)', async () => {
+  const h = makeRelay();
+  try {
+    const got = await h.rpc('fetch_history', { channelId: CHAN, limit: 5, direction: 'forward' });
+    assert.deepEqual(contents(got), ['m40', 'm39', 'm38', 'm37', 'm36']);
+    assert.equal('forward' in got, false, 'no echo without a cursor to walk from');
+    assert.equal(h.botCalls[0]?.forward, false);
+  } finally { h.cleanup(); }
+});
+
+test('direction with an undecodable after serves the bare newest page and does not echo', async () => {
+  // cursorToSnowflake answers undefined for a cursor that is neither a known
+  // relay id nor digits; the gate's !!after must then refuse the forward
+  // walk rather than echo a walk it cannot anchor (second-read finding 1).
+  const h = makeRelay();
+  try {
+    const got = await h.rpc('fetch_history', { channelId: CHAN, after: 'not-a-cursor', limit: 5, direction: 'forward' });
+    assert.deepEqual(contents(got), ['m40', 'm39', 'm38', 'm37', 'm36']);
+    assert.equal('forward' in got, false, 'no echo on an unanchored walk');
+    assert.equal(h.botCalls[0]?.forward, false);
+  } finally { h.cleanup(); }
+});
+
 test('a relay id handed back by one call decodes as the cursor of the next (both cursor forms)', async () => {
   const h = makeRelay();
   try {
