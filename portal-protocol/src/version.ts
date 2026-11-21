@@ -18,6 +18,11 @@
 // v5: additive voice output (RFC-006 §1.4) — `voice_speak` RPC, `voice_receipt`
 // event, `VOICE_SPEAK` capability. Same contract: older clients never call it
 // and ignore the unknown event type; the relay accepts lower client versions.
-export const PORTAL_PROTOCOL_VERSION = 5 as const;
+// v6 (portal#98): additive `direction: 'forward'` on `fetch_history`, echoed as
+// `forward: true` in the result when served. An `after`-only call WITHOUT the
+// field keeps its pre-v6 meaning (the newest `limit` above the cursor), so
+// older clients see no change; older relays ignore the field and never echo,
+// so newer clients detect them by the missing echo and fall back.
+export const PORTAL_PROTOCOL_VERSION = 6 as const;
 
 export type ProtocolVersion = typeof PORTAL_PROTOCOL_VERSION;

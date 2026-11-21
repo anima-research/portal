@@ -97,12 +97,36 @@ export interface FetchHistoryParams {
   limit?: number;
   /** Bounding cursors (exclusive). Each accepts **either** a RelayMessageId
    *  **or** a raw Discord snowflake — so a migrating bot can page using
-   *  snowflakes it already persisted without first obtaining a relay id. */
+   *  snowflakes it already persisted without first obtaining a relay id.
+   *
+   *  Which page a call selects (results are ALWAYS newest-first):
+   *  - `before` only, or neither: the newest `limit` below the cursor (or
+   *    the newest `limit` overall).
+   *  - both cursors: the newest `limit` inside the window.
+   *  - `after` only: the newest `limit` above the cursor — unless the call
+   *    opts into the forward walk with `direction` (below). */
   before?: RelayMessageId | string;
   after?: RelayMessageId | string;
+  /** The forward walk (protocol v6, portal#98): on an `after`-only call,
+   *  `direction: 'forward'` makes the relay serve the OLDEST `limit`
+   *  messages above the cursor instead of the newest, so a reader can page
+   *  chronologically by advancing the cursor to each result's max id. The
+   *  relay echoes `forward: true` in the result exactly when it served this
+   *  walk. A relay that predates v6 ignores the field and never echoes, so
+   *  a caller that NEEDS forward pagination must check the echo and fall
+   *  back to bounded `before`+`after` pages (which mean the same thing on
+   *  every relay version). Ignored when `before` is present or `after` is
+   *  absent. */
+  direction?: 'forward';
 }
 export interface FetchHistoryResult {
   messages: PortalMessage[];
+  /** Echoed as `true` exactly when the relay served the forward walk (an
+   *  `after`-only call carrying `direction: 'forward'`, protocol ≥6).
+   *  Absent on every other path and on older relays — its absence after a
+   *  `direction: 'forward'` request means the messages follow the pre-v6
+   *  newest-first contract. */
+  forward?: true;
 }
 
 /** Directory reads are capability-filtered like `ready` (portal#27): guilds
