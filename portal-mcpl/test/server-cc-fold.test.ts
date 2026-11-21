@@ -87,8 +87,12 @@ function relayClient(opts: RelayOpts) {
         const byId = newestFirst.findIndex((m) => m.id === p.after);
         if (byId >= 0) newestFirst = newestFirst.slice(0, byId);
         else {
+          // A sinceCursor snowflake has zero low bits; a real message in the
+          // SAME millisecond has nonzero low bits and sorts above it, so the
+          // real relay serves it. `>=` is the faithful encoding (the strict
+          // `>` here hid the same-ms class from every test — #98 round 2).
           const ms = snowMs(p.after);
-          newestFirst = newestFirst.filter((m) => Date.parse(m.createdAt) > ms);
+          newestFirst = newestFirst.filter((m) => Date.parse(m.createdAt) >= ms);
         }
       }
       const forwardServed =
@@ -272,6 +276,38 @@ test('a full page straddling the ceiling ends the walk without one more REST cal
   }).pageWindow({ client: r.client }, B, undefined, S(0), S(150)))!;
   assert.equal(got.length, 150, 'the whole window, nothing beyond it');
   assert.equal(r.fetches.length, 2, 'the straddling page is the last call');
+});
+
+test('a message in the same millisecond as the watermark stays unshown (pins the CURRENT contract; portal#100 tracks whether it should change)', async () => {
+  // The watermark is S(5); 'twin' was written in that same millisecond after
+  // the mark was taken. The relay SERVES it (sinceCursor has zero low bits,
+  // a real id in the same ms sorts above it) and pageWindow's exclusive
+  // `> since` filter drops it — so it is neither shown nor marked past.
+  // This pin makes that boundary VISIBLE: a `>=` mutant shows the twin and
+  // goes red here, instead of silently changing the #100 edge.
+  const twin = msg('btwin', B, S(5));
+  const backlog = Array.from({ length: 20 }, (_, i) => msg(`b${i + 6}`, B, S(i + 6)));
+  const r = relayClient({ messages: [twin, ...backlog, msg('a1', A, S(0))], watermarks: { [B]: S(5) } });
+  const h = serverFor(r.client, { cap: 100 });
+  ping(r.client, msg('a99', A, S(99), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b/.test(id));
+  assert.ok(!shown.includes('btwin'), 'the same-ms twin is not folded (the #100 edge, unchanged)');
+  assert.deepEqual(shown, backlog.map((m) => m.id), 'everything above the watermark millisecond folds');
+});
+
+test('the backward fallback folds exactly FOLD_BOUND whole, like the forward walk (review r2)', async () => {
+  const backlog = Array.from({ length: 500 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)));
+  const r = relayClient({ relay: 'v5', messages: [...backlog, msg('a1', A, S(0))], watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 1000 });
+  ping(r.client, msg('a99', A, S(600), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  assert.equal(shown.length, 500, 'exactly FOLD_BOUND folds through the fallback too');
+  assert.ok(!h.wakes[0].content.includes('more than a wake folds'));
+  assert.equal(r.marked.find((m) => m.channelId === B)!.uptoCreatedAt, S(500));
 });
 
 test('exactly FOLD_BOUND missed messages fold whole (the bound is inclusive)', async () => {
