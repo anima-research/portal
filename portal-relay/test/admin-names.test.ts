@@ -192,3 +192,25 @@ test('names: a source that throws synchronously frees its slot and stays retryab
   assert.equal(b.get('x')!.name, 'ok');
   assert.equal(b.get('y')!.name, 'ok');
 });
+
+test('names: a categorized channel does not spend REST budget chasing its category (#99 r1-2)', async () => {
+  // Since #95 every channel may carry a parentId (its category heading);
+  // labelOf attaches parentName only for threads, so fetching a category
+  // here would cost one uncached REST lookup per categorized channel —
+  // from the budget every persona shares, against the per-request deadline
+  // — for a label nothing renders. Reverting the second pass's thread-only
+  // guard is exactly that bug.
+  const cat = (id: string, name: string, parentId: string): ChannelMeta =>
+    ({ id, name, type: 'text', guildId: 'G1', parentId, isThread: false });
+  const s = source([], { c1: cat('c1', 'filed-general', 'cat9'), cat9: text('cat9', 'ARCHIVE') });
+  const r = new ChannelNameResolver(s.src);
+  const out = await r.resolve(['c1']);
+  assert.equal(out.get('c1')!.name, 'filed-general');
+  assert.deepEqual(s.calls, ['c1'], 'the channel is fetched; its category is not');
+  // The thread case still chases the parent (the label needs it).
+  const s2 = source([], { t1: thread('t1', 'notes', 'c9'), c9: text('c9', 'general') });
+  const r2 = new ChannelNameResolver(s2.src);
+  const out2 = await r2.resolve(['t1']);
+  assert.equal(out2.get('t1')!.parentName, 'general');
+  assert.deepEqual(s2.calls, ['t1', 'c9']);
+});

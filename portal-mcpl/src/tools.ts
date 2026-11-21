@@ -218,7 +218,11 @@ const definitions: ToolDefinition[] = [
   },
   {
     name: 'list_channels',
-    description: 'List channels in a guild, with your effective capabilities in each.',
+    description:
+      'List channels in a guild, with your effective capabilities in each. ' +
+      "An entry's parentId is a thread's channel, or a channel's category " +
+      '(joined as `category` when you can see it; the category may be absent ' +
+      'from the list if you hold nothing there).',
     inputSchema: {
       type: 'object',
       properties: { guildId: { type: 'string' } },
