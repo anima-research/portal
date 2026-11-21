@@ -19,6 +19,7 @@ export interface HistoryPage {
   limit: number;
   before?: string;
   after?: string;
+  forward?: boolean;
 }
 
 interface Read {
@@ -40,7 +41,10 @@ export class HistoryCache {
   }
 
   private key(page: HistoryPage): string {
-    return `${page.channelId}|${page.limit}|${page.before ?? ''}|${page.after ?? ''}`;
+    // `forward` is part of the key: the same (channel, limit, after) names
+    // two different pages depending on the walk (portal#98), and serving one
+    // as the other would silently hand a consumer the wrong end of history.
+    return `${page.channelId}|${page.limit}|${page.before ?? ''}|${page.after ?? ''}|${page.forward ? 'f' : ''}`;
   }
 
   async read(page: HistoryPage, fetch: () => Promise<IncomingMessage[]>): Promise<IncomingMessage[]> {
