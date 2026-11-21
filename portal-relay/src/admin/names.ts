@@ -20,7 +20,10 @@ export interface ChannelLabel {
   name: string | null;
   type?: ChannelMeta['type'];
   guildId?: string | null;
-  /** Threads: the parent channel, so a thread reads `#parent › thread`. */
+  /** A thread's parent channel (so it reads `#parent › thread`), or — from
+   *  the producers that pass metaOf/the fallback through since portal#95 —
+   *  a channel's category heading. The resolver's own labelOf fills it for
+   *  threads only; the SPA renders by `type`, so both shapes are safe. */
   parentId?: string;
   parentName?: string | null;
   archived?: boolean;
@@ -140,11 +143,15 @@ export class ChannelNameResolver {
     const got = new Map<string, Found>();
     const budget = { left: this.maxPerRequest };
     await this.settle(wanted, deadline, got, budget);
-    // Second pass: parents of threads (nearly always cached — they're live channels).
+    // Second pass: parents of THREADS only (nearly always cached — they're
+    // live channels). Since #95 every channel may carry a parentId (its
+    // category), but labelOf attaches parentName only for threads, so
+    // chasing category ids here would spend REST budget on labels nobody
+    // reads.
     const parents = new Set<string>();
     for (const id of wanted) {
       const m = got.get(id);
-      if (isMeta(m) && m.parentId) parents.add(m.parentId);
+      if (isMeta(m) && m.isThread && m.parentId) parents.add(m.parentId);
     }
     if (parents.size) await this.settle([...parents], deadline, got, budget);
 

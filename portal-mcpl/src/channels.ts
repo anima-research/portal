@@ -3,7 +3,8 @@
  *
  * Relay channel ids are Discord channel snowflakes (globally unique), so the
  * MCPL channel id is just `portal:<channelId>` — no guild prefix needed.
- * Threads carry their parent id in metadata.
+ * Threads carry their parent channel id in metadata, and (since portal#95)
+ * every categorized channel carries its category heading's id the same way.
  */
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import type { PortalChannel } from '@animalabs/portal-protocol';
