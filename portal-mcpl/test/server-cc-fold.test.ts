@@ -37,6 +37,11 @@ function msg(id: string, channelId: string, at: string, opts: { content?: string
 interface RelayOpts {
   personaId?: string;
   messages: PortalMessage[];
+  /** 'v5' = a relay that predates `direction` (portal#98): an `after`-only
+   *  call serves the NEWEST page above the cursor, `direction` is an unknown
+   *  param it ignores, and no `forward` echo ever comes back. Default is the
+   *  current contract. */
+  relay?: 'v5';
   watermarks?: Record<string, string>;
   pings?: PortalMessage[];
   /** Block list_unread until this resolves (to hold a wake mid-flight). */
@@ -59,8 +64,18 @@ function relayClient(opts: RelayOpts) {
     store.filter((m) => m.channelId === channelId && (!watermarks[channelId] || m.createdAt > watermarks[channelId]))
       .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
   Object.assign(client, {
-    async fetchHistory(p: { channelId: string; threadId?: string; limit?: number; before?: string }) {
+    async fetchHistory(p: { channelId: string; threadId?: string; limit?: number; before?: string; after?: string; direction?: 'forward' }) {
       fetches.push({ channelId: p.channelId, threadId: p.threadId });
+      // The relay's paging contract (#91/#98): before-only and bare calls
+      // serve the newest page below the cursor; an after-only call serves
+      // the newest page ABOVE it unless the caller opts into the forward
+      // walk with `direction: 'forward'`, which serves the OLDEST page
+      // above the cursor and is echoed back as `forward: true`. A v5 relay
+      // ignores `direction` and never echoes. Both cursors bound a window
+      // from the top. An `after` cursor is a message id when it names one,
+      // else a snowflake whose timestamp is the bound (sinceCursor builds
+      // those).
+      const snowMs = (snow: string) => Number((BigInt(snow) >> 22n) + 1420070400000n);
       let newestFirst = store
         .filter((m) => m.channelId === p.channelId && (p.threadId ? m.threadId === p.threadId : !m.threadId))
         .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
@@ -68,7 +83,24 @@ function relayClient(opts: RelayOpts) {
         const idx = newestFirst.findIndex((m) => m.id === p.before);
         newestFirst = idx >= 0 ? newestFirst.slice(idx + 1) : [];
       }
-      return { messages: newestFirst.slice(0, p.limit ?? 50) };
+      if (p.after) {
+        const byId = newestFirst.findIndex((m) => m.id === p.after);
+        if (byId >= 0) newestFirst = newestFirst.slice(0, byId);
+        else {
+          // A sinceCursor snowflake has zero low bits; a real message in the
+          // SAME millisecond has nonzero low bits and sorts above it, so the
+          // real relay serves it. `>=` is the faithful encoding (the strict
+          // `>` here hid the same-ms class from every test — #98 round 2).
+          const ms = snowMs(p.after);
+          newestFirst = newestFirst.filter((m) => Date.parse(m.createdAt) >= ms);
+        }
+      }
+      const forwardServed =
+        !!p.after && !p.before && opts.relay !== 'v5' && p.direction === 'forward';
+      const slice = forwardServed
+        ? newestFirst.slice(-(p.limit ?? 50)) // oldest page above the cursor
+        : newestFirst.slice(0, p.limit ?? 50);
+      return { messages: slice, ...(forwardServed ? { forward: true as const } : {}) };
     },
     async call(method: string, params: Record<string, unknown>) {
       switch (method) {
@@ -164,6 +196,152 @@ test('a live message newer than an unseen gap does not move the watermark past t
   await h.settle();
   const next = shownIds(h.wakes[1].content).filter((id) => /^b\d+$/.test(id));
   assert.equal(next[0], `b${Number(lastPrefix.id.slice(1)) + 1}`);
+});
+
+test('a backlog wider than one relay page is fetched whole, oldest first (#98 blocker)', async () => {
+  // 150 missed with FOLD_PAGE = 100 forces a second forward page. Before
+  // the fix, the walk's after-only first call took the oldest 100 and the
+  // next `before` page above the watermark was empty, so the newest 50
+  // were never fetched — and the whole-backlog branch could mark through
+  // them.
+  const backlog = Array.from({ length: 150 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)));
+  const r = relayClient({ messages: [...backlog, msg('a1', A, S(0))], watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 400 });
+  ping(r.client, msg('a99', A, S(200), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  assert.equal(shown.length, 150, 'every missed message is folded');
+  assert.deepEqual(shown, backlog.map((m) => m.id), 'oldest first, none skipped, none duplicated');
+  const markB = r.marked.find((m) => m.channelId === B)!;
+  assert.equal(markB.uptoCreatedAt, S(150), 'marked through the newest actually shown');
+  assert.equal(markB.count, 150);
+});
+
+test('a v5 relay (after-only serves the newest page, no forward echo): the fold falls back and loses nothing', async () => {
+  // The r1 blocker turned around (review r1-1): against a relay that
+  // predates `direction`, an after-only page is the NEWEST 100 above the
+  // cursor. A walk that assumes the forward contract advances its cursor to
+  // the newest message, sees an empty page, and returns the top slice —
+  // indistinguishable from a complete window — then marks through it. The
+  // fallback must detect the missing echo and page backward instead.
+  const backlog = Array.from({ length: 150 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)));
+  const r = relayClient({ relay: 'v5', messages: [...backlog, msg('a1', A, S(0))], watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 400 });
+  ping(r.client, msg('a99', A, S(200), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  assert.equal(shown.length, 150, 'every missed message is folded despite the old relay');
+  assert.deepEqual(shown, backlog.map((m) => m.id), 'oldest first, none skipped');
+  const markB = r.marked.find((m) => m.channelId === B)!;
+  assert.equal(markB.uptoCreatedAt, S(150), 'marked only through what was shown');
+});
+
+test('a v5 relay with a live message in the same wake: the watermark never passes unseen backlog', async () => {
+  // The other direction of the same skew (review r1-1's third column): a
+  // live ambient message rides the wake, and marking through it would lose
+  // whatever the old-relay slice hid beneath.
+  const backlog = Array.from({ length: 150 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)));
+  const live = msg('b151', B, S(151));
+  const r = relayClient({ relay: 'v5', messages: [...backlog, live, msg('a1', A, S(0))], watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 400 });
+  ambient(r.client, live);
+  ping(r.client, msg('a99', A, S(200), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  const markB = r.marked.find((m) => m.channelId === B)!;
+  // Whatever was shown, the watermark may not pass backlog that never was.
+  const shownSet = new Set(shown);
+  for (const m of backlog) {
+    if (m.createdAt <= (markB.uptoCreatedAt as string)) {
+      assert.ok(shownSet.has(m.id), `marked past ${m.id} without showing it`);
+    }
+  }
+  assert.equal(shown.length, 151, 'the whole backlog and the live message are shown');
+});
+
+test('a full page straddling the ceiling ends the walk without one more REST call (review r1-6)', async () => {
+  // 250 messages, window (S(0), S(150)]: the second page (b101..b200) is
+  // full and crosses `upto`. The walk must stop THERE — its newest message
+  // is already past the ceiling, so no later page can be in-window — not
+  // fetch a third page just to see that it starts past `upto`. The walk
+  // shares the single bot's REST budget with every persona.
+  const backlog = Array.from({ length: 250 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)));
+  const r = relayClient({ messages: backlog, watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 1000 });
+  const got = (await (h.server as unknown as {
+    pageWindow(b: unknown, c: string, t: string | undefined, s: string, u: string): Promise<PortalMessage[] | null>;
+  }).pageWindow({ client: r.client }, B, undefined, S(0), S(150)))!;
+  assert.equal(got.length, 150, 'the whole window, nothing beyond it');
+  assert.equal(r.fetches.length, 2, 'the straddling page is the last call');
+});
+
+test('a message in the same millisecond as the watermark stays unshown (pins the CURRENT contract; portal#100 tracks whether it should change)', async () => {
+  // The watermark is S(5); 'twin' was written in that same millisecond after
+  // the mark was taken. The relay SERVES it (sinceCursor has zero low bits,
+  // a real id in the same ms sorts above it) and pageWindow's exclusive
+  // `> since` filter drops it — so it is neither shown nor marked past.
+  // This pin makes that boundary VISIBLE: a `>=` mutant shows the twin and
+  // goes red here, instead of silently changing the #100 edge.
+  const twin = msg('btwin', B, S(5));
+  const backlog = Array.from({ length: 20 }, (_, i) => msg(`b${i + 6}`, B, S(i + 6)));
+  const r = relayClient({ messages: [twin, ...backlog, msg('a1', A, S(0))], watermarks: { [B]: S(5) } });
+  const h = serverFor(r.client, { cap: 100 });
+  ping(r.client, msg('a99', A, S(99), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b/.test(id));
+  assert.ok(!shown.includes('btwin'), 'the same-ms twin is not folded (the #100 edge, unchanged)');
+  assert.deepEqual(shown, backlog.map((m) => m.id), 'everything above the watermark millisecond folds');
+});
+
+test('the backward fallback folds exactly FOLD_BOUND whole, like the forward walk (review r2)', async () => {
+  const backlog = Array.from({ length: 500 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)));
+  const r = relayClient({ relay: 'v5', messages: [...backlog, msg('a1', A, S(0))], watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 1000 });
+  ping(r.client, msg('a99', A, S(600), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  assert.equal(shown.length, 500, 'exactly FOLD_BOUND folds through the fallback too');
+  assert.ok(!h.wakes[0].content.includes('more than a wake folds'));
+  assert.equal(r.marked.find((m) => m.channelId === B)!.uptoCreatedAt, S(500));
+});
+
+test('exactly FOLD_BOUND missed messages fold whole (the bound is inclusive)', async () => {
+  const backlog = Array.from({ length: 500 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)));
+  const r = relayClient({ messages: [...backlog, msg('a1', A, S(0))], watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 1000 });
+  ping(r.client, msg('a99', A, S(600), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  assert.equal(shown.length, 500, 'exactly FOLD_BOUND folds, it is not refused');
+  assert.ok(!h.wakes[0].content.includes('more than a wake folds'), 'no tooMany note at the bound');
+  const markB = r.marked.find((m) => m.channelId === B)!;
+  assert.equal(markB.uptoCreatedAt, S(500));
+});
+
+test('one past FOLD_BOUND: a note, nothing shown as folded, and the watermark stays (review r1-5)', async () => {
+  const backlog = Array.from({ length: 501 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)));
+  const r = relayClient({ messages: [...backlog, msg('a1', A, S(0))], watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 1000 });
+  ping(r.client, msg('a99', A, S(600), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  assert.equal(shown.length, 0, 'a slice of an over-bound backlog is never folded');
+  assert.ok(h.wakes[0].content.includes('more than a wake folds'), 'the wake carries the tooMany note');
+  assert.equal(r.marked.find((m) => m.channelId === B), undefined, 'the watermark never moves');
+
+  // The method's own contract, not only the caller's re-check: pageWindow
+  // answers null as soon as the bound is exceeded (its doc promises it).
+  const direct = await (h.server as unknown as {
+    pageWindow(b: unknown, c: string, t: string | undefined, s: string, u: string): Promise<PortalMessage[] | null>;
+  }).pageWindow({ client: r.client }, B, undefined, S(0), S(501));
+  assert.equal(direct, null, 'pageWindow itself refuses, independent of the caller');
 });
 
 test('thread replies under a followed channel are folded (fetched by threadId), not marked read unseen', async () => {

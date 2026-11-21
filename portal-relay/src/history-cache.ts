@@ -27,13 +27,16 @@ export class HistoryCache {
     return this.ttlMs > 0;
   }
 
-  private key(channelId: string, limit: number, before?: string, after?: string): string {
-    return `${channelId}|${limit}|${before ?? ''}|${after ?? ''}`;
+  private key(channelId: string, limit: number, before?: string, after?: string, forward?: boolean): string {
+    // `forward` is part of the key: the same (channel, limit, after) names
+    // two different pages depending on the walk (portal#98), and serving one
+    // as the other would silently hand a consumer the wrong end of history.
+    return `${channelId}|${limit}|${before ?? ''}|${after ?? ''}|${forward ? 'f' : ''}`;
   }
 
-  get(channelId: string, limit: number, before?: string, after?: string): IncomingMessage[] | undefined {
+  get(channelId: string, limit: number, before?: string, after?: string, forward?: boolean): IncomingMessage[] | undefined {
     if (!this.enabled) return undefined;
-    const k = this.key(channelId, limit, before, after);
+    const k = this.key(channelId, limit, before, after, forward);
     const e = this.map.get(k);
     if (!e) return undefined;
     if (this.now() - e.at >= this.ttlMs) {
@@ -46,9 +49,9 @@ export class HistoryCache {
     return e.messages;
   }
 
-  set(channelId: string, limit: number, before: string | undefined, after: string | undefined, messages: IncomingMessage[]): void {
+  set(channelId: string, limit: number, before: string | undefined, after: string | undefined, forward: boolean | undefined, messages: IncomingMessage[]): void {
     if (!this.enabled) return;
-    this.map.set(this.key(channelId, limit, before, after), { messages, at: this.now() });
+    this.map.set(this.key(channelId, limit, before, after, forward), { messages, at: this.now() });
     while (this.map.size > this.cap) {
       const oldest = this.map.keys().next().value;
       if (oldest === undefined) break;

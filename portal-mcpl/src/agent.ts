@@ -135,7 +135,12 @@ export class PortalAgent {
   }
 
   /** Fetch a window of messages centred on `messageId` (the relay returns the
-   *  older and newer halves; the anchor itself may not be included). */
+   *  older and newer halves; the anchor itself is never included — both
+   *  cursors are exclusive (the open half of portal#91). The newer half asks
+   *  for the forward walk so it is the half NEAREST the anchor; a relay
+   *  without `direction` (portal#98) serves the newest half above it
+   *  instead, which is what every version did before the forward walk
+   *  existed. */
   private async fetchAround(
     channelId: string,
     messageId: string,
@@ -145,7 +150,7 @@ export class PortalAgent {
     const half = Math.max(1, Math.floor(limit / 2));
     const [older, newer] = await Promise.all([
       this.client.fetchHistory({ channelId, threadId, before: messageId, limit: half }),
-      this.client.fetchHistory({ channelId, threadId, after: messageId, limit: half }),
+      this.client.fetchHistory({ channelId, threadId, after: messageId, limit: half, direction: 'forward' }),
     ]);
     const seen = new Set<string>();
     const messages = [...older.messages, ...newer.messages]
@@ -287,14 +292,22 @@ export class PortalAgent {
       }
       case 'unreact':
         return this.client.unreact(str(args.messageId, 'messageId'), str(args.emoji, 'emoji'), optBool(args.native, 'native') ?? false);
-      case 'fetch_history':
+      case 'fetch_history': {
+        const before = optStr(args.before, 'before');
+        const after = optStr(args.after, 'after');
         return this.client.fetchHistory({
           channelId: str(args.channelId, 'channelId'),
           threadId: optStr(args.threadId, 'threadId'),
           limit: optNum(args.limit, 'limit'),
-          before: optStr(args.before, 'before'),
-          after: optStr(args.after, 'after'),
+          before,
+          after,
+          // "Scroll forward" is what the tool description promises for an
+          // `after`-only call; the forward walk (portal#98) is what makes
+          // that true past one page. Older relays ignore it and serve the
+          // newest page above the cursor, as they always did.
+          ...(after && !before ? { direction: 'forward' as const } : {}),
         });
+      }
       case 'fetch_around':
         return this.fetchAround(
           str(args.channelId, 'channelId'),

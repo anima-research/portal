@@ -181,7 +181,8 @@ const definitions: ToolDefinition[] = [
     description:
       'Fetch recent messages from a channel or thread. Page with before/after ' +
       '(exclusive cursors — a relay message id or a raw Discord snowflake): pass ' +
-      '`before` to scroll back, `after` to scroll forward.',
+      '`before` to scroll back, `after` alone to scroll forward (the oldest page ' +
+      'just above the cursor; on an older relay, the newest page above it).',
     inputSchema: {
       type: 'object',
       properties: {
