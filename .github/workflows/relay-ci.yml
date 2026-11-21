@@ -83,6 +83,8 @@ jobs:
           test/permissions.test.ts
           test/invites.test.ts
           test/mint-invite.test.ts
+          test/channel-meta-parent.test.ts
+          test/directory-caps.test.ts
 
       # The gate on create_text_channel (#16): what lets a persona have the
       # shared bot create a channel.

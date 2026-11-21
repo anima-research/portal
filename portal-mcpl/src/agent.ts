@@ -322,12 +322,21 @@ export class PortalAgent {
         const guildId = str(args.guildId, 'guildId');
         const guildName = this.client.cache.getGuild(guildId)?.name;
         const res = (await this.client.call('list_channels', { guildId })) as {
-          channels: Array<{ id: string; name: string | null; type: string }>;
+          channels: Array<{ id: string; name: string | null; type: string; parentId?: string }>;
         };
+        // A channel's parentId is its category heading (or a thread's parent)
+        // since portal#95; when the category is an entry of this same
+        // response, join its NAME in so the model never has to (#99 r1-3).
+        // A category the persona holds nothing in is absent from the list,
+        // and that channel's parentId stays an honest dangling id.
+        const categoryName = new Map(
+          res.channels.filter((c) => c.type === 'category' && c.name).map((c) => [c.id, c.name as string]),
+        );
         return {
           channels: res.channels.map((c) => ({
             ...c,
             label: formatChannelLabel(c.name ?? c.id, guildName),
+            ...(c.parentId && categoryName.has(c.parentId) ? { category: categoryName.get(c.parentId) } : {}),
           })),
         };
       }

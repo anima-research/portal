@@ -44,8 +44,11 @@ export interface PortalChannel {
    * one exists. A category the persona's listing includes (it has some
    * capability there) appears as its own entry (type "category"), so the
    * name is one join away; a filtered-out category leaves an honest
-   * dangling id rather than an invented value. Absent when there is no
-   * parent (top-level channels and the categories themselves).
+   * dangling id rather than an invented value — and for a persona whose
+   * access is all channel-scoped grants (categories are not grantable),
+   * EVERY category id dangles, so the join is best-effort by design.
+   * Absent when there is no parent (top-level channels and the categories
+   * themselves).
    */
   parentId?: ChannelId;
   /** For threads: whether currently archived (posting auto-unarchives). */

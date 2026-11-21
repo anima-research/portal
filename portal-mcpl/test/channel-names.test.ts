@@ -445,3 +445,34 @@ test('a send split into parts says which parts went out when a later part fails'
   );
   assert.deepEqual(activity, ['message'], 'a first part that fails posts nothing');
 });
+
+test('list_channels joins the category NAME when its entry is in the same response (#99 r1-3)', async () => {
+  const { PortalClient } = await import('@animalabs/portal-client');
+  const { PortalAgent } = await import('../src/agent.js');
+  const { AgentState } = await import('../src/agent-state.js');
+  const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
+  client.cache.hydrate({
+    sessionId: 's', persona: { id: 'p', displayName: 'P', avatarUrl: '' },
+    guilds: [{ id: 'g1', name: 'G' }], channels: [], seq: 0,
+  });
+  Object.assign(client, {
+    async call(method: string) {
+      assert.equal(method, 'list_channels');
+      return { channels: [
+        { id: 'cat1', name: 'ARCHIVE', type: 'category', capabilities: ['VIEW_CHANNEL'] },
+        { id: 'c1', name: 'filed', type: 'text', parentId: 'cat1', capabilities: ['VIEW_CHANNEL'] },
+        { id: 'c2', name: 'orphan', type: 'text', parentId: 'cat-unseen', capabilities: ['VIEW_CHANNEL'] },
+        { id: 'c3', name: 'top', type: 'text', capabilities: ['VIEW_CHANNEL'] },
+      ] };
+    },
+  });
+  const agent = new PortalAgent(client, { state: new AgentState() });
+  const got = (await agent.handleToolCall('list_channels', { guildId: 'g1' })) as {
+    channels: Array<{ id: string; category?: string; parentId?: string }>;
+  };
+  const byId = new Map(got.channels.map((c) => [c.id, c]));
+  assert.equal(byId.get('c1')!.category, 'ARCHIVE', 'the visible category is joined by name');
+  assert.equal(byId.get('c2')!.category, undefined, 'a dangling id stays an id, nothing invented');
+  assert.equal(byId.get('c2')!.parentId, 'cat-unseen', 'the honest dangling id is passed through');
+  assert.equal(byId.get('c3')!.category, undefined);
+});

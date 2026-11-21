@@ -20,7 +20,10 @@ export interface ChannelLabel {
   name: string | null;
   type?: ChannelMeta['type'];
   guildId?: string | null;
-  /** Threads: the parent channel, so a thread reads `#parent › thread`. */
+  /** A thread's parent channel (so it reads `#parent › thread`), or — from
+   *  the producers that pass metaOf/the fallback through since portal#95 —
+   *  a channel's category heading. The resolver's own labelOf fills it for
+   *  threads only; the SPA renders by `type`, so both shapes are safe. */
   parentId?: string;
   parentName?: string | null;
   archived?: boolean;

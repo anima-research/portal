@@ -6,9 +6,11 @@ import { DiscordBot } from '../src/discord-bot.js';
 // Issue #95: list_channels entries carry no parentId for text channels, so a
 // flat listing cannot tell a live room from one filed under an archive
 // heading. metaOf should surface the category id for every channel kind
-// (threads keep their parent channel, as before). The category's NAME is
-// already in the same listing — categories are entries of their own — so one
-// id makes the listing joinable without a protocol change.
+// (threads keep their parent channel, as before). When the persona can see
+// the category it is an entry of the same listing (type "category"), so the
+// id is joinable without a protocol change; a category the persona holds
+// nothing in is filtered out and the id dangles honestly (see
+// directory-caps.test.ts and the protocol comment).
 
 type FakeChannel = {
   id: string;
@@ -106,4 +108,27 @@ test('webhook targeting: a categorized text channel posts to itself, a thread to
     await route({ id: 'thr', type: 'thread', parentId: 'general', isThread: true, guildId: 'g1', name: 'thr' }),
     { parentChannelId: 'general', threadId: 'thr' },
   );
+});
+
+test('fetchChannelMetaUncached carries the category id for a non-thread channel (#99 r1-2)', async () => {
+  // The round-1 fix made the UNCACHED path match metaOf; only the cached
+  // path had a test, so reverting the fix (back to thread-only parents)
+  // stayed green. This drives the raw-REST route directly.
+  const fetchRaw = async (raw: Record<string, unknown>) => {
+    const fake = Object.create(DiscordBot.prototype) as { client: unknown };
+    fake.client = { rest: { get: async () => raw } };
+    return DiscordBot.prototype.fetchChannelMetaUncached.call(fake as unknown as DiscordBot, String(raw.id));
+  };
+  const filed = await fetchRaw({ id: '10001', name: 'filed', type: ChannelType.GuildText, parent_id: '20002', guild_id: 'g1' });
+  assert.ok(typeof filed === 'object');
+  assert.equal(filed.parentId, '20002', 'a text channel keeps its category heading on the uncached path');
+  assert.equal(filed.isThread, false);
+  const thr = await fetchRaw({ id: '10003', name: 'thr', type: ChannelType.PublicThread, parent_id: '10001', guild_id: 'g1', thread_metadata: { archived: true } });
+  assert.ok(typeof thr === 'object');
+  assert.equal(thr.parentId, '10001');
+  assert.equal(thr.isThread, true);
+  assert.equal(thr.archived, true);
+  const top = await fetchRaw({ id: '10004', name: 'top', type: ChannelType.GuildText, parent_id: null, guild_id: 'g1' });
+  assert.ok(typeof top === 'object');
+  assert.equal(top.parentId, undefined, 'no parent, no invented id');
 });
