@@ -148,8 +148,11 @@ test('ambient messages never wake; a second mention does not re-fold what was se
 
 const S = (n: number) => `2026-09-21T11:${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}.000Z`;
 
-/** Relay double with a long B backlog and a history endpoint that pages like the
- *  real one: newest first, `limit` per call, `before` exclusive, `after` a stop. */
+/** Relay double with a long B backlog and a history endpoint that pages like
+ *  the real one (#91/#98): results newest-first, `limit` per call, cursors
+ *  exclusive; an `after`-only call serves the newest page above the cursor
+ *  unless it carries `direction: 'forward'`, which selects the OLDEST page
+ *  above it and is echoed back as `forward: true`. */
 function bigHarness(opts: { missed: number; cap: number; watermark?: string }) {
   process.env.PORTAL_CONTEXT_CAP = String(opts.cap);
   try {
@@ -164,7 +167,7 @@ function bigHarness(opts: { missed: number; cap: number; watermark?: string }) {
     const fetches: Array<{ limit?: number; before?: string; after?: string }> = [];
     const marked: Array<{ channelId: string; uptoCreatedAt?: string }> = [];
     Object.assign(client, {
-      async fetchHistory(p: { channelId: string; limit?: number; before?: string; after?: string }) {
+      async fetchHistory(p: { channelId: string; limit?: number; before?: string; after?: string; direction?: 'forward' }) {
         fetches.push({ limit: p.limit, before: p.before, after: p.after });
         const hist = p.channelId === B ? bHistory : [msg('a1', A, S(1))];
         let newestFirst = [...hist].reverse();
@@ -172,9 +175,11 @@ function bigHarness(opts: { missed: number; cap: number; watermark?: string }) {
           const idx = newestFirst.findIndex((m) => m.id === p.before);
           newestFirst = idx >= 0 ? newestFirst.slice(idx + 1) : [];
         }
-        // The relay's paging contract (#91): an after-only call serves the
-        // OLDEST page above the cursor (id, or a sinceCursor snowflake
-        // bounding by time); before-only and bare calls the newest below.
+        // The relay's paging contract (#91/#98): an after-only call serves
+        // the newest page above the cursor (id, or a sinceCursor snowflake
+        // bounding by time) unless it asks for `direction: 'forward'`, which
+        // selects the OLDEST page above it, echoed as `forward: true`;
+        // before-only and bare calls serve the newest below.
         if (p.after) {
           const byId = newestFirst.findIndex((m) => m.id === p.after);
           if (byId >= 0) newestFirst = newestFirst.slice(0, byId);
@@ -183,10 +188,11 @@ function bigHarness(opts: { missed: number; cap: number; watermark?: string }) {
             newestFirst = newestFirst.filter((m) => Date.parse(m.createdAt) > ms);
           }
         }
-        const slice = p.after && !p.before
+        const forwardServed = !!p.after && !p.before && p.direction === 'forward';
+        const slice = forwardServed
           ? newestFirst.slice(-(p.limit ?? 50))
           : newestFirst.slice(0, p.limit ?? 50);
-        return { messages: slice };
+        return { messages: slice, ...(forwardServed ? { forward: true as const } : {}) };
       },
       async call(method: string, params: Record<string, unknown>) {
         switch (method) {
