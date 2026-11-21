@@ -306,9 +306,10 @@ export class PortalCcChannelServer {
    * ambient traffic silently vanished — a catch-up wake carried only the pings.
    *
    * The relay keeps tallies, not bodies (Discord is the durable store). Each
-   * followed channel with unread is paged FORWARD from its watermark —
-   * since #91 an `after`-only fetch serves the window just above the
-   * cursor, so the oldest unseen arrives first by construction — and so is
+   * followed channel with unread is paged from its watermark — forward where
+   * the relay speaks `direction: 'forward'` (protocol v6, portal#98), and by
+   * the backward walk on older relays, detected per call by the missing
+   * `forward` echo — and so is
    * every thread under it with missed replies, because a thread reply counts
    * toward (and shares the watermark of) its parent channel but is not in the
    * parent's own history. A channel with more missed than FOLD_BOUND, or more
@@ -386,14 +387,17 @@ export class PortalCcChannelServer {
     return out;
   }
 
-  /** One container's messages in (since, upto], oldest first — paged
-   *  FORWARD from the watermark: since #91 an `after`-only fetch serves
-   *  the window just above the cursor, so the oldest unseen always
-   *  arrives first and each page's newest id is the next cursor. `since`
+  /** One container's messages in (since, upto], oldest first. Asks the relay
+   *  for the forward walk (`direction: 'forward'`, protocol v6 / portal#98)
+   *  so the oldest unseen arrives first and each page's newest id is the
+   *  next cursor; when the `forward` echo is missing — a relay that predates
+   *  v6 served the NEWEST page above the cursor instead — the page is handed
+   *  to the backward walk, which speaks exactly that older contract. `since`
    *  is required: the caller's floor guard bails before this when no
-   *  watermark or first-unread time exists (an older relay), so there is
-   *  no walk-from-the-top case. null when FOLD_BOUND is hit before the
-   *  window closes (folding a slice would skip what lies beyond it). */
+   *  watermark or first-unread time exists, so there is no walk-from-the-top
+   *  case. null as soon as more than FOLD_BOUND in-window messages have
+   *  accumulated (folding a slice would skip what lies beyond it) — exactly
+   *  FOLD_BOUND still folds. */
   private async pageWindow(
     b: Bound,
     channelId: string,
@@ -403,22 +407,64 @@ export class PortalCcChannelServer {
   ): Promise<PortalMessage[] | null> {
     const fresh: PortalMessage[] = [];
     let after = sinceCursor(since);
-    while (fresh.length <= FOLD_BOUND) {
-      const { messages } = await b.client.fetchHistory({
+    for (;;) {
+      const res = await b.client.fetchHistory({
         channelId,
         ...(threadId ? { threadId } : {}),
         limit: FOLD_PAGE,
         after,
+        direction: 'forward',
       });
+      if (!res.forward) return this.pageWindowBackward(b, channelId, threadId, since, upto, res.messages);
+      const { messages } = res;
       if (messages.length === 0) return fresh;
       const page = [...messages].sort(byCreatedAt);
       fresh.push(...page.filter((m) => m.createdAt > since && m.createdAt <= upto));
-      // Everything from here up is newer than the fold's ceiling.
-      if (page[0].createdAt > upto) return fresh;
+      if (fresh.length > FOLD_BOUND) return null;
+      // The page's newest message is past the ceiling: every later page is
+      // newer still, so the window is closed (and testing the page's newest,
+      // not its oldest, saves the one extra REST call a full page straddling
+      // `upto` used to cost — this walk shares the single bot's budget).
+      if (page[page.length - 1].createdAt > upto) return fresh;
       if (messages.length < FOLD_PAGE) return fresh;
       after = page[page.length - 1].id;
     }
-    return null;
+  }
+
+  /** The pre-v6 walk, for relays without `direction` (portal#98): their
+   *  `after`-only page is the NEWEST FOLD_PAGE above the cursor — that page
+   *  arrives here as `firstPage`, already fetched by pageWindow's probe —
+   *  and every later page is bounded `before`+`after`, which selects the
+   *  newest messages inside the window on EVERY relay version, so the walk
+   *  descends from the top until it reaches the watermark. Same return
+   *  contract as pageWindow. */
+  private async pageWindowBackward(
+    b: Bound,
+    channelId: string,
+    threadId: string | undefined,
+    since: string,
+    upto: string,
+    firstPage: PortalMessage[],
+  ): Promise<PortalMessage[] | null> {
+    const fresh: PortalMessage[] = [];
+    let messages = firstPage;
+    for (;;) {
+      if (messages.length === 0) return fresh;
+      const page = [...messages].sort(byCreatedAt);
+      fresh.unshift(...page.filter((m) => m.createdAt > since && m.createdAt <= upto));
+      if (fresh.length > FOLD_BOUND) return null;
+      // The page's oldest message is at or below the watermark: the window's
+      // floor is reached and nothing older is unseen.
+      if (page[0].createdAt <= since) return fresh;
+      if (messages.length < FOLD_PAGE) return fresh;
+      ({ messages } = await b.client.fetchHistory({
+        channelId,
+        ...(threadId ? { threadId } : {}),
+        limit: FOLD_PAGE,
+        before: page[0].id,
+        after: sinceCursor(since),
+      }));
+    }
   }
 
   /**
