@@ -423,6 +423,7 @@ export class PortalCcChannelServer {
   ): Promise<PortalMessage[] | null> {
     const fresh: PortalMessage[] = [];
     let after = sinceCursor(since);
+    let first = true;
     for (;;) {
       const res = await b.client.fetchHistory({
         channelId,
@@ -431,7 +432,18 @@ export class PortalCcChannelServer {
         after,
         direction: 'forward',
       });
-      if (!res.forward) return this.pageWindowBackward(b, channelId, threadId, since, upto, res.messages);
+      if (!res.forward) {
+        // No echo on the FIRST call: an old relay served its newest-above
+        // page, and the backward walk speaks exactly that contract. No echo
+        // LATER is a relay that changed contract mid-walk (a v6->v5
+        // rollback riding the client's reconnect outbox, review r2-1): the
+        // page in hand sits above an advanced cursor, the forward pages
+        // would be discarded, and folding a slice marks the rest read
+        // unseen — so refuse, post the note, keep the watermark.
+        if (first) return this.pageWindowBackward(b, channelId, threadId, since, upto, res.messages);
+        return null;
+      }
+      first = false;
       const { messages } = res;
       if (messages.length === 0) return fresh;
       const page = [...messages].sort(byCreatedAt);
@@ -443,7 +455,12 @@ export class PortalCcChannelServer {
       // `upto` used to cost — this walk shares the single bot's budget).
       if (page[page.length - 1].createdAt > upto) return fresh;
       if (messages.length < FOLD_PAGE) return fresh;
-      after = page[page.length - 1].id;
+      // The next cursor comes from the RESPONSE's id-ordered end (newest
+      // first), never from the createdAt-sorted page: a same-millisecond
+      // tie at the page edge sorts stably, hands back the LOWER id, and
+      // re-fetches its twin — the duplicate then counts toward the bound
+      // (review r2-3).
+      after = messages[0].id;
     }
   }
 
@@ -477,7 +494,9 @@ export class PortalCcChannelServer {
         channelId,
         ...(threadId ? { threadId } : {}),
         limit: FOLD_PAGE,
-        before: page[0].id,
+        // The response's id-ordered end (oldest of this newest-first page),
+        // for the same tie reason as the forward walk (review r2-3).
+        before: messages[messages.length - 1].id,
         after: sinceCursor(since),
       }));
     }

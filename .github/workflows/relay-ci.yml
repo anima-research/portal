@@ -108,6 +108,16 @@ jobs:
         working-directory: portal-relay
         run: node --import tsx --test test/claim-write-fails.test.ts
 
-      - name: History cache tests
+      # The relay half of the #98 skew protection: the forward walk served
+      # only on its opt-in, echoed exactly when served, and the cache keyed
+      # by direction. The consumer's fallback (MCPL CI, full suite) stands
+      # on these; a relay change that echoes unconditionally or drops the
+      # cache key must fail HERE, not in production (review r2-2).
+      - name: History paging and cache tests
         working-directory: portal-relay
-        run: node --import tsx --test test/history-cache.test.ts test/history-race.test.ts
+        run: >-
+          node --import tsx --test
+          test/fetch-history-paging.test.ts
+          test/fetch-history-dispatch.test.ts
+          test/history-cache.test.ts
+          test/history-race.test.ts

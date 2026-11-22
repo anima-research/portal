@@ -42,6 +42,10 @@ interface RelayOpts {
    *  param it ignores, and no `forward` echo ever comes back. Default is the
    *  current contract. */
   relay?: 'v5';
+  /** Behave as v6 for this many fetchHistory calls, then as v5 — the
+   *  mid-walk rollback R2-1 names (a restarted old relay serving a walk's
+   *  later pages). */
+  relayFlipAfter?: number;
   watermarks?: Record<string, string>;
   pings?: PortalMessage[];
   /** Block list_unread until this resolves (to hold a wake mid-flight). */
@@ -95,8 +99,9 @@ function relayClient(opts: RelayOpts) {
           newestFirst = newestFirst.filter((m) => Date.parse(m.createdAt) >= ms);
         }
       }
-      const forwardServed =
-        !!p.after && !p.before && opts.relay !== 'v5' && p.direction === 'forward';
+      const v5Now =
+        opts.relay === 'v5' || (opts.relayFlipAfter !== undefined && fetches.length > opts.relayFlipAfter);
+      const forwardServed = !!p.after && !p.before && !v5Now && p.direction === 'forward';
       const slice = forwardServed
         ? newestFirst.slice(-(p.limit ?? 50)) // oldest page above the cursor
         : newestFirst.slice(0, p.limit ?? 50);
@@ -342,6 +347,46 @@ test('one past FOLD_BOUND: a note, nothing shown as folded, and the watermark st
     pageWindow(b: unknown, c: string, t: string | undefined, s: string, u: string): Promise<PortalMessage[] | null>;
   }).pageWindow({ client: r.client }, B, undefined, S(0), S(501));
   assert.equal(direct, null, 'pageWindow itself refuses, independent of the caller');
+});
+
+test('a relay that stops echoing mid-walk: nothing folds, the note posts, the watermark stays (review r2-1)', async () => {
+  // A v6->v5 rollback between two RPCs of one walk (the client's outbox
+  // rides a reconnect). The walk's first page came forward; the second
+  // call finds no echo. Folding a slice here marks the already-collected
+  // region read without showing it, so the only safe answer is the
+  // too-many note with the watermark untouched.
+  const backlog = Array.from({ length: 150 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1)));
+  const r = relayClient({ relayFlipAfter: 1, messages: backlog, watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 400 });
+  ping(r.client, msg('a99', A, S(200), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  assert.equal(shown.length, 0, 'a mid-walk contract change never folds a slice');
+  assert.ok(h.wakes[0].content.includes('more than a wake folds'), 'the wake carries the note');
+  assert.equal(r.marked.find((m) => m.channelId === B), undefined, 'the watermark never moves');
+});
+
+test('same-millisecond twins at a page edge do not double-count toward the bound (review r2-3)', async () => {
+  // 500 unique messages, two of them sharing a millisecond exactly at the
+  // first page's edge. A cursor taken from the createdAt-sorted page's last
+  // row picks the LOWER id of the tie, re-fetches its twin, and the
+  // duplicate pushes fresh past FOLD_BOUND: exactly-500 refuses. Cursors
+  // from the response's id-ordered ends never re-cross the tie.
+  const backlog = [
+    ...Array.from({ length: 99 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1))),
+    msg('b100', B, S(99)), // b99's same-ms twin, higher id, page-1 edge
+    ...Array.from({ length: 400 }, (_, i) => msg(`b${i + 101}`, B, S(i + 100))),
+  ];
+  const r = relayClient({ messages: [...backlog, msg('a1', A, S(0))], watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 1000 });
+  ping(r.client, msg('a99', A, S(600), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  assert.equal(shown.length, 500, 'exactly FOLD_BOUND folds whole despite the tie');
+  assert.ok(!h.wakes[0].content.includes('more than a wake folds'), 'no false too-many note');
+  assert.equal(new Set(shown).size, 500, 'every message once');
 });
 
 test('thread replies under a followed channel are folded (fetched by threadId), not marked read unseen', async () => {
