@@ -463,6 +463,7 @@ test('list_channels joins the category NAME when its entry is in the same respon
         { id: 'c1', name: 'filed', type: 'text', parentId: 'cat1', capabilities: ['VIEW_CHANNEL'] },
         { id: 'c2', name: 'orphan', type: 'text', parentId: 'cat-unseen', capabilities: ['VIEW_CHANNEL'] },
         { id: 'c3', name: 'top', type: 'text', capabilities: ['VIEW_CHANNEL'] },
+        { id: 't1', name: 'a-thread', type: 'thread', parentId: 'c1', capabilities: ['VIEW_CHANNEL'] },
       ] };
     },
   });
@@ -475,4 +476,7 @@ test('list_channels joins the category NAME when its entry is in the same respon
   assert.equal(byId.get('c2')!.category, undefined, 'a dangling id stays an id, nothing invented');
   assert.equal(byId.get('c2')!.parentId, 'cat-unseen', 'the honest dangling id is passed through');
   assert.equal(byId.get('c3')!.category, undefined);
+  // A thread's parentId is a TEXT channel: the join must not serve it as a
+  // "category" (review #99 r2-2 — the type check is what this pins).
+  assert.equal(byId.get('t1')!.category, undefined, 'a thread gets no category from its text parent');
 });
