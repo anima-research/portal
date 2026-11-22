@@ -389,6 +389,29 @@ test('same-millisecond twins at a page edge do not double-count toward the bound
   assert.equal(new Set(shown).size, 500, 'every message once');
 });
 
+test("backward walk: a same-ms twin at the first page's oldest end does not double-count either (review r2-3, old relay)", async () => {
+  // The mirror of the forward twin case, through the fallback: on a v5
+  // relay the walk descends from the newest page, and a cursor taken from
+  // the createdAt-sorted page's front picks the HIGHER id of a tie at the
+  // page's oldest end, re-fetching its twin below. 500 unique messages
+  // with the twin pair at the boundary must fold whole, exactly once.
+  const backlog = [
+    ...Array.from({ length: 400 }, (_, i) => msg(`b${i + 1}`, B, S(i + 1))),
+    msg('b401', B, S(401)),
+    msg('b402', B, S(401)), // b401's same-ms twin, higher id, page-1's oldest end
+    ...Array.from({ length: 98 }, (_, i) => msg(`b${i + 403}`, B, S(i + 402))),
+  ];
+  const r = relayClient({ relay: 'v5', messages: backlog, watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client, { cap: 1000 });
+  ping(r.client, msg('a99', A, S(600), { content: '@P hi' }));
+  await h.settle();
+
+  const shown = shownIds(h.wakes[0].content).filter((id) => /^b\d+$/.test(id));
+  assert.equal(shown.length, 500, 'exactly FOLD_BOUND folds whole through the fallback despite the tie');
+  assert.equal(new Set(shown).size, 500, 'every message once');
+  assert.ok(!h.wakes[0].content.includes('more than a wake folds'), 'no false too-many note');
+});
+
 test('thread replies under a followed channel are folded (fetched by threadId), not marked read unseen', async () => {
   const r = relayClient({
     messages: [
