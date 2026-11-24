@@ -95,10 +95,11 @@ function makeRelay(ttl = 60_000) {
   let editStarted: (() => void) | undefined;
   let editFails = false;
   relay.webhooks = {
-    send: async (_channelId: string, _personaId: string, opts: { content: string; threadId?: string }) => {
+    send: async (channelId: string, _personaId: string, opts: { content: string; threadId?: string }) => {
       const messageId = `own-${++sent}`;
-      const place = opts.threadId ?? CHAN;
-      discord[place] = [incoming({ id: messageId, content: opts.content, cleanContent: opts.content, webhookId: WEBHOOK, channelId: place }), ...discord[place]!];
+      const place = opts.threadId ?? channelId;
+      const message = { id: messageId, content: opts.content, cleanContent: opts.content, webhookId: WEBHOOK };
+      discord[place] = [opts.threadId ? inThread(message) : incoming({ ...message, channelId, parentChannelId: channelId }), ...discord[place]!];
       return { messageId, webhookId: WEBHOOK };
     },
     ensureLoaded: async () => {},
@@ -156,6 +157,7 @@ async function heldRead(w: ReturnType<typeof makeRelay>, params: Record<string, 
 const places = [
   { name: 'a channel', read: { channelId: CHAN, limit: 5 }, place: CHAN, id: '100' },
   { name: 'a thread', read: { channelId: CHAN, threadId: THREAD, limit: 5 }, place: THREAD, id: '101' },
+  { name: 'a thread named by its own id as channelId', read: { channelId: THREAD, limit: 5 }, place: THREAD, id: '101' },
 ];
 
 for (const { name, read, place } of places) {

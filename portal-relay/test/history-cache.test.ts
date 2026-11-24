@@ -111,3 +111,19 @@ test('a read whose place changed while it read returns its page and stores nothi
   assert.equal(next.calls(), 1, 'the overtaken page was not stored');
   assert.equal((await c.read(page('chan'), cachedOnly)).length, 2, 'the read begun after the change stored its page');
 });
+
+test('a read still under way when another read of its place ends is overtaken by a later change', async () => {
+  const c = new HistoryCache(5000, 500, () => 0);
+  let answerFirst!: () => void;
+  let answerSecond!: () => void;
+  const first = c.read(page('chan'), () => new Promise((resolve) => (answerFirst = () => resolve(msgs(1)))));
+  const second = c.read(page('chan'), () => new Promise((resolve) => (answerSecond = () => resolve(msgs(1)))));
+  answerFirst();
+  await first;
+  c.invalidate('chan');
+  answerSecond();
+  await second;
+  const next = bot(2);
+  assert.equal((await c.read(page('chan'), next.fetch)).length, 2);
+  assert.equal(next.calls(), 1, 'the overtaken page was not stored');
+});
