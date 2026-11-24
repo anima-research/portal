@@ -32,6 +32,7 @@ export function forgetSentNotPending(state: AgentState, sentBeforeRead: string[]
 export function noteSentAndPrune(agent: PortalAgent, messageId: string): void {
   const sentBeforeRead = agent.state.sentIds();
   agent.state.noteSent([messageId]);
+  if (sentBeforeRead.length === 0) return;
   agent.pendingPingsFromRelay().then(
     (pending) => forgetSentNotPending(agent.state, sentBeforeRead, pending),
     () => {},

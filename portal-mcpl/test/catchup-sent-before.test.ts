@@ -40,7 +40,7 @@ function relay(personaId = 'p') {
     sessionId: 's', persona: { id: personaId, displayName: 'P', avatarUrl: '' },
     guilds: [{ id: 'g1', name: 'G' }], channels: [channel(CH, 'portables'), channel(OTHER, 'other')], seq: 0,
   });
-  const control: { pending: PortalMessage[]; unreadable?: boolean; held?: { entered: () => void; until: Promise<void> } } = { pending: [] };
+  const control: { pending: PortalMessage[]; reads: number; unreadable?: boolean; held?: { entered: () => void; until: Promise<void> } } = { pending: [], reads: 0 };
   const holdNextRead = () => {
     const entered = gate();
     const release = gate();
@@ -58,6 +58,7 @@ function relay(personaId = 'p') {
         case 'mark_read':
           return {};
         case 'get_pending_pings': {
+          control.reads++;
           if (control.unreadable) throw new Error('relay not ready');
           const held = control.held;
           if (held) {
@@ -437,7 +438,13 @@ test('a mention that the host accepts prunes the saved ids against the pending l
     await first.mention(msg('m1', 1));
     for (let turn = 0; turn < 5; turn++) await new Promise((r) => setImmediate(r));
     assert.deepEqual(savedSent(first.state), ['m1'], open ? 'channels/incoming' : 'push/event');
+    assert.equal(first.control.reads, 1);
 
+    const fresh = hostProcess(undefined, answer, { open });
+    await fresh.mention(msg('m1', 1));
+    for (let turn = 0; turn < 5; turn++) await new Promise((r) => setImmediate(r));
+    assert.deepEqual(savedSent(fresh.state), ['m1']);
+    assert.equal(fresh.control.reads, 0, 'with no earlier id, nothing can be pruned, so the relay is not read');
   }
 });
 
