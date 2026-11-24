@@ -45,10 +45,9 @@ export interface PortalChannel {
    * capability there) appears as its own entry (type "category"), so the
    * name is one join away; a filtered-out category leaves an honest
    * dangling id rather than an invented value — and for a persona whose
-   * access is all channel grants made through the admin panel (which
-   * refuses category targets; a permissions-file or role-scope grant on a
-   * category does count), EVERY category id dangles, so the join is
-   * best-effort by design.
+   * grants are all on individual text, voice or forum channels, EVERY
+   * category id dangles (nothing flows up from a channel to its
+   * category), so the join is best-effort by design.
    * Absent when there is no parent (top-level channels and the categories
    * themselves).
    */
