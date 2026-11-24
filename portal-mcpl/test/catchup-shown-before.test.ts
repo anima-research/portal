@@ -168,7 +168,7 @@ test('a catch-up counts the new mentions and the ones shown before, and marks on
   assert.match(lineOf(wake, 'm2'), /\[message m2\]/);
 });
 
-test('with nothing shown before, the catch-up reads as it always did', async () => {
+test('with nothing shown before, the catch-up has no shown-before head and no mark', async () => {
   const wake = await nextCatchUp(undefined, [msg('m1', 1)]);
   assert.equal(head(wake), NEW_HEAD);
   assert.doesNotMatch(wake.content, /shown/);
