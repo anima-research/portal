@@ -254,12 +254,10 @@ export class PortalAgent {
             // says nothing ran for its own call, isn't the whole answer; and
             // posting them was public activity.
             this.onPublicActivity?.('message');
-            const cleared =
-              typeof first === 'object' && first !== null && 'pingCleared' in first && first.pingCleared === true;
             const ping =
               args.replyToId == null
                 ? ''
-                : cleared
+                : pingCleared(first)
                   ? 'The first part cleared the pending ping it replied to (pingCleared). '
                   : 'The first part cleared no pending ping. ';
             throw new Error(
@@ -272,6 +270,10 @@ export class PortalAgent {
           }
           const id = (result as { messageId?: unknown } | undefined)?.messageId;
           if (typeof id === 'string') posted.push(id);
+          if (i === 0 && typeof args.replyToId === 'string' && pingCleared(result)) {
+            this.state.clearPing(args.replyToId);
+            this.state.forgetShown([args.replyToId]);
+          }
           first ??= result;
         }
         this.onPublicActivity?.('message');
@@ -429,6 +431,10 @@ export class PortalAgent {
         throw new Error(unknownToolMessage(name));
     }
   }
+}
+
+function pingCleared(result: unknown): boolean {
+  return typeof result === 'object' && result !== null && 'pingCleared' in result && result.pingCleared === true;
 }
 
 /** A string argument, refused by name before anything runs. */

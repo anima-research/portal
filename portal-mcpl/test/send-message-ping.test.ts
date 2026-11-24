@@ -59,3 +59,27 @@ test('a message whose later part fails says whether its first part cleared the p
   const noReply = await failingSecondPart({ messageId: 'rm_a' }, {});
   assert.doesNotMatch(noReply, /ping/);
 });
+
+test('a reply that clears its ping drops it from the local pending list and the shown ids', async () => {
+  for (const cleared of [true, false]) {
+    const { client } = relay();
+    Object.assign(client, { sendMessage: async () => (cleared ? { messageId: 'rm_a', pingCleared: true } : { messageId: 'rm_a' }) });
+    const state = new AgentState();
+    state.ingest(
+      {
+        id: 'rm_y', nativeId: 'y', channelId: CH, guildId: 'g1',
+        author: { kind: 'user', userId: 'u1', username: 'bob', displayName: 'Bob', bot: false },
+        content: 'hi', cleanContent: 'hi', attachments: [],
+        mentions: { personas: [], roles: [], users: [], everyone: false },
+        reactions: [], createdAt: '2026-11-20T10:01:00.000Z',
+      },
+      true,
+      ['role_mention'],
+    );
+    state.noteShown(['rm_y']);
+    const agent = new PortalAgent(client, { state });
+    await agent.handleToolCall('send_message', { channelId: CH, content: 'answer', replyToId: 'rm_y' });
+    assert.equal(state.wasShown('rm_y'), !cleared);
+    assert.deepEqual(state.pendingPings().map((p) => p.message.id), cleared ? [] : ['rm_y']);
+  }
+});
