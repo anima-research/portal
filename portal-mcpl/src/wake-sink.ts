@@ -114,8 +114,8 @@ export function renderCodexWake({ content, meta, allSentBefore }: WakePayload): 
   const head = !meta.catchup
     ? `[portal] ${meta.author} addressed you in ${where} — reply there with ${replyHint}.`
     : allSentBefore
-      ? '[portal] Messages addressed to you are still pending from an earlier session — reply where each came from with send_message.'
-      : '[portal] Messages addressed to you arrived while you were away — reply where each came from with send_message.';
+      ? '[portal] Messages addressed to you are still pending from an earlier session — if one still needs an answer, reply where it came from with send_message.'
+      : '[portal] Messages addressed to you arrived while you were away — if one still needs an answer, reply where it came from with send_message.';
   const omitted = codexWakeOmits(content);
   const body =
     omitted > 0

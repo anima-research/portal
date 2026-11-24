@@ -81,7 +81,7 @@ const definitions: ToolDefinition[] = [
           description:
             'Relay message id to reply to; the relay may render it as a quoted link. Where the relay supports it, ' +
             'a reply to a message that was addressed to you clears it from your pending pings, and the result says ' +
-            'so (pingCleared). Without pingCleared, nothing was cleared.',
+            'so (pingCleared). A result without pingCleared means that this send cleared nothing.',
         },
         mentionPersonaIds: {
           type: 'array',

@@ -437,6 +437,7 @@ test('a mention that the host accepts prunes the saved ids against the pending l
     await first.mention(msg('m1', 1));
     for (let turn = 0; turn < 5; turn++) await new Promise((r) => setImmediate(r));
     assert.deepEqual(savedSent(first.state), ['m1'], open ? 'channels/incoming' : 'push/event');
+
   }
 });
 
@@ -517,9 +518,13 @@ test('a catch-up through a wake sink tells it when every mention was sent before
   }
 });
 
-test('the codex wake says the mentions are still pending from an earlier session only when every one was sent before', () => {
+test('the codex catch-up head says the mentions are still pending from an earlier session only when every one was sent before', () => {
   const meta = { catchup: 'true', channelId: CH };
   const earlier: WakePayload = { content: 'x', meta, allSentBefore: true };
-  assert.match(renderCodexWake(earlier), /^\[portal\] Messages addressed to you are still pending from an earlier session — reply where each came from with send_message\./);
-  assert.match(renderCodexWake({ content: 'x', meta }), /^\[portal\] Messages addressed to you arrived while you were away/);
+  const reply = ' — if one still needs an answer, reply where it came from with send_message.';
+  assert.equal(
+    renderCodexWake(earlier).split('\n')[0],
+    '[portal] Messages addressed to you are still pending from an earlier session' + reply,
+  );
+  assert.equal(renderCodexWake({ content: 'x', meta }).split('\n')[0], '[portal] Messages addressed to you arrived while you were away' + reply);
 });
