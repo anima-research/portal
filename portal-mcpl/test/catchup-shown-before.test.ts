@@ -381,6 +381,22 @@ test('a host push is saved when the host accepts it, and not when the host decli
   }
 });
 
+test('a host push is saved only once the host has answered it', async () => {
+  for (const method of ['push/event', 'channels/incoming']) {
+    const answered = gate();
+    const answer = answered.opened.then(() =>
+      method === 'push/event' ? { accepted: true } : { results: [{ messageId: 'm1', accepted: true }] },
+    );
+    const first = hostProcess(undefined, answer, { open: method === 'channels/incoming' });
+    await first.mention(msg('m1', 1));
+    assert.equal(first.requests[0].method, method);
+    assert.equal(first.state.wasShown('m1'), false, `${method}: nothing is saved while the host has not answered`);
+    answered.open();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(first.state.wasShown('m1'), true, method);
+  }
+});
+
 test('in an open channel, a mention is saved only when the host accepts that message', async () => {
   const cases: Array<[unknown, boolean]> = [
     [{ results: [{ messageId: 'm1', accepted: true }] }, true],
