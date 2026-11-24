@@ -254,10 +254,13 @@ export class PortalAgent {
             // says nothing ran for its own call, isn't the whole answer; and
             // posting them was public activity.
             this.onPublicActivity?.('message');
+            const cleared =
+              typeof first === 'object' && first !== null && 'pingCleared' in first && first.pingCleared === true;
             throw new Error(
               `Only part of the message was sent: the first ${i} of ${chunks.length} parts were posted ` +
                 `(${posted.map((id) => JSON.stringify(id)).join(', ')}), and part ${i + 1} may not have been. ` +
                 `Its call answered: "${(e as Error).message}" ` +
+                (cleared ? 'The first part cleared the pending ping it replied to (pingCleared). ' : '') +
                 'To send the rest, call send_message with only the text that didn\'t go out; fetch_around shows what did.',
             );
           }
