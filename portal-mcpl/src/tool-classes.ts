@@ -51,6 +51,7 @@ export const TOOL_CLASSES: Readonly<Record<string, readonly ToolClass[]>> = {
   create_thread: ['comms'],
   fetch_history: ['comms'],
   fetch_around: ['comms'],
+  fetch_message: ['comms'],
   list_pins: ['comms'],
   get_pending_pings: ['comms'],
   list_unread: ['comms'],

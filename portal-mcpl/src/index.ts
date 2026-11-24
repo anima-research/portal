@@ -10,7 +10,7 @@ export type { PortalAgentOptions } from './agent.js';
 export { PortalMcplServer } from './server.js';
 export { AgentState } from './agent-state.js';
 export type { PendingPing, ChannelUnread } from './agent-state.js';
-export { toolDefinitions } from './tools.js';
+export { toolDefinitions, digestToolDefinitions, withDigestView } from './tools.js';
 export type { ToolDefinition } from './tools.js';
 export { buildSession } from './session.js';
 export type { BuildSessionOptions } from './session.js';

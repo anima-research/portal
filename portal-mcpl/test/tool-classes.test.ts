@@ -17,7 +17,10 @@ import {
   UNCLASSED,
   withToolClass,
 } from '../src/tool-classes.js';
-import { toolDefinitions, type ToolDefinition } from '../src/tools.js';
+import { digestToolDefinitions, toolDefinitions, type ToolDefinition } from '../src/tools.js';
+
+/** Every tool a server can serve: the public list, and what the digest view adds when it is on. */
+const everyTool = [...toolDefinitions, ...digestToolDefinitions];
 
 const ALL_USES = [...new Set(Object.values(featureSets).flatMap((set) => set.uses as string[]))];
 
@@ -30,7 +33,7 @@ test('the class vocabulary is exactly RFC-008 §4', () => {
 });
 
 test('every tool (all feature sets) is in TOOL_CLASSES or UNCLASSED, never both, never stale', () => {
-  const names = toolDefinitions.map((t) => t.name);
+  const names = everyTool.map((t) => t.name);
   const unlisted = names.filter((name) => !(name in TOOL_CLASSES) && !UNCLASSED.has(name));
   assert.deepEqual(unlisted, [], 'class or explicitly unclass every tool');
   const both = names.filter((name) => name in TOOL_CLASSES && UNCLASSED.has(name));
@@ -60,7 +63,7 @@ test('the comms rule: a tool that takes message text or attachments is comms', (
 });
 
 test('toolDefinitions carry their class in _meta; unclassed tools carry no key', () => {
-  for (const tool of toolDefinitions) {
+  for (const tool of everyTool) {
     const declared = tool._meta?.[TOOL_CLASS_META_KEY];
     if (UNCLASSED.has(tool.name)) {
       assert.equal(declared, undefined, tool.name);
@@ -159,9 +162,9 @@ test('MCPL server tools/list emits mcpl/class and keeps existing _meta (host-own
   assert.ok(tools.length > 0);
 });
 
-test('Claude Code channel tools/list emits mcpl/class and keeps existing _meta (full surface)', async () => {
+test('Claude Code channel tools/list emits mcpl/class and keeps existing _meta (full surface, digest view on)', async () => {
   const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
-  const server = new PortalCcChannelServer(client, new AttributedAgent(client));
+  const server = new PortalCcChannelServer(client, new AttributedAgent(client, { digestView: true }));
   const internal = server as unknown as Internal;
   const stub = connStub();
   internal.conn = stub.conn;
@@ -169,5 +172,24 @@ test('Claude Code channel tools/list emits mcpl/class and keeps existing _meta (
   await internal.handleRequest({ id: 1, method: 'tools/list' });
   assert.equal(stub.errors.length, 0);
   const { tools } = stub.responses[0] as { tools: ToolDefinition[] };
-  assertClassedListing(tools, toolDefinitions.map((t) => t.name));
+  assertClassedListing(tools, everyTool.map((t) => t.name));
+});
+
+test('Claude Code channel tools/list by default is the public toolDefinitions, and adds nothing (portal#79)', async () => {
+  const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
+  // The environment must not turn the view on for a test of the default.
+  const saved = process.env.PORTAL_DIGEST_VIEW;
+  delete process.env.PORTAL_DIGEST_VIEW;
+  try {
+    const server = new PortalCcChannelServer(client, new AttributedAgent(client));
+    const internal = server as unknown as Internal;
+    const stub = connStub();
+    internal.conn = stub.conn;
+    await internal.handleRequest({ id: 1, method: 'tools/list' });
+    assert.equal(stub.errors.length, 0);
+    const { tools } = stub.responses[0] as { tools: ToolDefinition[] };
+    assertClassedListing(tools, toolDefinitions.map((t) => t.name));
+  } finally {
+    if (saved !== undefined) process.env.PORTAL_DIGEST_VIEW = saved;
+  }
 });
