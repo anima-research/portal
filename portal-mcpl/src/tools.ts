@@ -183,7 +183,7 @@ const definitions: ToolDefinition[] = [
       '(exclusive cursors — a relay message id or a raw Discord snowflake): pass ' +
       '`before` to scroll back, `after` to scroll forward. A channel\'s own history ' +
       'holds none of its threads\' messages: to read a thread, pass its id as ' +
-      'threadId, or directly as channelId.',
+      'threadId with its parent as channelId, or directly as channelId.',
     inputSchema: {
       type: 'object',
       properties: {

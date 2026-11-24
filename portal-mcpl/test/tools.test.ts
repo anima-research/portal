@@ -32,7 +32,7 @@ test('send_message offers threadId, and its description names both ways to post 
 test("fetch_history and fetch_around say that a channel's history holds none of its threads' messages, and how to read a thread", () => {
   const history = byName.get('fetch_history')!.description;
   assert.match(history, /A channel's own history holds none of its threads' messages/);
-  assert.match(history, /pass its id as threadId, or directly as channelId/);
+  assert.match(history, /pass its id as threadId with its parent as channelId, or directly as channelId/);
   assert.match(byName.get('fetch_around')!.description, /If the message is in a thread, target that thread/);
 });
 
