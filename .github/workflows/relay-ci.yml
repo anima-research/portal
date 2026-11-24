@@ -102,3 +102,7 @@ jobs:
       - name: Invite claim tests
         working-directory: portal-relay
         run: node --import tsx --test test/claim-write-fails.test.ts
+
+      - name: History cache tests
+        working-directory: portal-relay
+        run: node --import tsx --test test/history-cache.test.ts test/history-race.test.ts

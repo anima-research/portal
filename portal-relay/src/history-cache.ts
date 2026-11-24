@@ -14,8 +14,20 @@ interface Entry {
   at: number;
 }
 
+export interface HistoryPage {
+  channelId: string;
+  limit: number;
+  before?: string;
+  after?: string;
+}
+
+interface Read {
+  overtaken: boolean;
+}
+
 export class HistoryCache {
   private map = new Map<string, Entry>();
+  private reading = new Map<string, Set<Read>>();
 
   constructor(
     private ttlMs: number,
@@ -27,13 +39,30 @@ export class HistoryCache {
     return this.ttlMs > 0;
   }
 
-  private key(channelId: string, limit: number, before?: string, after?: string): string {
-    return `${channelId}|${limit}|${before ?? ''}|${after ?? ''}`;
+  private key(page: HistoryPage): string {
+    return `${page.channelId}|${page.limit}|${page.before ?? ''}|${page.after ?? ''}`;
   }
 
-  get(channelId: string, limit: number, before?: string, after?: string): IncomingMessage[] | undefined {
-    if (!this.enabled) return undefined;
-    const k = this.key(channelId, limit, before, after);
+  async read(page: HistoryPage, fetch: () => Promise<IncomingMessage[]>): Promise<IncomingMessage[]> {
+    if (!this.enabled) return fetch();
+    const k = this.key(page);
+    const cached = this.lookup(k);
+    if (cached) return cached;
+    const read: Read = { overtaken: false };
+    let reads = this.reading.get(page.channelId);
+    if (!reads) this.reading.set(page.channelId, (reads = new Set()));
+    reads.add(read);
+    try {
+      const messages = await fetch();
+      if (!read.overtaken) this.store(k, messages);
+      return messages;
+    } finally {
+      reads.delete(read);
+      if (reads.size === 0) this.reading.delete(page.channelId);
+    }
+  }
+
+  private lookup(k: string): IncomingMessage[] | undefined {
     const e = this.map.get(k);
     if (!e) return undefined;
     if (this.now() - e.at >= this.ttlMs) {
@@ -46,9 +75,8 @@ export class HistoryCache {
     return e.messages;
   }
 
-  set(channelId: string, limit: number, before: string | undefined, after: string | undefined, messages: IncomingMessage[]): void {
-    if (!this.enabled) return;
-    this.map.set(this.key(channelId, limit, before, after), { messages, at: this.now() });
+  private store(k: string, messages: IncomingMessage[]): void {
+    this.map.set(k, { messages, at: this.now() });
     while (this.map.size > this.cap) {
       const oldest = this.map.keys().next().value;
       if (oldest === undefined) break;
@@ -59,6 +87,7 @@ export class HistoryCache {
   /** Drop all cached pages for a channel (on any content change there). */
   invalidate(channelId: string): void {
     if (!this.enabled) return;
+    for (const read of this.reading.get(channelId) ?? []) read.overtaken = true;
     const prefix = `${channelId}|`;
     for (const k of this.map.keys()) if (k.startsWith(prefix)) this.map.delete(k);
   }
