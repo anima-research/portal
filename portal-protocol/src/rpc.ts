@@ -45,6 +45,9 @@ export interface SendMessageParams {
 }
 export interface SendMessageResult {
   messageId: RelayMessageId;
+  /** Present when `replyToId` named one of the sender's pending pings: the
+   *  relay dropped that ping. Absent from relays that predate it. */
+  pingCleared?: true;
 }
 
 export interface EditMessageParams {

@@ -89,6 +89,10 @@ jobs:
         working-directory: portal-relay
         run: node --import tsx --test test/create-text-channel.test.ts
 
+      - name: Reply clears its ping tests
+        working-directory: portal-relay
+        run: node --import tsx --test test/reply-clears-ping.test.ts
+
       # Voice output, speech and transcripts. voice-sink.test.ts loads
       # voice-speaker.ts, the module that loads @animalabs/voice-kit at run
       # time, so it also checks the installed package loads.

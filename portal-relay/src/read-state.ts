@@ -201,6 +201,16 @@ export class ReadStateStore {
     return [...(this.inboxes.get(personaId)?.pings ?? [])];
   }
 
+  clearPing(personaId: string, messageId: string): boolean {
+    const ib = this.inboxes.get(personaId);
+    if (!ib) return false;
+    const left = ib.pings.filter((p) => p.message.id !== messageId);
+    if (left.length === ib.pings.length) return false;
+    ib.pings = left;
+    this.scheduleFlush();
+    return true;
+  }
+
   unread(personaId: string): ChannelUnread[] {
     const ib = this.inboxes.get(personaId);
     if (!ib) return [];

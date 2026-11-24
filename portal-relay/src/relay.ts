@@ -20,6 +20,7 @@ import type {
   RpcParams,
   RpcRequest,
   RpcResponse,
+  SendMessageResult,
 } from '@animalabs/portal-protocol';
 import type { AccessRole, InviteTemplate, PersonaIdentity, PersonaPolicy, RelayConfig, Scope } from './config.js';
 import { DiscordBot, type ChannelMeta, type IncomingMessage } from './discord-bot.js';
@@ -1755,7 +1756,7 @@ export class Relay implements GatewayHooks {
   private async sendMessage(
     personaId: string,
     p: RpcParams<'send_message'>,
-  ): Promise<{ messageId: string }> {
+  ): Promise<SendMessageResult> {
     const cfg = this.identity.get(personaId)!;
     const target = await this.resolveContainer(p.channelId, p.threadId);
     if (!target) throw containerNotFound(p.channelId, p.threadId);
@@ -1814,7 +1815,8 @@ export class Relay implements GatewayHooks {
       personaId,
       webhookId,
     });
-    return { messageId: ref.relayId };
+    const pingCleared = p.replyToId !== undefined && this.readState.clearPing(personaId, p.replyToId);
+    return pingCleared ? { messageId: ref.relayId, pingCleared } : { messageId: ref.relayId };
   }
 
   private async react(
