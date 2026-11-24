@@ -1,50 +1,129 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { HistoryCache } from '../src/history-cache.js';
+import { HistoryCache, type HistoryPage } from '../src/history-cache.js';
 
 const msgs = (n: number) => Array.from({ length: n }, (_, i) => ({ id: String(i) })) as never[];
 
-test('hit within TTL, miss after TTL', () => {
+const page = (channelId: string, limit = 50, before?: string, after?: string): HistoryPage => ({
+  channelId,
+  limit,
+  before,
+  after,
+});
+
+function bot(n = 1) {
+  let calls = 0;
+  return {
+    fetch: async () => {
+      calls++;
+      return msgs(n);
+    },
+    calls: () => calls,
+  };
+}
+
+const cachedOnly = async (): Promise<never> => assert.fail('the cache read Discord');
+
+test('hit within TTL, miss after TTL', async () => {
   let t = 1000;
   const c = new HistoryCache(5000, 500, () => t);
-  c.set('chan', 50, undefined, undefined, msgs(3));
-  assert.equal(c.get('chan', 50, undefined, undefined)?.length, 3);
+  const b = bot(3);
+  assert.equal((await c.read(page('chan'), b.fetch)).length, 3);
   t = 1000 + 4999;
-  assert.ok(c.get('chan', 50, undefined, undefined), 'still fresh at 4999ms');
+  assert.equal((await c.read(page('chan'), b.fetch)).length, 3);
+  assert.equal(b.calls(), 1, 'still fresh at 4999ms');
   t = 1000 + 5000;
-  assert.equal(c.get('chan', 50, undefined, undefined), undefined, 'expired at TTL');
+  await c.read(page('chan'), b.fetch);
+  assert.equal(b.calls(), 2, 'expired at TTL');
 });
 
-test('distinct keys for cursors', () => {
-  const c = new HistoryCache(5000, 500, () => 0);
-  c.set('chan', 50, 'before1', undefined, msgs(1));
-  c.set('chan', 50, 'before2', undefined, msgs(2));
-  assert.equal(c.get('chan', 50, 'before1', undefined)?.length, 1);
-  assert.equal(c.get('chan', 50, 'before2', undefined)?.length, 2);
+test('a page lives for the TTL from when it is stored, not from when its read began', async () => {
+  let t = 0;
+  const c = new HistoryCache(5000, 500, () => t);
+  await c.read(page('chan'), async () => {
+    t = 6000;
+    return msgs(1);
+  });
+  t = 6000 + 4999;
+  assert.ok(await c.read(page('chan'), cachedOnly));
 });
 
-test('invalidate drops only that channel', () => {
+test('a read that returns or throws leaves no read under way', async () => {
   const c = new HistoryCache(5000, 500, () => 0);
-  c.set('a', 50, undefined, undefined, msgs(1));
-  c.set('b', 50, undefined, undefined, msgs(1));
+  await c.read(page('a'), bot().fetch);
+  await assert.rejects(
+    c.read(page('b'), async () => {
+      throw new Error('Discord refused the read');
+    }),
+  );
+  assert.equal((c as unknown as { reading: Map<string, unknown> }).reading.size, 0);
+});
+
+test('distinct keys for cursors', async () => {
+  const c = new HistoryCache(5000, 500, () => 0);
+  await c.read(page('chan', 50, 'before1'), bot(1).fetch);
+  await c.read(page('chan', 50, 'before2'), bot(2).fetch);
+  assert.equal((await c.read(page('chan', 50, 'before1'), cachedOnly)).length, 1);
+  assert.equal((await c.read(page('chan', 50, 'before2'), cachedOnly)).length, 2);
+});
+
+test('invalidate drops only that channel', async () => {
+  const c = new HistoryCache(5000, 500, () => 0);
+  await c.read(page('a'), bot().fetch);
+  await c.read(page('b'), bot().fetch);
   c.invalidate('a');
-  assert.equal(c.get('a', 50, undefined, undefined), undefined);
-  assert.ok(c.get('b', 50, undefined, undefined));
+  const again = bot();
+  await c.read(page('a'), again.fetch);
+  assert.equal(again.calls(), 1);
+  assert.ok(await c.read(page('b'), cachedOnly));
 });
 
-test('ttl=0 disables the cache', () => {
+test('ttl=0 disables the cache', async () => {
   const c = new HistoryCache(0, 500, () => 0);
-  c.set('a', 50, undefined, undefined, msgs(1));
-  assert.equal(c.get('a', 50, undefined, undefined), undefined);
+  const b = bot();
+  await c.read(page('a'), b.fetch);
+  await c.read(page('a'), b.fetch);
+  assert.equal(b.calls(), 2);
   assert.equal(c.enabled, false);
 });
 
-test('LRU eviction respects cap', () => {
+test('LRU eviction respects cap', async () => {
   const c = new HistoryCache(5000, 2, () => 0);
-  c.set('a', 1, undefined, undefined, msgs(1));
-  c.set('b', 1, undefined, undefined, msgs(1));
-  c.set('c', 1, undefined, undefined, msgs(1)); // evicts 'a' (oldest)
-  assert.equal(c.get('a', 1, undefined, undefined), undefined);
-  assert.ok(c.get('b', 1, undefined, undefined));
-  assert.ok(c.get('c', 1, undefined, undefined));
+  await c.read(page('a', 1), bot().fetch);
+  await c.read(page('b', 1), bot().fetch);
+  await c.read(page('c', 1), bot().fetch); // evicts 'a' (oldest)
+  assert.ok(await c.read(page('b', 1), cachedOnly));
+  assert.ok(await c.read(page('c', 1), cachedOnly));
+  const again = bot();
+  await c.read(page('a', 1), again.fetch);
+  assert.equal(again.calls(), 1);
+});
+
+test('a read whose place changed while it read returns its page and stores nothing; a read begun after the change stores its page', async () => {
+  const c = new HistoryCache(5000, 500, () => 0);
+  let answer!: () => void;
+  const overtaken = c.read(page('chan'), () => new Promise((resolve) => (answer = () => resolve(msgs(1)))));
+  c.invalidate('chan');
+  answer();
+  assert.equal((await overtaken).length, 1, 'the overtaken read still returns its page');
+  const next = bot(2);
+  assert.equal((await c.read(page('chan'), next.fetch)).length, 2);
+  assert.equal(next.calls(), 1, 'the overtaken page was not stored');
+  assert.equal((await c.read(page('chan'), cachedOnly)).length, 2, 'the read begun after the change stored its page');
+});
+
+test('a read still under way when another read of its place ends is overtaken by a later change', async () => {
+  const c = new HistoryCache(5000, 500, () => 0);
+  let answerFirst!: () => void;
+  let answerSecond!: () => void;
+  const first = c.read(page('chan'), () => new Promise((resolve) => (answerFirst = () => resolve(msgs(1)))));
+  const second = c.read(page('chan'), () => new Promise((resolve) => (answerSecond = () => resolve(msgs(1)))));
+  answerFirst();
+  await first;
+  c.invalidate('chan');
+  answerSecond();
+  await second;
+  const next = bot(2);
+  assert.equal((await c.read(page('chan'), next.fetch)).length, 2);
+  assert.equal(next.calls(), 1, 'the overtaken page was not stored');
 });
