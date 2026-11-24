@@ -29,18 +29,33 @@ test("send_message returns the first part's answer, pingCleared with it, for a m
   assert.deepEqual(result, { messageId: 'rm_a', pingCleared: true });
 });
 
-test('a message whose later part fails says that its first part cleared the ping', async () => {
+async function failingSecondPart(firstAnswer: object, args: Record<string, unknown>): Promise<string> {
   const { client } = relay();
   let calls = 0;
   Object.assign(client, {
     sendMessage: async () => {
-      if (++calls === 1) return { messageId: 'rm_a', pingCleared: true };
+      if (++calls === 1) return firstAnswer;
       throw new Error('Discord refused part two');
     },
   });
   const agent = new PortalAgent(client, { state: new AgentState() });
-  await assert.rejects(
-    agent.handleToolCall('send_message', { channelId: CH, content: 'x'.repeat(4500), replyToId: 'rm_y' }),
-    /Only part of the message was sent.*The first part cleared the pending ping it replied to \(pingCleared\)\./s,
+  const err = await agent.handleToolCall('send_message', { channelId: CH, content: 'x'.repeat(4500), ...args }).then(
+    () => assert.fail('the send should fail'),
+    (e: unknown) => (e as Error).message,
   );
+  assert.equal(calls, 2);
+  assert.match(err, /^Only part of the message was sent/);
+  return err;
+}
+
+test('a message whose later part fails says whether its first part cleared the ping', async () => {
+  const cleared = await failingSecondPart({ messageId: 'rm_a', pingCleared: true }, { replyToId: 'rm_y' });
+  assert.match(cleared, /The first part cleared the pending ping it replied to \(pingCleared\)\./);
+  assert.doesNotMatch(cleared, /cleared no pending ping/);
+
+  const notCleared = await failingSecondPart({ messageId: 'rm_a' }, { replyToId: 'rm_y' });
+  assert.match(notCleared, /The first part cleared no pending ping\./);
+
+  const noReply = await failingSecondPart({ messageId: 'rm_a' }, {});
+  assert.doesNotMatch(noReply, /ping/);
 });
