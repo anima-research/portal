@@ -27,7 +27,7 @@ import type { PortalClient } from '@animalabs/portal-client';
 import type { ChannelUnread, PortalMessage } from '@animalabs/portal-protocol';
 import type { PortalAgent } from './agent.js';
 import type { WakePayload, WakeSink } from './wake-sink.js';
-import { SENT_BEFORE, catchUpHead, clearingNotes, forgetSentNotPending, messageMark } from './catch-up.js';
+import { SENT_BEFORE, catchUpHead, clearingNotes, forgetSentNotPending } from './catch-up.js';
 import { IDENTITY_TOOL_FEATURE_SETS, identityToolDefinitions, type IdentityToolHandler } from './identity.js';
 
 /** Claude Code's channel push notification method. */
@@ -274,7 +274,7 @@ export class PortalCcChannelServer {
         const why = fresh.find((f) => f.message.id === p.id)?.reasons ?? [];
         // A message in a thread names it: a reply goes there only with threadId.
         const thread = p.threadId ? ` [thread ${p.threadId}]` : '';
-        return (why.length ? ` (${why.join(',')})` : '') + (sentBefore.has(p.id) ? SENT_BEFORE : '') + messageMark(p.id) + thread;
+        return (why.length ? ` (${why.join(',')})` : '') + (sentBefore.has(p.id) ? SENT_BEFORE : '') + thread;
       }));
       lines.push(...this.remainingNotes(missed, all));
       lines.push(

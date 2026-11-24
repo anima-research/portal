@@ -113,7 +113,7 @@ const lineOf = (wake: Wake, id: string) => wake.content.split('\n').find((l) => 
 const NEW_HEAD = '[catch-up] 1 message(s) addressed to you while you were away:';
 const MAY_HAVE_ANSWER = '[a mention marked (sent before) may already have an answer]';
 const TO_CLEAR =
-  '[to clear a mention, reply with send_message and its id as replyToId, where the relay supports it, or mark_read its channel]';
+  '[to clear a mention, reply with send_message and its id from get_pending_pings as replyToId, where the relay supports it, or mark_read its channel]';
 const EARLIER_HEAD =
   '[catch-up] nothing new was addressed to you while you were away. 1 message(s) sent to you before are still pending:';
 
@@ -150,7 +150,6 @@ test('a mention sent to an earlier process reads "nothing new", marked "(sent be
   first.mention(m1);
   await first.settle();
   assert.equal(first.wakes.length, 1);
-  assert.doesNotMatch(first.wakes[0].content, /\[message /, 'a live wake names no ids');
 
   const wake = await nextCatchUp(first.state.toJSON(), [m1]);
   assert.equal(head(wake), EARLIER_HEAD);
@@ -167,9 +166,9 @@ test('a catch-up counts the new mentions and the ones sent before, and marks onl
 
   const wake = await nextCatchUp(first.state.toJSON(), [m1, m2]);
   assert.equal(head(wake), '[catch-up] 1 message(s) addressed to you while you were away, and 1 sent to you before and still pending:');
-  assert.match(lineOf(wake, 'm1'), /\(sent before\) \[message m1\]/);
+  assert.match(lineOf(wake, 'm1'), /\(sent before\)/);
   assert.doesNotMatch(lineOf(wake, 'm2'), /sent before/);
-  assert.match(lineOf(wake, 'm2'), /\[message m2\]/);
+  assert.doesNotMatch(wake.content, /\[message /, 'a catch-up names no message ids');
   const notes = wake.content.split('\n').slice(-2);
   assert.deepEqual(notes, [MAY_HAVE_ANSWER, TO_CLEAR]);
 });
@@ -421,7 +420,7 @@ test('a host push is saved when the host accepts it, and not when the host decli
     assert.equal(lines.at(-3) === MAY_HAVE_ANSWER, accepted);
     if (accepted) {
       assert.equal(lines[0], EARLIER_HEAD);
-      assert.match(lines.find((l) => l.includes('message m1')) ?? '', /\(sent before\) \[message m1\]/);
+      assert.match(lines.find((l) => l.includes('message m1')) ?? '', /\(sent before\)/);
     } else {
       assert.equal(lines[0], NEW_HEAD);
       assert.doesNotMatch(text, /sent (before|to you)/);
