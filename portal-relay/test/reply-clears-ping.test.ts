@@ -41,7 +41,12 @@ function setup() {
       },
     }),
   );
-  return { dir, identityPath, permissionsPath, readStatePath };
+  return { dir, identityPath, permissionsPath, readStatePath, relays: [] as Array<{ readState: { flush(): void } }> };
+}
+
+function teardown(paths: ReturnType<typeof setup>) {
+  for (const relay of paths.relays) relay.readState.flush();
+  rmSync(paths.dir, { recursive: true, force: true });
 }
 
 function makeRelay(paths: ReturnType<typeof setup>, opts: { replyLink?: boolean } = {}) {
@@ -55,6 +60,7 @@ function makeRelay(paths: ReturnType<typeof setup>, opts: { replyLink?: boolean 
     allowPathFiles: false, replyLink: opts.replyLink ?? false,
   };
   const relay = new Relay(config) as any;
+  paths.relays.push(relay);
   const metas: Record<string, { id: string; isThread: boolean; guildId: string }> = {
     [CHANNEL]: { id: CHANNEL, isThread: false, guildId: GUILD },
     [READ_ONLY]: { id: READ_ONLY, isThread: false, guildId: GUILD },
@@ -123,7 +129,7 @@ test('a reply clears the ping it answers, and only that one; the channel stays u
     assert.deepEqual(await rpc('list_unread', {}), unreadBefore);
     assert.deepEqual(await rpc('channel_missed', { channelId: CHANNEL }), missedBefore);
   } finally {
-    rmSync(paths.dir, { recursive: true, force: true });
+    teardown(paths);
   }
 });
 
@@ -142,7 +148,7 @@ test('a reply to a message that is no pending ping of the sender changes nothing
     assert.equal('pingCleared' in result, false);
     assert.deepEqual(await pendingIds(rpc), before);
   } finally {
-    rmSync(paths.dir, { recursive: true, force: true });
+    teardown(paths);
   }
 });
 
@@ -167,7 +173,7 @@ test('a refused or failed send leaves the ping pending', async () => {
     assert.equal(posts, 1);
     assert.deepEqual(await pendingIds(rpc), pings);
   } finally {
-    rmSync(paths.dir, { recursive: true, force: true });
+    teardown(paths);
   }
 });
 
@@ -184,7 +190,7 @@ test('the reply clears its ping with the quoted reply link on too', async () => 
     assert.equal(result.pingCleared, true);
     assert.deepEqual(await pendingIds(rpc), []);
   } finally {
-    rmSync(paths.dir, { recursive: true, force: true });
+    teardown(paths);
   }
 });
 
@@ -218,7 +224,7 @@ test('a cleared ping is written to the read-state file, and stays cleared when t
     const after = makeRelay(paths);
     assert.deepEqual(await pendingIds(after.rpc), [second]);
   } finally {
-    rmSync(paths.dir, { recursive: true, force: true });
+    teardown(paths);
   }
 });
 
@@ -235,6 +241,6 @@ test("a reply clears the sender's ping and leaves another persona's ping for the
     assert.deepEqual(await pendingIds(rpc), []);
     assert.deepEqual(await pendingIds(rpc, TWIN), [ping]);
   } finally {
-    rmSync(paths.dir, { recursive: true, force: true });
+    teardown(paths);
   }
 });
