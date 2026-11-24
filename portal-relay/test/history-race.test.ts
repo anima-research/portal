@@ -93,6 +93,7 @@ function makeRelay(ttl = 60_000) {
   let sent = 0;
   let editGate: Promise<void> = Promise.resolve();
   let editStarted: (() => void) | undefined;
+  let editFails = false;
   relay.webhooks = {
     send: async (_channelId: string, _personaId: string, opts: { content: string; threadId?: string }) => {
       const messageId = `own-${++sent}`;
@@ -106,6 +107,10 @@ function makeRelay(ttl = 60_000) {
       await editGate;
       const place = threadId ?? CHAN;
       discord[place] = discord[place]!.map((m) => (m.id === messageId ? { ...m, content, cleanContent: content } : m));
+      if (editFails) {
+        editFails = false;
+        throw new Error('The edit request timed out');
+      }
     },
   };
 
@@ -116,6 +121,7 @@ function makeRelay(ttl = 60_000) {
     hold: (n = 1) => { toHold = n; },
     answer: () => answers.shift()!(),
     nextRead: () => new Promise<void>((resolve) => (readStarted = resolve)),
+    failNextEdit: () => { editFails = true; },
     holdEdit: () => {
       let release!: () => void;
       editGate = new Promise((resolve) => (release = resolve));
@@ -147,19 +153,27 @@ async function heldRead(w: ReturnType<typeof makeRelay>, params: Record<string, 
   return { answered };
 }
 
-test('a message that arrives while a page is read: the next call of the same shape reads Discord again, and has it', async () => {
-  const w = makeRelay();
-  try {
-    w.hold();
-    const { answered: first } = await heldRead(w, { channelId: CHAN, limit: 5 });
-    w.arrive(CHAN, incoming({ id: '200', content: 'NEW', cleanContent: 'NEW' }));
-    w.answer();
-    assert.deepEqual(contents(await first), ['old'], 'the overtaken read returns the page it read');
-    const second = await w.rpc('fetch_history', { channelId: CHAN, limit: 5 });
-    assert.deepEqual(contents(second), ['NEW', 'old']);
-    assert.equal(w.reads.length, 2);
-  } finally { w.cleanup(); }
-});
+const places = [
+  { name: 'a channel', read: { channelId: CHAN, limit: 5 }, place: CHAN, id: '100' },
+  { name: 'a thread', read: { channelId: CHAN, threadId: THREAD, limit: 5 }, place: THREAD, id: '101' },
+];
+
+for (const { name, read, place } of places) {
+  test(`a message that arrives in ${name} while a page of it is read: the next call of the same shape reads Discord again, and has it`, async () => {
+    const w = makeRelay();
+    try {
+      w.hold();
+      const { answered: first } = await heldRead(w, read);
+      const message = { id: '200', content: 'NEW', cleanContent: 'NEW' };
+      w.arrive(place, place === THREAD ? inThread(message) : incoming(message));
+      w.answer();
+      assert.deepEqual(contents(await first), ['old'], 'the overtaken read returns the page it read');
+      const second = await w.rpc('fetch_history', read);
+      assert.deepEqual(contents(second), ['NEW', 'old']);
+      assert.equal(w.reads.length, 2);
+    } finally { w.cleanup(); }
+  });
+}
 
 test('with no change while a page is read, the next call of the same shape within the cache life reads no Discord', async () => {
   const w = makeRelay();
@@ -170,10 +184,6 @@ test('with no change while a page is read, the next call of the same shape withi
   } finally { w.cleanup(); }
 });
 
-const places = [
-  { name: 'a channel', read: { channelId: CHAN, limit: 5 }, place: CHAN, id: '100' },
-  { name: 'a thread', read: { channelId: CHAN, threadId: THREAD, limit: 5 }, place: THREAD, id: '101' },
-];
 for (const change of ['an edit', 'a delete'] as const) {
   for (const { name, read, place, id } of places) {
     test(`${change} that reaches ${name} while a page of it is read keeps the page from being stored`, async () => {
@@ -278,6 +288,17 @@ test("a read that starts while a persona's edit is on its way to Discord, and re
     await editing;
     w.answer();
     assert.equal(contents(await answered)[0], 'first');
+    assert.equal(contents(await w.rpc('fetch_history', { channelId: CHAN, limit: 5 }))[0], 'second');
+  } finally { w.cleanup(); }
+});
+
+test("an edit_message whose webhook call fails after Discord applied the edit still clears the place's cached pages", async () => {
+  const w = makeRelay();
+  try {
+    const { messageId } = await w.rpc('send_message', { channelId: CHAN, content: 'first' });
+    await w.rpc('fetch_history', { channelId: CHAN, limit: 5 });
+    w.failNextEdit();
+    await assert.rejects(w.rpc('edit_message', { messageId, content: 'second' }));
     assert.equal(contents(await w.rpc('fetch_history', { channelId: CHAN, limit: 5 }))[0], 'second');
   } finally { w.cleanup(); }
 });

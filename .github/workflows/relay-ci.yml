@@ -3,8 +3,8 @@ name: Relay CI
 # Type-checks the relay and runs its admin-panel tests: the admin API, the
 # slash commands, the permission and invite stores, and the panel's own client
 # scripts (test/admin-spa.test.ts loads portal-admin/*.js in node:vm). It also
-# runs the channel-creation gate tests, the voice tests and the invite claim
-# tests. The rest of the relay suite (the gateway's among it) is not run here;
+# runs the channel-creation gate tests, the voice tests, the invite claim
+# tests and the history cache tests. The rest of the relay suite (the gateway's among it) is not run here;
 # the gateway logging test is known to be flaky.
 
 on:

@@ -1391,8 +1391,11 @@ export class Relay implements GatewayHooks {
         }
         this.requireCap(personaId, ref.channelId, 'EDIT_OWN');
         await this.webhooks.ensureLoaded(ref.channelId); // adopt webhooks post-restart
-        await this.webhooks.edit(ref.webhookId, ref.discordMsgId, p.content, ref.threadId);
-        this.history.invalidate(ref.threadId ?? ref.channelId);
+        try {
+          await this.webhooks.edit(ref.webhookId, ref.discordMsgId, p.content, ref.threadId);
+        } finally {
+          this.history.invalidate(ref.threadId ?? ref.channelId);
+        }
         return {};
       }
       case 'delete_message': {
