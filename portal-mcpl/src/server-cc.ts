@@ -277,7 +277,10 @@ export class PortalCcChannelServer {
         return (why.length ? ` (${why.join(',')})` : '') + (sentBefore.has(p.id) ? SENT_BEFORE : '') + messageMark(p.id) + thread;
       }));
       lines.push(...this.remainingNotes(missed, all));
-      lines.push('\n[use fetch_history / fetch_around to read surrounding context]', ...clearingNotes(sentBefore.size > 0));
+      lines.push(
+        '\n[use fetch_history / fetch_around to read surrounding context]',
+        ...clearingNotes(sentBefore.size > 0),
+      );
       if (fresh.some((p) => p.message.threadId)) {
         lines.push('[to reply in a thread, call send_message with the channel as channelId and the thread as threadId]');
       }
@@ -588,7 +591,7 @@ export class PortalCcChannelServer {
     sink.deliver(wake).then(
       (cut) => {
         if (process.env.PORTAL_DEBUG) console.error(`[portal-cc] wake delivered via ${sink.kind} (${wake.meta.channelId})`);
-        if (!cut) b.agent.state.noteSent(sentIds);
+        if (!cut && b.client === this.client) b.agent.state.noteSent(sentIds);
         onDelivered?.();
       },
       (err: Error) => {

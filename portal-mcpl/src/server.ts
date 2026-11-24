@@ -995,7 +995,9 @@ export class PortalMcplServer {
           } satisfies ChannelsIncomingParams)
           .then(
             (answer) => {
-              if (addressedToMe && incomingAccepted(answer, message.id)) noteSentAndPrune(agent, message.id);
+              if (this.swapEpoch === epoch && addressedToMe && incomingAccepted(answer, message.id)) {
+                noteSentAndPrune(agent, message.id);
+              }
             },
             (err) => this.notePushRejection('inbound message', err),
           );
@@ -1024,7 +1026,7 @@ export class PortalMcplServer {
           } satisfies PushEventParams)
           .then(
             (answer) => {
-              if (addressedToMe && pushAccepted(answer)) noteSentAndPrune(agent, message.id);
+              if (this.swapEpoch === epoch && addressedToMe && pushAccepted(answer)) noteSentAndPrune(agent, message.id);
             },
             (err) => this.notePushRejection('message push', err),
           );
@@ -1146,7 +1148,7 @@ export class PortalMcplServer {
       } satisfies PushEventParams)
       .then(
         (answer) => {
-          if (pushAccepted(answer)) state.noteSent(fresh.map((p) => p.message.id));
+          if (this.swapEpoch === epoch && pushAccepted(answer)) state.noteSent(fresh.map((p) => p.message.id));
         },
         (err) => this.notePushRejection('catch-up push', err),
       );

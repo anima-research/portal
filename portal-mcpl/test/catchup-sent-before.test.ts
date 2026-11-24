@@ -335,6 +335,21 @@ test('a wake dropped by an identity switch is saved in neither persona', async (
   assert.deepEqual(savedSent(stateB), []);
 });
 
+test('a sink answer that comes after an identity switch saves nothing', async () => {
+  const m1 = msg('m1', 1);
+  const done = gate();
+  const { sink, delivered } = recordingSink(() => done.opened);
+  const a = ccProcess(undefined, { wakeSink: sink });
+  a.mention(m1);
+  await a.settle();
+  assert.equal(delivered.length, 1);
+  const b = relay('q');
+  await a.server.swapSession(b.client, new PortalAgent(b.client, { state: new AgentState() }));
+  done.open();
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(savedSent(a.state), []);
+});
+
 type Push = { payload: { content: Array<{ text: string }> } };
 
 function hostProcess(saved: unknown, answer: unknown, opts: { open?: boolean } = {}) {
@@ -418,6 +433,23 @@ test('a host push is saved only once the host has answered it', async () => {
     answered.open();
     await new Promise((r) => setImmediate(r));
     assert.equal(first.state.wasSent('m1'), true, method);
+  }
+});
+
+test('a host answer that comes after an identity switch saves nothing', async () => {
+  for (const open of [false, true]) {
+    const answered = gate();
+    const answer = answered.opened.then(() =>
+      open ? { results: [{ messageId: 'm1', accepted: true }] } : { accepted: true },
+    );
+    const first = hostProcess(undefined, answer, { open });
+    await first.mention(msg('m1', 1));
+    const b = relay('q');
+    const server = first.internal as unknown as { swapSession(c: PortalClient, a: PortalAgent): Promise<void> };
+    await server.swapSession(b.client, new PortalAgent(b.client, { state: new AgentState(), hostOwnsChannelLifecycle: true }));
+    answered.open();
+    for (let turn = 0; turn < 5; turn++) await new Promise((r) => setImmediate(r));
+    assert.equal(first.state.wasSent('m1'), false, open ? 'channels/incoming' : 'push/event');
   }
 });
 
