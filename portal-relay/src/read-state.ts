@@ -201,10 +201,12 @@ export class ReadStateStore {
     return [...(this.inboxes.get(personaId)?.pings ?? [])];
   }
 
-  clearPing(personaId: string, messageId: string): boolean {
+  clearPing(personaId: string, messageId: string, containerId: string): boolean {
     const ib = this.inboxes.get(personaId);
     if (!ib) return false;
-    const left = ib.pings.filter((p) => p.message.id !== messageId);
+    const left = ib.pings.filter(
+      (p) => p.message.id !== messageId || (p.message.threadId ?? p.message.channelId) !== containerId,
+    );
     if (left.length === ib.pings.length) return false;
     ib.pings = left;
     this.scheduleFlush();

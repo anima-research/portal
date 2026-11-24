@@ -9,6 +9,7 @@ import type { RelayConfig } from '../src/config.js';
 const GUILD = 'g1';
 const CHANNEL = 'chan-1';
 const READ_ONLY = 'chan-ro';
+const OTHER = 'chan-2';
 const ALICE = 'alice';
 const TWIN = 'twin';
 const WEBHOOK = 'wh-1';
@@ -35,7 +36,7 @@ function setup() {
       personas: {
         [ALICE]: {
           default: [],
-          guilds: { [GUILD]: { default: [], channels: { [CHANNEL]: FULL, [READ_ONLY]: ['VIEW_CHANNEL', 'READ_HISTORY'] } } },
+          guilds: { [GUILD]: { default: [], channels: { [CHANNEL]: FULL, [OTHER]: FULL, [READ_ONLY]: ['VIEW_CHANNEL', 'READ_HISTORY'] } } },
         },
         [TWIN]: { default: [], guilds: { [GUILD]: { default: [], channels: { [CHANNEL]: FULL } } } },
       },
@@ -64,6 +65,7 @@ function makeRelay(paths: ReturnType<typeof setup>, opts: { replyLink?: boolean 
   const metas: Record<string, { id: string; isThread: boolean; guildId: string }> = {
     [CHANNEL]: { id: CHANNEL, isThread: false, guildId: GUILD },
     [READ_ONLY]: { id: READ_ONLY, isThread: false, guildId: GUILD },
+    [OTHER]: { id: OTHER, isThread: false, guildId: GUILD },
   };
   relay.bot = {
     getChannelMeta: async (id: string) => metas[id] ?? null,
@@ -240,6 +242,25 @@ test("a reply clears the sender's ping and leaves another persona's ping for the
 
     assert.deepEqual(await pendingIds(rpc), []);
     assert.deepEqual(await pendingIds(rpc, TWIN), [ping]);
+  } finally {
+    teardown(paths);
+  }
+});
+
+test('a reply posted in another channel leaves the ping pending', async () => {
+  const paths = setup();
+  try {
+    const { relay, rpc, sent } = makeRelay(paths);
+    arrive(relay, 'd1', CHANNEL, ['role-alice']);
+    const [ping] = await pendingIds(rpc);
+    const elsewhere = await rpc('send_message', { channelId: OTHER, content: 'answer', replyToId: ping });
+    assert.equal(sent.length, 1, 'the reply was posted');
+    assert.equal(elsewhere.pingCleared, undefined);
+    assert.deepEqual(await pendingIds(rpc), [ping]);
+
+    const here = await rpc('send_message', { channelId: CHANNEL, content: 'answer', replyToId: ping });
+    assert.equal(here.pingCleared, true);
+    assert.deepEqual(await pendingIds(rpc), []);
   } finally {
     teardown(paths);
   }

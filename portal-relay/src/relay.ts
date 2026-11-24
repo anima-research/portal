@@ -1817,7 +1817,9 @@ export class Relay implements GatewayHooks {
       personaId,
       webhookId,
     });
-    const pingCleared = p.replyToId !== undefined && this.readState.clearPing(personaId, p.replyToId);
+    const pingCleared =
+      p.replyToId !== undefined &&
+      this.readState.clearPing(personaId, p.replyToId, target.threadId ?? target.parentChannelId);
     return pingCleared ? { messageId: ref.relayId, pingCleared } : { messageId: ref.relayId };
   }
 
