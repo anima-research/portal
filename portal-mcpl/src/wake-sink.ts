@@ -32,7 +32,6 @@ export interface WakePayload {
   allShownBefore?: true;
 }
 
-/** What a sink answers when it delivered only the end of a wake's content. */
 export interface WakeCut {
   omittedChars: number;
 }
