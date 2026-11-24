@@ -26,7 +26,8 @@ import {
 import type { PortalClient } from '@animalabs/portal-client';
 import type { ChannelUnread, PortalMessage } from '@animalabs/portal-protocol';
 import type { PortalAgent } from './agent.js';
-import type { WakeSink } from './wake-sink.js';
+import type { WakePayload, WakeSink } from './wake-sink.js';
+import { SHOWN_BEFORE, catchUpHead, forgetShownNotPending } from './catch-up.js';
 import { IDENTITY_TOOL_FEATURE_SETS, identityToolDefinitions, type IdentityToolHandler } from './identity.js';
 
 /** Claude Code's channel push notification method. */
@@ -248,7 +249,9 @@ export class PortalCcChannelServer {
     return this.serialized(async () => {
       if (!this.conn || origin.client !== this.client) return; // switched away meanwhile
       const b = origin;
+      const shownBeforeRead = b.agent.state.shownIds();
       const pings = await b.agent.pendingPingsFromRelay();
+      forgetShownNotPending(b.agent.state, shownBeforeRead, pings);
       const fresh = pings.filter((p) => !b.woken.has(p.message.id));
       if (fresh.length === 0) return;
       fresh.sort((a, z) => (a.at < z.at ? -1 : a.at > z.at ? 1 : 0));
@@ -264,13 +267,14 @@ export class PortalCcChannelServer {
       for (const id of pingIds) b.woken.add(id);
       const all = this.planFold(missed, base);
 
-      const lines = [`[catch-up] ${fresh.length} message(s) addressed to you while you were away` +
+      const shownBefore = new Set(fresh.filter((p) => b.agent.state.wasShown(p.message.id)).map((p) => p.message.id));
+      const lines = [catchUpHead(fresh.length - shownBefore.size, shownBefore.size) +
         (missed.length ? `, plus what you missed in ${missed.length} followed channel(s):` : ':')];
       lines.push(this.buildContent(all, pingIds, omitted, (p) => {
         const why = fresh.find((f) => f.message.id === p.id)?.reasons ?? [];
         // A message in a thread names it: a reply goes there only with threadId.
         const thread = p.threadId ? ` [thread ${p.threadId}]` : '';
-        return (why.length ? ` (${why.join(',')})` : '') + thread;
+        return (why.length ? ` (${why.join(',')})` : '') + (shownBefore.has(p.id) ? SHOWN_BEFORE : '') + thread;
       }));
       lines.push(...this.remainingNotes(missed, all));
       lines.push('\n[use fetch_history / fetch_around to read surrounding context, then mark_read]');
@@ -293,7 +297,12 @@ export class PortalCcChannelServer {
       // Every channel with a ping still pending keeps its relay watermark for
       // the agent to advance once it has handled the ping.
       const keep = new Set(pings.map((p) => p.message.channelId));
-      this.deliverWake(b, lines.join('\n'), meta, [...pingIds], () => this.settleFolded(b, missed, keep, all));
+      const wake: WakePayload = {
+        content: lines.join('\n'),
+        meta,
+        ...(shownBefore.size === fresh.length ? { allShownBefore: true } : {}),
+      };
+      this.deliverWake(b, wake, [...pingIds], [...pingIds], () => this.settleFolded(b, missed, keep, all));
     });
   }
 
@@ -563,21 +572,23 @@ export class PortalCcChannelServer {
    *  the wake was built for (`b`), even if a switch happened meanwhile. */
   private deliverWake(
     b: Bound,
-    content: string,
-    meta: Record<string, string>,
+    wake: WakePayload,
     pingIds: string[],
+    shownIds: string[],
     onDelivered?: () => void,
   ): void {
     const sink = this.opts.wakeSink;
     if (!sink) {
       if (!this.conn) return;
-      this.conn.sendNotification(CHANNEL_NOTIFY, { content, meta });
+      this.conn.sendNotification(CHANNEL_NOTIFY, { content: wake.content, meta: wake.meta });
+      b.agent.state.noteShown(shownIds);
       onDelivered?.();
       return;
     }
-    sink.deliver({ content, meta }).then(
-      () => {
-        if (process.env.PORTAL_DEBUG) console.error(`[portal-cc] wake delivered via ${sink.kind} (${meta.channelId})`);
+    sink.deliver(wake).then(
+      (cut) => {
+        if (process.env.PORTAL_DEBUG) console.error(`[portal-cc] wake delivered via ${sink.kind} (${wake.meta.channelId})`);
+        if (!cut) b.agent.state.noteShown(shownIds);
         onDelivered?.();
       },
       (err: Error) => {
@@ -620,7 +631,9 @@ export class PortalCcChannelServer {
     // which channels still hold pending pings, then everything unseen that
     // arrived live (includes this message).
     const missed = await this.collectMissed(b);
+    const shownBeforeRead = b.agent.state.shownIds();
     const pending = await b.agent.pendingPingsFromRelay().catch(() => null);
+    if (pending) forgetShownNotPending(b.agent.state, shownBeforeRead, pending);
     const drained = b.agent.state.drainUnread();
 
     // First contact with this channel → backfill recent history for context.
@@ -666,7 +679,8 @@ export class PortalCcChannelServer {
     // The trigger's channel and every channel with a ping still pending keep
     // their relay watermark; if the pending set couldn't be read, none move.
     const keep = pending === null ? null : new Set([channelId, ...pending.map((p) => p.message.channelId)]);
-    this.deliverWake(b, body, meta, [message.id], () => this.settleFolded(b, missed, keep, all, droppedLive));
+    const shown = baseIds.has(message.id) ? [message.id] : [];
+    this.deliverWake(b, { content: body, meta }, [message.id], shown, () => this.settleFolded(b, missed, keep, all, droppedLive));
   }
 
   /** Render the wake payload: optional truncation note, channel-labeled lines,

@@ -38,6 +38,7 @@ import { chunkText } from './chunk.js';
 import type { AddressReason, PortalEvent, PortalMessage } from '@animalabs/portal-protocol';
 import { shortJson, unknownToolMessage, type PortalAgent } from './agent.js';
 import type { PendingPing } from './agent-state.js';
+import { SHOWN_BEFORE, catchUpHead, forgetShownNotPending } from './catch-up.js';
 import { parsePortalChannelId, portalChannelId, toDescriptor } from './channels.js';
 import { featureSets, TOOL_FEATURE_SETS, type PortalFeatureSet } from './feature-sets.js';
 import {
@@ -964,6 +965,7 @@ export class PortalMcplServer {
     // persona's message and must not go out as the new one's.
     const epoch = this.swapEpoch;
     const woken = this.wokenPings;
+    const state = this.agent.state;
     const meta = wakeMetadata(message, addressedToMe, reasons);
     const tags = deriveTags(message, addressedToMe, reasons);
     const channelMcplId = portalChannelId(message.channelId);
@@ -991,7 +993,12 @@ export class PortalMcplServer {
               },
             ],
           } satisfies ChannelsIncomingParams)
-          .catch((err) => this.notePushRejection('inbound message', err));
+          .then(
+            (answer) => {
+              if (addressedToMe && incomingAccepted(answer, message.id)) state.noteShown([message.id]);
+            },
+            (err) => this.notePushRejection('inbound message', err),
+          );
       } else {
         if (!this.canPush()) return;
         conn
@@ -1015,7 +1022,12 @@ export class PortalMcplServer {
             tags, // MCPL RFC-001 — the host routes/gates on these
             payload: { content },
           } satisfies PushEventParams)
-          .catch((err) => this.notePushRejection('message push', err));
+          .then(
+            (answer) => {
+              if (addressedToMe && pushAccepted(answer)) state.noteShown([message.id]);
+            },
+            (err) => this.notePushRejection('message push', err),
+          );
       }
     });
   }
@@ -1075,6 +1087,8 @@ export class PortalMcplServer {
     if (!this.conn || !this.canPush()) return;
     const conn = this.conn;
     const epoch = this.swapEpoch;
+    const state = this.agent.state;
+    const shownBeforeRead = state.shownIds();
     let pings: PendingPing[];
     try {
       pings = await this.agent.pendingPingsFromRelay();
@@ -1086,16 +1100,19 @@ export class PortalMcplServer {
     // watermark below is consumed, so this has to happen before it moves. An
     // identity swap inside the round trip means these are the OLD persona's.
     if (this.conn !== conn || !this.canPush() || this.swapEpoch !== epoch) return;
+    forgetShownNotPending(state, shownBeforeRead, pings);
     const fresh = pings.filter((p) => !this.wokenPings.has(p.message.id));
     if (fresh.length === 0) return;
     for (const p of fresh) this.wokenPings.add(p.message.id);
     fresh.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
 
-    const lines = [`[catch-up] ${fresh.length} message(s) addressed to you while you were away:`];
+    const shownBefore = new Set(fresh.filter((p) => state.wasShown(p.message.id)).map((p) => p.message.id));
+    const lines = [`${catchUpHead(fresh.length - shownBefore.size, shownBefore.size)}:`];
     for (const p of fresh) {
       // A message in a thread names it: a reply goes there only with threadId.
       const thread = p.message.threadId ? ` [thread ${p.message.threadId}]` : '';
-      lines.push(`— ${this.channelLabel(p.message.channelId)}: ${render(p.message)}${thread}`);
+      const mark = shownBefore.has(p.message.id) ? SHOWN_BEFORE : '';
+      lines.push(`— ${this.channelLabel(p.message.channelId)}: ${render(p.message)}${mark}${thread}`);
     }
     lines.push('[use fetch_history / fetch_around for context, then mark_read]');
     if (fresh.some((p) => p.message.threadId)) {
@@ -1123,7 +1140,12 @@ export class PortalMcplServer {
         tags: ['chat:addressed', 'chat:mention'],
         payload: { content: [textContent(lines.join('\n'))] },
       } satisfies PushEventParams)
-      .catch((err) => this.notePushRejection('catch-up push', err));
+      .then(
+        (answer) => {
+          if (pushAccepted(answer)) state.noteShown(fresh.map((p) => p.message.id));
+        },
+        (err) => this.notePushRejection('catch-up push', err),
+      );
   }
 
   /** `#name (Guild)` — the same label the descriptors carry and every
@@ -1333,6 +1355,21 @@ export class PortalMcplServer {
 function descriptorKey(descriptor: ReturnType<typeof toDescriptor>): string {
   const { initiallyOpen: _open, ...content } = descriptor;
   return JSON.stringify(content);
+}
+
+function pushAccepted(answer: unknown): boolean {
+  return typeof answer === 'object' && answer !== null && 'accepted' in answer && answer.accepted === true;
+}
+
+function incomingAccepted(answer: unknown, messageId: string): boolean {
+  if (typeof answer !== 'object' || answer === null || !('results' in answer) || !Array.isArray(answer.results)) {
+    return false;
+  }
+  return answer.results.some(
+    (r: unknown) =>
+      typeof r === 'object' && r !== null && 'messageId' in r && r.messageId === messageId &&
+      'accepted' in r && r.accepted === true,
+  );
 }
 
 /** discord-mcpl-parity wake flags, derived from the relay's AddressInfo. The
