@@ -324,8 +324,9 @@ export class PortalCcChannelServer {
    * The relay keeps tallies, not bodies (Discord is the durable store). Each
    * followed channel with unread is paged from its watermark — forward where
    * the relay speaks `direction: 'forward'` (protocol v6, portal#98), and by
-   * the backward walk on older relays, detected per call by the missing
-   * `forward` echo — and so is
+   * the backward walk on older relays, detected on the walk's first call by
+   * the missing `forward` echo (a later missing echo is a mid-walk contract
+   * change and refuses the channel for this wake) — and so is
    * every thread under it with missed replies, because a thread reply counts
    * toward (and shares the watermark of) its parent channel but is not in the
    * parent's own history. A channel with more missed than FOLD_BOUND, or more
@@ -406,9 +407,11 @@ export class PortalCcChannelServer {
   /** One container's messages in (since, upto], oldest first. Asks the relay
    *  for the forward walk (`direction: 'forward'`, protocol v6 / portal#98)
    *  so the oldest unseen arrives first and each page's newest id is the
-   *  next cursor; when the `forward` echo is missing — a relay that predates
-   *  v6 served the NEWEST page above the cursor instead — the page is handed
-   *  to the backward walk, which speaks exactly that older contract. `since`
+   *  next cursor; when the `forward` echo is missing on the FIRST call — a
+   *  relay that predates v6 served the NEWEST page above the cursor instead —
+   *  the page is handed to the backward walk, which speaks exactly that older
+   *  contract. A later missing echo is a mid-walk contract change (a rollback
+   *  between pages) and returns null, so nothing is marked read. `since`
    *  is required: the caller's floor guard bails before this when no
    *  watermark or first-unread time exists, so there is no walk-from-the-top
    *  case. null as soon as more than FOLD_BOUND in-window messages have
