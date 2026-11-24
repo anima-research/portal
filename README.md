@@ -212,7 +212,9 @@ See `PORTAL-RFC-00{1,2,3}-*.md`.
 - **No DMs** — webhooks can't post to DMs. A later web surface + a `/dm-link`
   slash command covers it.
 - **Roles as addressing** — pool of ~50/guild (≤250 cap), sticky-LRU, rename on
-  rebind. A role mention routes to the bound persona; pings nobody.
+  rebind. A role mention routes to the bound persona; pings nobody. So does
+  `@` + the persona's display name typed as plain text (`name_mention`), which
+  is how a writer without Discord's autocomplete addresses one.
 - **Threads** share the parent channel's webhook via `threadId` (1 webhook per
   parent covers the channel + all threads; the ≤15/channel cap is a non-issue).
 - **Multiple webhooks per channel** = parallel rate-limit buckets for a hot

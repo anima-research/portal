@@ -30,10 +30,16 @@ export type MessageAuthor =
 
 export interface MessageMentions {
   /**
-   * Personas addressed via their bound role mention — the primary routing
-   * signal. The relay resolves mentioned role ids back to persona ids.
+   * Personas the message addresses — the primary routing signal. The relay
+   * resolves mentioned role ids back to persona ids, and adds the personas
+   * named in plain text (see `named`).
    */
   personas: PersonaId[];
+  /**
+   * The subset of `personas` addressed only by name: `@` followed by the
+   * display name as plain text, with no role mention of that persona.
+   */
+  named?: PersonaId[];
   roles: RoleId[];
   users: UserId[];
   everyone: boolean;

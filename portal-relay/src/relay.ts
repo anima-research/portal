@@ -1962,10 +1962,11 @@ export class Relay implements GatewayHooks {
     }
   }
 
-  /** Why a message is addressed to a persona: role mention and/or reply. */
+  /** Why a message is addressed to a persona: a mention (by role or by name) and/or a reply. */
   private reasonsFor(message: PortalMessage, personaId: string): AddressReason[] {
     const reasons: AddressReason[] = [];
-    if (message.mentions.personas.includes(personaId)) reasons.push('role_mention');
+    if (message.mentions.named?.includes(personaId)) reasons.push('name_mention');
+    else if (message.mentions.personas.includes(personaId)) reasons.push('role_mention');
     if (message.replyToId) {
       const ref = this.store.getByRelayId(message.replyToId);
       if (ref?.personaId === personaId) reasons.push('reply');
@@ -2157,11 +2158,16 @@ export class Relay implements GatewayHooks {
     }
 
     const personas: string[] = [];
+    let named: string[] = [];
     if (inc.guildId) {
       for (const roleId of inc.mentionRoleIds) {
         const pid = this.roles.resolveRole(inc.guildId, roleId);
         if (pid) personas.push(pid);
       }
+      // `@Name` as plain text addresses the persona too: the raw content holds
+      // a real mention as `<@&id>`, so only typed names match here.
+      named = this.roles.namedIn(inc.guildId, inc.content).filter((pid) => !personas.includes(pid));
+      personas.push(...named);
     }
 
     // Reply target lives in the same container; its id is deterministic, so we
@@ -2185,6 +2191,7 @@ export class Relay implements GatewayHooks {
       attachments: inc.attachments,
       mentions: {
         personas,
+        ...(named.length ? { named } : {}),
         roles: inc.mentionRoleIds,
         users: inc.mentionUserIds,
         everyone: inc.mentionsEveryone,
