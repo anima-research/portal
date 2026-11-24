@@ -38,7 +38,7 @@ import { chunkText } from './chunk.js';
 import type { AddressReason, PortalEvent, PortalMessage } from '@animalabs/portal-protocol';
 import { shortJson, unknownToolMessage, type PortalAgent } from './agent.js';
 import type { PendingPing } from './agent-state.js';
-import { SHOWN_BEFORE, catchUpHead, forgetShownNotPending } from './catch-up.js';
+import { SHOWN_BEFORE, catchUpHead, forgetShownNotPending, noteShownAndPrune } from './catch-up.js';
 import { parsePortalChannelId, portalChannelId, toDescriptor } from './channels.js';
 import { featureSets, TOOL_FEATURE_SETS, type PortalFeatureSet } from './feature-sets.js';
 import {
@@ -965,7 +965,7 @@ export class PortalMcplServer {
     // persona's message and must not go out as the new one's.
     const epoch = this.swapEpoch;
     const woken = this.wokenPings;
-    const state = this.agent.state;
+    const agent = this.agent;
     const meta = wakeMetadata(message, addressedToMe, reasons);
     const tags = deriveTags(message, addressedToMe, reasons);
     const channelMcplId = portalChannelId(message.channelId);
@@ -995,7 +995,7 @@ export class PortalMcplServer {
           } satisfies ChannelsIncomingParams)
           .then(
             (answer) => {
-              if (addressedToMe && incomingAccepted(answer, message.id)) state.noteShown([message.id]);
+              if (addressedToMe && incomingAccepted(answer, message.id)) noteShownAndPrune(agent, message.id);
             },
             (err) => this.notePushRejection('inbound message', err),
           );
@@ -1024,7 +1024,7 @@ export class PortalMcplServer {
           } satisfies PushEventParams)
           .then(
             (answer) => {
-              if (addressedToMe && pushAccepted(answer)) state.noteShown([message.id]);
+              if (addressedToMe && pushAccepted(answer)) noteShownAndPrune(agent, message.id);
             },
             (err) => this.notePushRejection('message push', err),
           );

@@ -381,6 +381,18 @@ test('a host push is saved when the host accepts it, and not when the host decli
   }
 });
 
+test('a mention that the host accepts prunes the saved ids against the pending list, and keeps its own id', async () => {
+  for (const open of [false, true]) {
+    const answer = open ? { results: [{ messageId: 'm1', accepted: true }] } : { accepted: true };
+    const first = hostProcess(undefined, answer, { open });
+    first.state.noteShown(['gone']);
+    first.control.pending = [];
+    await first.mention(msg('m1', 1));
+    for (let turn = 0; turn < 5; turn++) await new Promise((r) => setImmediate(r));
+    assert.deepEqual(savedShown(first.state), ['m1'], open ? 'channels/incoming' : 'push/event');
+  }
+});
+
 test('a host push is saved only once the host has answered it', async () => {
   for (const method of ['push/event', 'channels/incoming']) {
     const answered = gate();

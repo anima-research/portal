@@ -1,4 +1,5 @@
 import type { AgentState, PendingPing } from './agent-state.js';
+import type { PortalAgent } from './agent.js';
 
 export const SHOWN_BEFORE = ' (shown before)';
 
@@ -19,4 +20,13 @@ export function catchUpHead(newCount: number, shownBeforeCount: number): string 
 export function forgetShownNotPending(state: AgentState, shownBeforeRead: string[], pending: PendingPing[]): void {
   const stillPending = new Set(pending.map((p) => p.message.id));
   state.forgetShown(shownBeforeRead.filter((id) => !stillPending.has(id)));
+}
+
+export function noteShownAndPrune(agent: PortalAgent, messageId: string): void {
+  const shownBeforeRead = agent.state.shownIds();
+  agent.state.noteShown([messageId]);
+  agent.pendingPingsFromRelay().then(
+    (pending) => forgetShownNotPending(agent.state, shownBeforeRead, pending),
+    () => {},
+  );
 }
