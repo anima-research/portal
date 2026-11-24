@@ -350,6 +350,26 @@ test('a sink answer that comes after an identity switch saves nothing', async ()
   assert.deepEqual(savedSent(a.state), []);
 });
 
+test('a catch-up says that a mention may already have an answer only when it shows one sent before', async () => {
+  const saved = process.env.PORTAL_CONTEXT_CAP;
+  process.env.PORTAL_CONTEXT_CAP = '1';
+  try {
+    const m1 = msg('m1', 1);
+    const first = ccProcess();
+    first.mention(m1);
+    await first.settle();
+
+    const wake = await nextCatchUp(first.state.toJSON(), [m1, msg('m2', 2)]);
+    assert.equal(lineOf(wake, 'm1'), '', 'the cap left out the mention sent before');
+    assert.equal(head(wake), '[catch-up] 1 message(s) addressed to you while you were away, and 1 sent to you before and still pending:');
+    assert.doesNotMatch(wake.content, /may already have an answer/);
+    assert.equal(wake.content.split('\n').at(-1), TO_CLEAR);
+  } finally {
+    if (saved === undefined) delete process.env.PORTAL_CONTEXT_CAP;
+    else process.env.PORTAL_CONTEXT_CAP = saved;
+  }
+});
+
 type Push = { payload: { content: Array<{ text: string }> } };
 
 function hostProcess(saved: unknown, answer: unknown, opts: { open?: boolean } = {}) {

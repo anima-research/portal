@@ -279,7 +279,7 @@ export class PortalCcChannelServer {
       lines.push(...this.remainingNotes(missed, all));
       lines.push(
         '\n[use fetch_history / fetch_around to read surrounding context]',
-        ...clearingNotes(sentBefore.size > 0),
+        ...clearingNotes(base.some((m) => sentBefore.has(m.id))),
       );
       if (fresh.some((p) => p.message.threadId)) {
         lines.push('[to reply in a thread, call send_message with the channel as channelId and the thread as threadId]');
