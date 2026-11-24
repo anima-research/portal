@@ -29,7 +29,7 @@ const run = promisify(execFile);
 export interface WakePayload {
   content: string;
   meta: Record<string, string>;
-  allShownBefore?: true;
+  allSentBefore?: true;
 }
 
 export interface WakeCut {
@@ -104,7 +104,7 @@ export function readCodexWakeTarget(file: string): CodexWakeTarget | undefined {
 
 /** One header line so the hand knows this is a portal delivery (not its
  *  operator typing), then the same folded context Claude Code would get. */
-export function renderCodexWake({ content, meta, allShownBefore }: WakePayload): string {
+export function renderCodexWake({ content, meta, allSentBefore }: WakePayload): string {
   const where = meta.threadId
     ? `thread ${meta.threadId} (channel ${meta.channelId})`
     : `channel ${meta.channelId}`;
@@ -113,7 +113,7 @@ export function renderCodexWake({ content, meta, allShownBefore }: WakePayload):
     : `send_message(channelId ${meta.channelId})`;
   const head = !meta.catchup
     ? `[portal] ${meta.author} addressed you in ${where} — reply there with ${replyHint}.`
-    : allShownBefore
+    : allSentBefore
       ? '[portal] Messages addressed to you are still pending from an earlier session — reply where each came from with send_message.'
       : '[portal] Messages addressed to you arrived while you were away — reply where each came from with send_message.';
   const omitted = codexWakeOmits(content);

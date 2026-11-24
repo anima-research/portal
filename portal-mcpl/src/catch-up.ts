@@ -1,32 +1,32 @@
 import type { AgentState, PendingPing } from './agent-state.js';
 import type { PortalAgent } from './agent.js';
 
-export const SHOWN_BEFORE = ' (shown before)';
+export const SENT_BEFORE = ' (sent before)';
 
-export function catchUpHead(newCount: number, shownBeforeCount: number): string {
-  if (shownBeforeCount === 0) return `[catch-up] ${newCount} message(s) addressed to you while you were away`;
+export function catchUpHead(newCount: number, sentBeforeCount: number): string {
+  if (sentBeforeCount === 0) return `[catch-up] ${newCount} message(s) addressed to you while you were away`;
   if (newCount === 0) {
     return (
       '[catch-up] nothing new was addressed to you while you were away. ' +
-      `${shownBeforeCount} message(s) shown to an earlier session are still pending`
+      `${sentBeforeCount} message(s) sent to you before are still pending`
     );
   }
   return (
     `[catch-up] ${newCount} message(s) addressed to you while you were away, ` +
-    `and ${shownBeforeCount} shown to an earlier session and still pending`
+    `and ${sentBeforeCount} sent to you before and still pending`
   );
 }
 
-export function forgetShownNotPending(state: AgentState, shownBeforeRead: string[], pending: PendingPing[]): void {
+export function forgetSentNotPending(state: AgentState, sentBeforeRead: string[], pending: PendingPing[]): void {
   const stillPending = new Set(pending.map((p) => p.message.id));
-  state.forgetShown(shownBeforeRead.filter((id) => !stillPending.has(id)));
+  state.forgetSent(sentBeforeRead.filter((id) => !stillPending.has(id)));
 }
 
-export function noteShownAndPrune(agent: PortalAgent, messageId: string): void {
-  const shownBeforeRead = agent.state.shownIds();
-  agent.state.noteShown([messageId]);
+export function noteSentAndPrune(agent: PortalAgent, messageId: string): void {
+  const sentBeforeRead = agent.state.sentIds();
+  agent.state.noteSent([messageId]);
   agent.pendingPingsFromRelay().then(
-    (pending) => forgetShownNotPending(agent.state, shownBeforeRead, pending),
+    (pending) => forgetSentNotPending(agent.state, sentBeforeRead, pending),
     () => {},
   );
 }

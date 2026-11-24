@@ -106,12 +106,12 @@ async function nextCatchUp(saved: unknown, pending: PortalMessage[]) {
   return next.wakes[0];
 }
 
-const savedShown = (state: AgentState): string[] => (state.toJSON() as { shown?: string[] }).shown ?? [];
+const savedSent = (state: AgentState): string[] => (state.toJSON() as { sent?: string[] }).sent ?? [];
 const head = (wake: Wake) => wake.content.split('\n')[0];
 const lineOf = (wake: Wake, id: string) => wake.content.split('\n').find((l) => l.includes(`message ${id}`)) ?? '';
 const NEW_HEAD = '[catch-up] 1 message(s) addressed to you while you were away:';
 const EARLIER_HEAD =
-  '[catch-up] nothing new was addressed to you while you were away. 1 message(s) shown to an earlier session are still pending:';
+  '[catch-up] nothing new was addressed to you while you were away. 1 message(s) sent to you before are still pending:';
 
 function recordingSink(answer: () => Promise<WakeCut | void>) {
   const delivered: WakePayload[] = [];
@@ -125,22 +125,22 @@ function recordingSink(answer: () => Promise<WakeCut | void>) {
   return { sink, delivered };
 }
 
-test('the agent state saves the shown ids, tells its listener of each change, and an older saved state has none', () => {
+test('the agent state saves the sent ids, tells its listener of each change, and an older saved state has none', () => {
   const state = new AgentState();
   let changes = 0;
   state.onChange(() => changes++);
-  state.noteShown(['m1']);
-  state.noteShown(['m1']);
+  state.noteSent(['m1']);
+  state.noteSent(['m1']);
   assert.equal(changes, 1, 'an id already saved changes nothing');
-  assert.equal(AgentState.fromJSON(JSON.parse(JSON.stringify(state.toJSON()))).wasShown('m1'), true);
-  state.forgetShown(['m1']);
-  state.forgetShown(['m1']);
+  assert.equal(AgentState.fromJSON(JSON.parse(JSON.stringify(state.toJSON()))).wasSent('m1'), true);
+  state.forgetSent(['m1']);
+  state.forgetSent(['m1']);
   assert.equal(changes, 2);
-  assert.equal(state.wasShown('m1'), false);
-  assert.equal(AgentState.fromJSON({ watermarks: {}, pings: [] }).wasShown('m1'), false);
+  assert.equal(state.wasSent('m1'), false);
+  assert.equal(AgentState.fromJSON({ watermarks: {}, pings: [] }).wasSent('m1'), false);
 });
 
-test('a mention shown to an earlier process reads "nothing new", marked "(shown before)", with no new attribute', async () => {
+test('a mention sent to an earlier process reads "nothing new", marked "(sent before)", with no new attribute', async () => {
   const m1 = msg('m1', 1);
   const first = ccProcess();
   first.mention(m1);
@@ -150,11 +150,11 @@ test('a mention shown to an earlier process reads "nothing new", marked "(shown 
 
   const wake = await nextCatchUp(first.state.toJSON(), [m1]);
   assert.equal(head(wake), EARLIER_HEAD);
-  assert.match(lineOf(wake, 'm1'), /\(shown before\)/);
+  assert.match(lineOf(wake, 'm1'), /\(sent before\)/);
   assert.deepEqual(Object.keys(wake.meta).sort(), ['addressed', 'author', 'catchup', 'channelId', 'messageId', 'source']);
 });
 
-test('a catch-up counts the new mentions and the ones shown before, and marks only the latter', async () => {
+test('a catch-up counts the new mentions and the ones sent before, and marks only the latter', async () => {
   const m1 = msg('m1', 1);
   const m2 = msg('m2', 2);
   const first = ccProcess();
@@ -162,30 +162,30 @@ test('a catch-up counts the new mentions and the ones shown before, and marks on
   await first.settle();
 
   const wake = await nextCatchUp(first.state.toJSON(), [m1, m2]);
-  assert.equal(head(wake), '[catch-up] 1 message(s) addressed to you while you were away, and 1 shown to an earlier session and still pending:');
-  assert.match(lineOf(wake, 'm1'), /\(shown before\) \[message m1\]/);
-  assert.doesNotMatch(lineOf(wake, 'm2'), /shown before/);
+  assert.equal(head(wake), '[catch-up] 1 message(s) addressed to you while you were away, and 1 sent to you before and still pending:');
+  assert.match(lineOf(wake, 'm1'), /\(sent before\) \[message m1\]/);
+  assert.doesNotMatch(lineOf(wake, 'm2'), /sent before/);
   assert.match(lineOf(wake, 'm2'), /\[message m2\]/);
 });
 
-test('with nothing shown before, the catch-up has no shown-before head and no mark', async () => {
+test('with nothing sent before, the catch-up has no sent-before head and no mark', async () => {
   const wake = await nextCatchUp(undefined, [msg('m1', 1)]);
   assert.equal(head(wake), NEW_HEAD);
-  assert.doesNotMatch(wake.content, /shown/);
+  assert.doesNotMatch(wake.content, /sent (before|to you)/);
 });
 
-test('a shown id leaves the saved state once the relay no longer lists its mention', async () => {
+test('a sent id leaves the saved state once the relay no longer lists its mention', async () => {
   const m1 = msg('m1', 1);
   const first = ccProcess();
   first.mention(m1);
   await first.settle();
-  assert.deepEqual(savedShown(first.state), ['m1']);
+  assert.deepEqual(savedSent(first.state), ['m1']);
 
   const next = ccProcess(first.state.toJSON());
   next.control.pending = [];
   await next.internal.catchUp();
   await next.settle();
-  assert.deepEqual(savedShown(next.state), []);
+  assert.deepEqual(savedSent(next.state), []);
 });
 
 test('an id saved while a catch-up waits on the relay is not dropped by that catch-up', async () => {
@@ -193,31 +193,31 @@ test('an id saved while a catch-up waits on the relay is not dropped by that cat
   const { entered, release } = next.holdNextRead();
   const catchUp = next.internal.catchUp();
   await entered;
-  next.state.noteShown(['m9']);
+  next.state.noteSent(['m9']);
   release();
   await catchUp;
-  assert.deepEqual(savedShown(next.state), ['m9']);
+  assert.deepEqual(savedSent(next.state), ['m9']);
 });
 
 test('a live wake prunes the saved ids against the pending list it reads', async () => {
   const m1 = msg('m1', 1);
   const first = ccProcess();
-  first.state.noteShown(['gone']);
+  first.state.noteSent(['gone']);
   first.control.pending = [m1];
   first.mention(m1);
   await first.settle();
-  assert.deepEqual(savedShown(first.state), ['m1']);
+  assert.deepEqual(savedSent(first.state), ['m1']);
 });
 
 test('a live wake that cannot read the pending list prunes nothing', async () => {
   const m1 = msg('m1', 1);
   const first = ccProcess();
-  first.state.noteShown(['earlier']);
+  first.state.noteSent(['earlier']);
   first.control.unreadable = true;
   first.mention(m1);
   await first.settle();
   assert.equal(first.wakes.length, 1);
-  assert.deepEqual(savedShown(first.state), ['earlier', 'm1']);
+  assert.deepEqual(savedSent(first.state), ['earlier', 'm1']);
 });
 
 test('a wake that fails at its sink is not saved, so the next process reads the mention as new', async () => {
@@ -241,10 +241,10 @@ test('a sink wake is saved only once its delivery succeeds', async () => {
   first.mention(m1);
   await first.settle();
   assert.equal(delivered.length, 1);
-  assert.deepEqual(savedShown(first.state), [], 'nothing is saved while the sink is delivering');
+  assert.deepEqual(savedSent(first.state), [], 'nothing is saved while the sink is delivering');
   done.open();
   await new Promise((r) => setImmediate(r));
-  assert.deepEqual(savedShown(first.state), ['m1']);
+  assert.deepEqual(savedSent(first.state), ['m1']);
 });
 
 test('a wake that its sink delivered only in part saves nothing', async () => {
@@ -255,7 +255,7 @@ test('a wake that its sink delivered only in part saves nothing', async () => {
   await first.settle();
   await new Promise((r) => setImmediate(r));
   assert.equal(delivered.length, 1);
-  assert.deepEqual(savedShown(first.state), []);
+  assert.deepEqual(savedSent(first.state), []);
 });
 
 test('the codex sink answers when it cut a wake, and says nothing when it sent all of it', async () => {
@@ -289,7 +289,7 @@ test('a live wake whose context cap left out its trigger saves nothing', async (
     await first.settle();
     assert.equal(first.wakes.length, 1);
     assert.equal(lineOf(first.wakes[0], 'm1'), '', 'the cap left the trigger out');
-    assert.deepEqual(savedShown(first.state), []);
+    assert.deepEqual(savedSent(first.state), []);
   } finally {
     if (saved === undefined) delete process.env.PORTAL_CONTEXT_CAP;
     else process.env.PORTAL_CONTEXT_CAP = saved;
@@ -324,8 +324,8 @@ test('a wake dropped by an identity switch is saved in neither persona', async (
   await a.settle();
 
   assert.equal(a.wakes.length, 1);
-  assert.deepEqual(savedShown(a.state), ['m1'], 'the wake handed over before the switch is saved');
-  assert.deepEqual(savedShown(stateB), []);
+  assert.deepEqual(savedSent(a.state), ['m1'], 'the wake handed over before the switch is saved');
+  assert.deepEqual(savedSent(stateB), []);
 });
 
 type Push = { payload: { content: Array<{ text: string }> } };
@@ -375,10 +375,10 @@ test('a host push is saved when the host accepts it, and not when the host decli
     const lines = text.split('\n');
     if (accepted) {
       assert.equal(lines[0], EARLIER_HEAD);
-      assert.match(lines.find((l) => l.includes('message m1')) ?? '', /\(shown before\) \[message m1\]/);
+      assert.match(lines.find((l) => l.includes('message m1')) ?? '', /\(sent before\) \[message m1\]/);
     } else {
       assert.equal(lines[0], NEW_HEAD);
-      assert.doesNotMatch(text, /shown/);
+      assert.doesNotMatch(text, /sent (before|to you)/);
     }
   }
 });
@@ -387,11 +387,11 @@ test('a mention that the host accepts prunes the saved ids against the pending l
   for (const open of [false, true]) {
     const answer = open ? { results: [{ messageId: 'm1', accepted: true }] } : { accepted: true };
     const first = hostProcess(undefined, answer, { open });
-    first.state.noteShown(['gone']);
+    first.state.noteSent(['gone']);
     first.control.pending = [];
     await first.mention(msg('m1', 1));
     for (let turn = 0; turn < 5; turn++) await new Promise((r) => setImmediate(r));
-    assert.deepEqual(savedShown(first.state), ['m1'], open ? 'channels/incoming' : 'push/event');
+    assert.deepEqual(savedSent(first.state), ['m1'], open ? 'channels/incoming' : 'push/event');
   }
 });
 
@@ -404,10 +404,10 @@ test('a host push is saved only once the host has answered it', async () => {
     const first = hostProcess(undefined, answer, { open: method === 'channels/incoming' });
     await first.mention(msg('m1', 1));
     assert.equal(first.requests[0].method, method);
-    assert.equal(first.state.wasShown('m1'), false, `${method}: nothing is saved while the host has not answered`);
+    assert.equal(first.state.wasSent('m1'), false, `${method}: nothing is saved while the host has not answered`);
     answered.open();
     await new Promise((r) => setImmediate(r));
-    assert.equal(first.state.wasShown('m1'), true, method);
+    assert.equal(first.state.wasSent('m1'), true, method);
   }
 });
 
@@ -422,7 +422,7 @@ test('in an open channel, a mention is saved only when the host accepts that mes
     const first = hostProcess(undefined, answer, { open: true });
     await first.mention(msg('m1', 1));
     assert.equal(first.requests[0].method, 'channels/incoming');
-    assert.equal(first.state.wasShown('m1'), saved, JSON.stringify(answer));
+    assert.equal(first.state.wasSent('m1'), saved, JSON.stringify(answer));
   }
 });
 
@@ -433,11 +433,11 @@ test('a host catch-up is saved when the host accepts it, and not when it decline
     await next.internal.catchUp();
     await new Promise((r) => setImmediate(r));
     assert.equal(next.requests.length, 1);
-    assert.equal(next.state.wasShown('m1'), accepted);
+    assert.equal(next.state.wasSent('m1'), accepted);
   }
 });
 
-test('a catch-up through a wake sink tells it when every mention was shown before', async () => {
+test('a catch-up through a wake sink tells it when every mention was sent before', async () => {
   const m1 = msg('m1', 1);
   const m2 = msg('m2', 2);
   const first = ccProcess();
@@ -451,13 +451,13 @@ test('a catch-up through a wake sink tells it when every mention was shown befor
     await next.internal.catchUp();
     await next.settle();
     assert.equal(delivered.length, 1);
-    assert.equal(delivered[0].allShownBefore, pending.length === 1 ? true : undefined);
+    assert.equal(delivered[0].allSentBefore, pending.length === 1 ? true : undefined);
   }
 });
 
-test('the codex wake says the mentions are still pending from an earlier session only when every one was shown before', () => {
+test('the codex wake says the mentions are still pending from an earlier session only when every one was sent before', () => {
   const meta = { catchup: 'true', channelId: CH };
-  const earlier: WakePayload = { content: 'x', meta, allShownBefore: true };
+  const earlier: WakePayload = { content: 'x', meta, allSentBefore: true };
   assert.match(renderCodexWake(earlier), /^\[portal\] Messages addressed to you are still pending from an earlier session — reply where each came from with send_message\./);
   assert.match(renderCodexWake({ content: 'x', meta }), /^\[portal\] Messages addressed to you arrived while you were away/);
 });

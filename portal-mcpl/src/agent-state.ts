@@ -32,7 +32,7 @@ interface SerializedState {
   subscriptions?: string[];
   /** Channels opted into live reaction visibility (durable, default off). */
   reactionChannels?: string[];
-  shown?: string[];
+  sent?: string[];
 }
 
 const PREVIEW_LEN = 140;
@@ -54,7 +54,7 @@ export class AgentState {
    *  Reactions from these channels surface in context but NEVER wake the agent
    *  (tagged `chat:reaction`, which matches no wake policy). Durable. */
   private reactionChannels = new Set<string>();
-  private shown = new Set<string>();
+  private sent = new Set<string>();
   private listeners: Array<() => void> = [];
 
   /** Notify on any persistence-relevant change (watermark / ping / subscription). */
@@ -164,24 +164,24 @@ export class AgentState {
     return [...this.pings];
   }
 
-  noteShown(messageIds: Iterable<string>): void {
-    const before = this.shown.size;
-    for (const id of messageIds) this.shown.add(id);
-    if (this.shown.size !== before) this.emitChange();
+  noteSent(messageIds: Iterable<string>): void {
+    const before = this.sent.size;
+    for (const id of messageIds) this.sent.add(id);
+    if (this.sent.size !== before) this.emitChange();
   }
 
-  wasShown(messageId: string): boolean {
-    return this.shown.has(messageId);
+  wasSent(messageId: string): boolean {
+    return this.sent.has(messageId);
   }
 
-  shownIds(): string[] {
-    return [...this.shown];
+  sentIds(): string[] {
+    return [...this.sent];
   }
 
-  forgetShown(messageIds: Iterable<string>): void {
-    const before = this.shown.size;
-    for (const id of messageIds) this.shown.delete(id);
-    if (this.shown.size !== before) this.emitChange();
+  forgetSent(messageIds: Iterable<string>): void {
+    const before = this.sent.size;
+    for (const id of messageIds) this.sent.delete(id);
+    if (this.sent.size !== before) this.emitChange();
   }
 
   /** Remove a specific ping (e.g. once the agent replies to it). */
@@ -235,7 +235,7 @@ export class AgentState {
       pings: this.pings,
       subscriptions: [...this.subscriptions],
       reactionChannels: [...this.reactionChannels],
-      shown: [...this.shown],
+      sent: [...this.sent],
     };
   }
 
@@ -245,7 +245,7 @@ export class AgentState {
     s.pings = data.pings ?? [];
     s.subscriptions = new Set(data.subscriptions ?? []);
     s.reactionChannels = new Set(data.reactionChannels ?? []);
-    s.shown = new Set(data.shown ?? []);
+    s.sent = new Set(data.sent ?? []);
     return s;
   }
 }

@@ -60,7 +60,7 @@ test('a message whose later part fails says whether its first part cleared the p
   assert.doesNotMatch(noReply, /ping/);
 });
 
-test('a reply that clears its ping drops it from the local pending list and the shown ids', async () => {
+test('a reply that clears its ping drops it from the local pending list and the sent ids', async () => {
   for (const cleared of [true, false]) {
     const { client } = relay();
     Object.assign(client, { sendMessage: async () => (cleared ? { messageId: 'rm_a', pingCleared: true } : { messageId: 'rm_a' }) });
@@ -76,10 +76,10 @@ test('a reply that clears its ping drops it from the local pending list and the 
       true,
       ['role_mention'],
     );
-    state.noteShown(['rm_y']);
+    state.noteSent(['rm_y']);
     const agent = new PortalAgent(client, { state });
     await agent.handleToolCall('send_message', { channelId: CH, content: 'answer', replyToId: 'rm_y' });
-    assert.equal(state.wasShown('rm_y'), !cleared);
+    assert.equal(state.wasSent('rm_y'), !cleared);
     assert.deepEqual(state.pendingPings().map((p) => p.message.id), cleared ? [] : ['rm_y']);
   }
 });

@@ -272,7 +272,7 @@ export class PortalAgent {
           if (typeof id === 'string') posted.push(id);
           if (i === 0 && typeof args.replyToId === 'string' && pingCleared(result)) {
             this.state.clearPing(args.replyToId);
-            this.state.forgetShown([args.replyToId]);
+            this.state.forgetSent([args.replyToId]);
           }
           first ??= result;
         }

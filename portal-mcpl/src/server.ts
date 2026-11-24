@@ -38,7 +38,7 @@ import { chunkText } from './chunk.js';
 import type { AddressReason, PortalEvent, PortalMessage } from '@animalabs/portal-protocol';
 import { shortJson, unknownToolMessage, type PortalAgent } from './agent.js';
 import type { PendingPing } from './agent-state.js';
-import { SHOWN_BEFORE, catchUpHead, forgetShownNotPending, messageMark, noteShownAndPrune } from './catch-up.js';
+import { SENT_BEFORE, catchUpHead, forgetSentNotPending, messageMark, noteSentAndPrune } from './catch-up.js';
 import { parsePortalChannelId, portalChannelId, toDescriptor } from './channels.js';
 import { featureSets, TOOL_FEATURE_SETS, type PortalFeatureSet } from './feature-sets.js';
 import {
@@ -995,7 +995,7 @@ export class PortalMcplServer {
           } satisfies ChannelsIncomingParams)
           .then(
             (answer) => {
-              if (addressedToMe && incomingAccepted(answer, message.id)) noteShownAndPrune(agent, message.id);
+              if (addressedToMe && incomingAccepted(answer, message.id)) noteSentAndPrune(agent, message.id);
             },
             (err) => this.notePushRejection('inbound message', err),
           );
@@ -1024,7 +1024,7 @@ export class PortalMcplServer {
           } satisfies PushEventParams)
           .then(
             (answer) => {
-              if (addressedToMe && pushAccepted(answer)) noteShownAndPrune(agent, message.id);
+              if (addressedToMe && pushAccepted(answer)) noteSentAndPrune(agent, message.id);
             },
             (err) => this.notePushRejection('message push', err),
           );
@@ -1088,7 +1088,7 @@ export class PortalMcplServer {
     const conn = this.conn;
     const epoch = this.swapEpoch;
     const state = this.agent.state;
-    const shownBeforeRead = state.shownIds();
+    const sentBeforeRead = state.sentIds();
     let pings: PendingPing[];
     try {
       pings = await this.agent.pendingPingsFromRelay();
@@ -1100,18 +1100,18 @@ export class PortalMcplServer {
     // watermark below is consumed, so this has to happen before it moves. An
     // identity swap inside the round trip means these are the OLD persona's.
     if (this.conn !== conn || !this.canPush() || this.swapEpoch !== epoch) return;
-    forgetShownNotPending(state, shownBeforeRead, pings);
+    forgetSentNotPending(state, sentBeforeRead, pings);
     const fresh = pings.filter((p) => !this.wokenPings.has(p.message.id));
     if (fresh.length === 0) return;
     for (const p of fresh) this.wokenPings.add(p.message.id);
     fresh.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
 
-    const shownBefore = new Set(fresh.filter((p) => state.wasShown(p.message.id)).map((p) => p.message.id));
-    const lines = [`${catchUpHead(fresh.length - shownBefore.size, shownBefore.size)}:`];
+    const sentBefore = new Set(fresh.filter((p) => state.wasSent(p.message.id)).map((p) => p.message.id));
+    const lines = [`${catchUpHead(fresh.length - sentBefore.size, sentBefore.size)}:`];
     for (const p of fresh) {
       // A message in a thread names it: a reply goes there only with threadId.
       const thread = p.message.threadId ? ` [thread ${p.message.threadId}]` : '';
-      const mark = shownBefore.has(p.message.id) ? SHOWN_BEFORE : '';
+      const mark = sentBefore.has(p.message.id) ? SENT_BEFORE : '';
       lines.push(`— ${this.channelLabel(p.message.channelId)}: ${render(p.message)}${mark}${messageMark(p.message.id)}${thread}`);
     }
     lines.push('[use fetch_history / fetch_around for context, then mark_read]');
@@ -1142,7 +1142,7 @@ export class PortalMcplServer {
       } satisfies PushEventParams)
       .then(
         (answer) => {
-          if (pushAccepted(answer)) state.noteShown(fresh.map((p) => p.message.id));
+          if (pushAccepted(answer)) state.noteSent(fresh.map((p) => p.message.id));
         },
         (err) => this.notePushRejection('catch-up push', err),
       );
