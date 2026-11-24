@@ -32,6 +32,7 @@ interface SerializedState {
   subscriptions?: string[];
   /** Channels opted into live reaction visibility (durable, default off). */
   reactionChannels?: string[];
+  sent?: string[];
 }
 
 const PREVIEW_LEN = 140;
@@ -53,6 +54,7 @@ export class AgentState {
    *  Reactions from these channels surface in context but NEVER wake the agent
    *  (tagged `chat:reaction`, which matches no wake policy). Durable. */
   private reactionChannels = new Set<string>();
+  private sent = new Set<string>();
   private listeners: Array<() => void> = [];
 
   /** Notify on any persistence-relevant change (watermark / ping / subscription). */
@@ -162,6 +164,26 @@ export class AgentState {
     return [...this.pings];
   }
 
+  noteSent(messageIds: Iterable<string>): void {
+    const before = this.sent.size;
+    for (const id of messageIds) this.sent.add(id);
+    if (this.sent.size !== before) this.emitChange();
+  }
+
+  wasSent(messageId: string): boolean {
+    return this.sent.has(messageId);
+  }
+
+  sentIds(): string[] {
+    return [...this.sent];
+  }
+
+  forgetSent(messageIds: Iterable<string>): void {
+    const before = this.sent.size;
+    for (const id of messageIds) this.sent.delete(id);
+    if (this.sent.size !== before) this.emitChange();
+  }
+
   /** Remove a specific ping (e.g. once the agent replies to it). */
   clearPing(messageId: string): void {
     this.pings = this.pings.filter((p) => p.message.id !== messageId);
@@ -213,6 +235,7 @@ export class AgentState {
       pings: this.pings,
       subscriptions: [...this.subscriptions],
       reactionChannels: [...this.reactionChannels],
+      sent: [...this.sent],
     };
   }
 
@@ -222,6 +245,7 @@ export class AgentState {
     s.pings = data.pings ?? [];
     s.subscriptions = new Set(data.subscriptions ?? []);
     s.reactionChannels = new Set(data.reactionChannels ?? []);
+    s.sent = new Set(data.sent ?? []);
     return s;
   }
 }

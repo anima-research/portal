@@ -3,9 +3,10 @@ name: Relay CI
 # Type-checks the relay and runs its admin-panel tests: the admin API, the
 # slash commands, the permission and invite stores, and the panel's own client
 # scripts (test/admin-spa.test.ts loads portal-admin/*.js in node:vm). It also
-# runs the channel-creation gate tests, the voice tests, the invite claim
-# tests and the history cache tests. The rest of the relay suite (the gateway's among it) is not run here;
-# the gateway logging test is known to be flaky.
+# runs the channel-creation gate tests, the voice tests, the invite claim tests,
+# the history cache tests and the tests that a reply clears the ping it
+# answers. The rest of the relay suite (the gateway's among it) is not run
+# here; the gateway logging test is known to be flaky.
 
 on:
   pull_request:
@@ -88,6 +89,10 @@ jobs:
       - name: Channel-creation gate tests
         working-directory: portal-relay
         run: node --import tsx --test test/create-text-channel.test.ts
+
+      - name: Reply clears its ping tests
+        working-directory: portal-relay
+        run: node --import tsx --test test/reply-clears-ping.test.ts
 
       # Voice output, speech and transcripts. voice-sink.test.ts loads
       # voice-speaker.ts, the module that loads @animalabs/voice-kit at run

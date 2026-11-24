@@ -254,15 +254,26 @@ export class PortalAgent {
             // says nothing ran for its own call, isn't the whole answer; and
             // posting them was public activity.
             this.onPublicActivity?.('message');
+            const ping =
+              args.replyToId == null
+                ? ''
+                : pingCleared(first)
+                  ? 'The first part cleared the pending ping it replied to (pingCleared). '
+                  : 'The first part cleared no pending ping. ';
             throw new Error(
               `Only part of the message was sent: the first ${i} of ${chunks.length} parts were posted ` +
                 `(${posted.map((id) => JSON.stringify(id)).join(', ')}), and part ${i + 1} may not have been. ` +
                 `Its call answered: "${(e as Error).message}" ` +
+                ping +
                 'To send the rest, call send_message with only the text that didn\'t go out; fetch_around shows what did.',
             );
           }
           const id = (result as { messageId?: unknown } | undefined)?.messageId;
           if (typeof id === 'string') posted.push(id);
+          if (i === 0 && typeof args.replyToId === 'string' && pingCleared(result)) {
+            this.state.clearPing(args.replyToId);
+            this.state.forgetSent([args.replyToId]);
+          }
           first ??= result;
         }
         this.onPublicActivity?.('message');
@@ -420,6 +431,10 @@ export class PortalAgent {
         throw new Error(unknownToolMessage(name));
     }
   }
+}
+
+function pingCleared(result: unknown): boolean {
+  return typeof result === 'object' && result !== null && 'pingCleared' in result && result.pingCleared === true;
 }
 
 /** A string argument, refused by name before anything runs. */

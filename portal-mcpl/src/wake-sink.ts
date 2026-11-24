@@ -29,11 +29,16 @@ const run = promisify(execFile);
 export interface WakePayload {
   content: string;
   meta: Record<string, string>;
+  sentBefore?: 'all' | 'some';
+}
+
+export interface WakeCut {
+  omittedChars: number;
 }
 
 export interface WakeSink {
   readonly kind: string;
-  deliver(payload: WakePayload): Promise<void>;
+  deliver(payload: WakePayload): Promise<WakeCut | void>;
 }
 
 export interface CodexWakeTarget {
@@ -62,9 +67,11 @@ export class CodexQueueSink implements WakeSink {
     private readonly now: () => number = () => Date.now(),
   ) {}
 
-  async deliver(payload: WakePayload): Promise<void> {
+  async deliver(payload: WakePayload): Promise<WakeCut | void> {
     const target = await this.waitForTarget();
     await this.exec(target.codexBin, ['queue', '--thread', target.threadId, '--message', renderCodexWake(payload)]);
+    const omittedChars = codexWakeOmits(payload.content);
+    if (omittedChars > 0) return { omittedChars };
   }
 
   private async waitForTarget(): Promise<CodexWakeTarget> {
@@ -97,22 +104,31 @@ export function readCodexWakeTarget(file: string): CodexWakeTarget | undefined {
 
 /** One header line so the hand knows this is a portal delivery (not its
  *  operator typing), then the same folded context Claude Code would get. */
-export function renderCodexWake({ content, meta }: WakePayload): string {
+export function renderCodexWake({ content, meta, sentBefore }: WakePayload): string {
   const where = meta.threadId
     ? `thread ${meta.threadId} (channel ${meta.channelId})`
     : `channel ${meta.channelId}`;
   const replyHint = meta.threadId
     ? `send_message(channelId ${meta.channelId}, threadId ${meta.threadId})`
     : `send_message(channelId ${meta.channelId})`;
-  const head = meta.catchup
-    ? '[portal] Messages addressed to you arrived while you were away — reply where each came from with send_message.'
-    : `[portal] ${meta.author} addressed you in ${where} — reply there with ${replyHint}.`;
+  const ifNeeded = ' — if one still needs an answer, reply where it came from with send_message.';
+  const head = !meta.catchup
+    ? `[portal] ${meta.author} addressed you in ${where} — reply there with ${replyHint}.`
+    : sentBefore === 'all'
+      ? '[portal] Messages addressed to you are still pending from an earlier session' + ifNeeded
+      : sentBefore === 'some'
+        ? '[portal] Messages addressed to you arrived while you were away' + ifNeeded
+        : '[portal] Messages addressed to you arrived while you were away — reply where each came from with send_message.';
+  const omitted = codexWakeOmits(content);
   const body =
-    content.length > CODEX_WAKE_MAX_CHARS
-      ? `[${content.length - CODEX_WAKE_MAX_CHARS} chars of earlier context omitted — use fetch_history]\n` +
-        content.slice(-CODEX_WAKE_MAX_CHARS)
+    omitted > 0
+      ? `[${omitted} chars of earlier context omitted — use fetch_history]\n` + content.slice(omitted)
       : content;
   return `${head}\n${body}`;
+}
+
+function codexWakeOmits(content: string): number {
+  return Math.max(0, content.length - CODEX_WAKE_MAX_CHARS);
 }
 
 export function wakeSinkFromEnv(

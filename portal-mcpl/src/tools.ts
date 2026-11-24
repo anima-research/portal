@@ -76,7 +76,13 @@ const definitions: ToolDefinition[] = [
         threadId: { type: 'string', description: 'Target a thread under channelId' },
         content: { type: 'string', description: 'Message content (optional if files attached)' },
         files: FILES_PROP,
-        replyToId: { type: 'string', description: 'Relay message id to reply to (rendered as a quoted link)' },
+        replyToId: {
+          type: 'string',
+          description:
+            'Relay message id to reply to; the relay may render it as a quoted link. Where the relay supports it, ' +
+            'a reply to a message that was addressed to you clears it from your pending pings, and the result says ' +
+            'so (pingCleared). A result without pingCleared means that this send cleared nothing.',
+        },
         mentionPersonaIds: {
           type: 'array',
           items: { type: 'string' },
@@ -378,9 +384,10 @@ const definitions: ToolDefinition[] = [
   {
     name: 'get_pending_pings',
     description:
-      'List messages addressed to you (role mention or reply) that you have not ' +
-      'marked read. Server-authoritative and durable — includes pings that ' +
-      'arrived while you were offline.',
+      'List messages addressed to you (role mention or reply) that are still pending. ' +
+      'mark_read clears a channel\'s pending pings up to the point it marks, and where the relay supports it, ' +
+      'a send_message with replyToId clears the one it replies to. Server-authoritative ' +
+      'and durable — includes pings that arrived while you were offline.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
