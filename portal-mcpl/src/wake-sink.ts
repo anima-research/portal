@@ -29,7 +29,7 @@ const run = promisify(execFile);
 export interface WakePayload {
   content: string;
   meta: Record<string, string>;
-  allSentBefore?: true;
+  sentBefore?: 'all' | 'some';
 }
 
 export interface WakeCut {
@@ -104,18 +104,21 @@ export function readCodexWakeTarget(file: string): CodexWakeTarget | undefined {
 
 /** One header line so the hand knows this is a portal delivery (not its
  *  operator typing), then the same folded context Claude Code would get. */
-export function renderCodexWake({ content, meta, allSentBefore }: WakePayload): string {
+export function renderCodexWake({ content, meta, sentBefore }: WakePayload): string {
   const where = meta.threadId
     ? `thread ${meta.threadId} (channel ${meta.channelId})`
     : `channel ${meta.channelId}`;
   const replyHint = meta.threadId
     ? `send_message(channelId ${meta.channelId}, threadId ${meta.threadId})`
     : `send_message(channelId ${meta.channelId})`;
+  const ifNeeded = ' — if one still needs an answer, reply where it came from with send_message.';
   const head = !meta.catchup
     ? `[portal] ${meta.author} addressed you in ${where} — reply there with ${replyHint}.`
-    : allSentBefore
-      ? '[portal] Messages addressed to you are still pending from an earlier session — if one still needs an answer, reply where it came from with send_message.'
-      : '[portal] Messages addressed to you arrived while you were away — if one still needs an answer, reply where it came from with send_message.';
+    : sentBefore === 'all'
+      ? '[portal] Messages addressed to you are still pending from an earlier session' + ifNeeded
+      : sentBefore === 'some'
+        ? '[portal] Messages addressed to you arrived while you were away' + ifNeeded
+        : '[portal] Messages addressed to you arrived while you were away — reply where each came from with send_message.';
   const omitted = codexWakeOmits(content);
   const body =
     omitted > 0

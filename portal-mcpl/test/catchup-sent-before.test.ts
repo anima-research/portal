@@ -507,31 +507,33 @@ test('a host catch-up is saved when the host accepts it, and not when it decline
   }
 });
 
-test('a catch-up through a wake sink tells it when every mention was sent before', async () => {
+test('a catch-up through a wake sink tells it whether all, some or none of its mentions were sent before', async () => {
   const m1 = msg('m1', 1);
   const m2 = msg('m2', 2);
   const first = ccProcess();
   first.mention(m1);
   await first.settle();
 
-  for (const pending of [[m1], [m1, m2]]) {
+  const cases: Array<[PortalMessage[], 'all' | 'some' | undefined]> = [[[m1], 'all'], [[m1, m2], 'some'], [[m2], undefined]];
+  for (const [pending, expected] of cases) {
     const { sink, delivered } = recordingSink(async () => {});
     const next = ccProcess(first.state.toJSON(), { wakeSink: sink });
     next.control.pending = pending;
     await next.internal.catchUp();
     await next.settle();
     assert.equal(delivered.length, 1);
-    assert.equal(delivered[0].allSentBefore, pending.length === 1 ? true : undefined);
+    assert.equal(delivered[0].sentBefore, expected);
   }
 });
 
-test('the codex catch-up head says the mentions are still pending from an earlier session only when every one was sent before', () => {
+test('the codex catch-up head changes from main only when the catch-up holds a mention sent before', () => {
   const meta = { catchup: 'true', channelId: CH };
-  const earlier: WakePayload = { content: 'x', meta, allSentBefore: true };
-  const reply = ' — if one still needs an answer, reply where it came from with send_message.';
+  const ifNeeded = ' — if one still needs an answer, reply where it came from with send_message.';
+  const headOf = (p: WakePayload) => renderCodexWake(p).split('\n')[0];
+  assert.equal(headOf({ content: 'x', meta, sentBefore: 'all' }), '[portal] Messages addressed to you are still pending from an earlier session' + ifNeeded);
+  assert.equal(headOf({ content: 'x', meta, sentBefore: 'some' }), '[portal] Messages addressed to you arrived while you were away' + ifNeeded);
   assert.equal(
-    renderCodexWake(earlier).split('\n')[0],
-    '[portal] Messages addressed to you are still pending from an earlier session' + reply,
+    headOf({ content: 'x', meta }),
+    '[portal] Messages addressed to you arrived while you were away — reply where each came from with send_message.',
   );
-  assert.equal(renderCodexWake({ content: 'x', meta }).split('\n')[0], '[portal] Messages addressed to you arrived while you were away' + reply);
 });

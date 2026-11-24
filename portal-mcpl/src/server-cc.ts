@@ -303,7 +303,11 @@ export class PortalCcChannelServer {
       const wake: WakePayload = {
         content: lines.join('\n'),
         meta,
-        ...(sentBefore.size === fresh.length ? { allSentBefore: true } : {}),
+        ...(sentBefore.size === fresh.length
+          ? { sentBefore: 'all' as const }
+          : base.some((m) => sentBefore.has(m.id))
+            ? { sentBefore: 'some' as const }
+            : {}),
       };
       this.deliverWake(b, wake, [...pingIds], [...pingIds], () => this.settleFolded(b, missed, keep, all));
     });
