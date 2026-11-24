@@ -38,7 +38,7 @@ import { chunkText } from './chunk.js';
 import type { AddressReason, PortalEvent, PortalMessage } from '@animalabs/portal-protocol';
 import { shortJson, unknownToolMessage, type PortalAgent } from './agent.js';
 import type { PendingPing } from './agent-state.js';
-import { SENT_BEFORE, catchUpHead, forgetSentNotPending, messageMark, noteSentAndPrune } from './catch-up.js';
+import { SENT_BEFORE, catchUpHead, clearingNotes, forgetSentNotPending, messageMark, noteSentAndPrune } from './catch-up.js';
 import { parsePortalChannelId, portalChannelId, toDescriptor } from './channels.js';
 import { featureSets, TOOL_FEATURE_SETS, type PortalFeatureSet } from './feature-sets.js';
 import {
@@ -1114,7 +1114,11 @@ export class PortalMcplServer {
       const mark = sentBefore.has(p.message.id) ? SENT_BEFORE : '';
       lines.push(`— ${this.channelLabel(p.message.channelId)}: ${render(p.message)}${mark}${messageMark(p.message.id)}${thread}`);
     }
-    lines.push('[use fetch_history / fetch_around for context, then mark_read]');
+    lines.push(
+      '[use fetch_history / fetch_around for context]',
+      ...clearingNotes(sentBefore.size > 0),
+      '[a plain reply in the channel clears nothing]',
+    );
     if (fresh.some((p) => p.message.threadId)) {
       lines.push('[to reply in a thread, call send_message with the channel as channelId and the thread as threadId]');
     }

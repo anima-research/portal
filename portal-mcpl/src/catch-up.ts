@@ -17,6 +17,13 @@ export function catchUpHead(newCount: number, sentBeforeCount: number): string {
   );
 }
 
+export function clearingNotes(anySentBefore: boolean): string[] {
+  return [
+    ...(anySentBefore ? ['[a mention marked (sent before) may already have an answer]'] : []),
+    '[to clear a mention, reply with send_message and its id as replyToId, where the relay supports it, or mark_read its channel]',
+  ];
+}
+
 export function forgetSentNotPending(state: AgentState, sentBeforeRead: string[], pending: PendingPing[]): void {
   const stillPending = new Set(pending.map((p) => p.message.id));
   state.forgetSent(sentBeforeRead.filter((id) => !stillPending.has(id)));

@@ -110,6 +110,9 @@ const savedSent = (state: AgentState): string[] => (state.toJSON() as { sent?: s
 const head = (wake: Wake) => wake.content.split('\n')[0];
 const lineOf = (wake: Wake, id: string) => wake.content.split('\n').find((l) => l.includes(`message ${id}`)) ?? '';
 const NEW_HEAD = '[catch-up] 1 message(s) addressed to you while you were away:';
+const MAY_HAVE_ANSWER = '[a mention marked (sent before) may already have an answer]';
+const TO_CLEAR =
+  '[to clear a mention, reply with send_message and its id as replyToId, where the relay supports it, or mark_read its channel]';
 const EARLIER_HEAD =
   '[catch-up] nothing new was addressed to you while you were away. 1 message(s) sent to you before are still pending:';
 
@@ -166,12 +169,16 @@ test('a catch-up counts the new mentions and the ones sent before, and marks onl
   assert.match(lineOf(wake, 'm1'), /\(sent before\) \[message m1\]/);
   assert.doesNotMatch(lineOf(wake, 'm2'), /sent before/);
   assert.match(lineOf(wake, 'm2'), /\[message m2\]/);
+  const notes = wake.content.split('\n').slice(-2);
+  assert.deepEqual(notes, [MAY_HAVE_ANSWER, TO_CLEAR]);
 });
 
 test('with nothing sent before, the catch-up has no sent-before head and no mark', async () => {
   const wake = await nextCatchUp(undefined, [msg('m1', 1)]);
   assert.equal(head(wake), NEW_HEAD);
   assert.doesNotMatch(wake.content, /sent (before|to you)/);
+  assert.equal(wake.content.split('\n').at(-1), TO_CLEAR);
+  assert.doesNotMatch(wake.content, /plain reply/);
 });
 
 test('a sent id leaves the saved state once the relay no longer lists its mention', async () => {
@@ -373,6 +380,9 @@ test('a host push is saved when the host accepts it, and not when the host decli
     await next.internal.catchUp();
     const text = (next.requests[0].params as Push).payload.content[0].text;
     const lines = text.split('\n');
+    assert.equal(lines.at(-1), '[a plain reply in the channel clears nothing]');
+    assert.equal(lines.at(-2), TO_CLEAR);
+    assert.equal(lines.at(-3) === MAY_HAVE_ANSWER, accepted);
     if (accepted) {
       assert.equal(lines[0], EARLIER_HEAD);
       assert.match(lines.find((l) => l.includes('message m1')) ?? '', /\(sent before\) \[message m1\]/);
