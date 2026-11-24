@@ -146,6 +146,7 @@ test('a mention shown to an earlier process reads "nothing new", marked "(shown 
   first.mention(m1);
   await first.settle();
   assert.equal(first.wakes.length, 1);
+  assert.doesNotMatch(first.wakes[0].content, /\[message /, 'a live wake names no ids');
 
   const wake = await nextCatchUp(first.state.toJSON(), [m1]);
   assert.equal(head(wake), EARLIER_HEAD);
@@ -162,8 +163,9 @@ test('a catch-up counts the new mentions and the ones shown before, and marks on
 
   const wake = await nextCatchUp(first.state.toJSON(), [m1, m2]);
   assert.equal(head(wake), '[catch-up] 1 message(s) addressed to you while you were away, and 1 shown to an earlier session and still pending:');
-  assert.match(lineOf(wake, 'm1'), /\(shown before\)/);
+  assert.match(lineOf(wake, 'm1'), /\(shown before\) \[message m1\]/);
   assert.doesNotMatch(lineOf(wake, 'm2'), /shown before/);
+  assert.match(lineOf(wake, 'm2'), /\[message m2\]/);
 });
 
 test('with nothing shown before, the catch-up reads as it always did', async () => {
@@ -373,7 +375,7 @@ test('a host push is saved when the host accepts it, and not when the host decli
     const lines = text.split('\n');
     if (accepted) {
       assert.equal(lines[0], EARLIER_HEAD);
-      assert.match(lines.find((l) => l.includes('message m1')) ?? '', /\(shown before\)/);
+      assert.match(lines.find((l) => l.includes('message m1')) ?? '', /\(shown before\) \[message m1\]/);
     } else {
       assert.equal(lines[0], NEW_HEAD);
       assert.doesNotMatch(text, /shown/);

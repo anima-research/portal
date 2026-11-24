@@ -30,3 +30,7 @@ export function noteShownAndPrune(agent: PortalAgent, messageId: string): void {
     () => {},
   );
 }
+
+export function messageMark(messageId: string): string {
+  return ` [message ${messageId}]`;
+}
