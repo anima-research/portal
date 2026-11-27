@@ -39,8 +39,17 @@ export interface PortalChannel {
   type: ChannelType;
   /**
    * For threads: the parent text/forum channel id. Webhooks live on the
-   * parent; the relay posts into a thread by reusing the parent's webhook with
-   * a thread id. Absent for non-thread channels.
+   * parent; the relay posts into a thread by reusing the parent's webhook
+   * with a thread id. For other channels: the category heading's id, when
+   * one exists. A category the persona's listing includes (it has some
+   * capability there) appears as its own entry (type "category"), so the
+   * name is one join away; a filtered-out category leaves an honest
+   * dangling id rather than an invented value — and for a persona whose
+   * grants are all on individual text, voice or forum channels, EVERY
+   * category id dangles (nothing flows up from a channel to its
+   * category), so the join is best-effort by design.
+   * Absent when there is no parent (top-level channels and the categories
+   * themselves).
    */
   parentId?: ChannelId;
   /** For threads: whether currently archived (posting auto-unarchives). */

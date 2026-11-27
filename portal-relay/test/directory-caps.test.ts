@@ -35,19 +35,29 @@ const SECRET = 'chan-secret'; // same guild, no rights → must be invisible
 const THREAD_OPEN = 'thread-open'; // thread under OPEN → visible, parent caps
 const THREAD_SECRET = 'thread-secret'; // thread under SECRET → invisible
 const C2 = 'chan-g2'; // other guild, no rights
+const CAT = 'cat-shelf'; // category: nobody holds caps on it
+const FILED = 'chan-filed'; // text channel UNDER the category; cara: RW
 const ALICE = 'alice';
 const BOB = 'bob'; // no rights anywhere
+const CARA = 'cara'; // RW on the categorized channel only
 const RW = ['VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES', 'ADD_REACTIONS'];
 
-function meta(id: string, guildId: string, parentId?: string): ChannelMeta {
+function meta(id: string, guildId: string, parentId?: string, kind?: ChannelMeta['type']): ChannelMeta {
+  // Since #95 a parentId no longer implies a thread: pass kind to build a
+  // categorized text channel or a category entry.
+  const type = kind ?? (parentId ? 'thread' : 'text');
+  const isThread = type === 'thread';
   return {
-    id, name: id, type: parentId ? 'thread' : 'text', guildId,
-    isThread: !!parentId, parentId, archived: parentId ? false : undefined,
+    id, name: id, type, guildId,
+    isThread, parentId, archived: isThread ? false : undefined,
   };
 }
 
 const METAS: Record<string, ChannelMeta[]> = {
-  [G1]: [meta(OPEN, G1), meta(SECRET, G1), meta(THREAD_OPEN, G1, OPEN), meta(THREAD_SECRET, G1, SECRET)],
+  [G1]: [
+    meta(OPEN, G1), meta(SECRET, G1), meta(THREAD_OPEN, G1, OPEN), meta(THREAD_SECRET, G1, SECRET),
+    meta(CAT, G1, undefined, 'category'), meta(FILED, G1, CAT, 'text'),
+  ],
   [G2]: [meta(C2, G2)],
 };
 const ALL_METAS = [...METAS[G1], ...METAS[G2]];
@@ -60,10 +70,12 @@ function makeRelay() {
   writeFileSync(identityPath, JSON.stringify({ personas: [
     { id: ALICE, displayName: 'Alice', avatar: '', token: 'tok-a' },
     { id: BOB, displayName: 'Bob', avatar: '', token: 'tok-b' },
+    { id: CARA, displayName: 'Cara', avatar: '', token: 'tok-c' },
   ] }));
   writeFileSync(permissionsPath, JSON.stringify({ personas: {
     [ALICE]: { default: [], guilds: { [G1]: { default: [], channels: { [OPEN]: RW } } } },
     [BOB]: { default: [], guilds: {} },
+    [CARA]: { default: [], guilds: { [G1]: { default: [], channels: { [FILED]: RW } } } },
   } }));
 
   const config: RelayConfig = {
@@ -504,6 +516,30 @@ test('Discord-side channel create/update and resync respect the filter', async (
     } finally {
       METAS[G1].pop();
     }
+  } finally {
+    t.cleanup();
+  }
+});
+
+// ── categorized channels (#95, #99 review findings 3/4/6) ──
+
+test('a categorized text channel lists with its category id; caps and visibility key on the channel, not the category', async () => {
+  const t = makeRelay();
+  try {
+    const res = (await t.rpc(CARA, 'list_channels', { guildId: G1 })) as { channels: Array<{ id: string; parentId?: string; capabilities: string[]; type: string }> };
+    const ids = res.channels.map((c) => c.id).sort();
+    // The category grants cara nothing, so it is absent — and the child's
+    // parentId stays as an honest dangling id, not an invented value.
+    assert.deepEqual(ids, [FILED], 'only the channel with caps lists; the capless category does not');
+    const filed = res.channels.find((c) => c.id === FILED)!;
+    assert.equal(filed.parentId, CAT, 'the category id rides the entry');
+    assert.equal(filed.type, 'text');
+    assert.deepEqual([...filed.capabilities].sort(), [...RW].sort(), 'caps come from the channel grant, not the category');
+
+    // The ready directory agrees with the listing.
+    const ready = (await t.relay.buildReady(t.session(CARA))) as ReadyData;
+    assert.deepEqual(ready.channels.map((c) => c.id), [FILED]);
+    assert.equal(ready.channels[0].parentId, CAT);
   } finally {
     t.cleanup();
   }

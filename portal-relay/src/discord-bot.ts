@@ -45,7 +45,8 @@ export interface ChannelMeta {
   id: string;
   name: string | null;
   type: 'text' | 'voice' | 'category' | 'thread' | 'forum' | 'unknown';
-  /** Parent channel id for threads (where the webhook lives). */
+  /** Parent id: for threads the channel the thread lives under (where the
+   *  webhook lives); for other channels the category heading, if any. */
   parentId?: string;
   guildId: string | null;
   archived?: boolean;
@@ -731,7 +732,10 @@ export class DiscordBot implements WebhookOps, RoleOps {
       id: channel.id,
       name: 'name' in channel ? (channel.name ?? null) : null,
       type: mapChannelType(channel.type),
-      parentId: isThread ? ((channel as AnyThreadChannel).parentId ?? undefined) : undefined,
+      // For threads the channel they live under; for everything else the
+      // category heading, when one exists (issue #95: a flat listing can't
+      // otherwise tell a live room from one filed under an archive shelf).
+      parentId: channel.parentId ?? undefined,
       guildId,
       archived: isThread ? ((channel as AnyThreadChannel).archived ?? false) : undefined,
       isThread,
@@ -823,7 +827,8 @@ export class DiscordBot implements WebhookOps, RoleOps {
       id: String(raw.id),
       name: typeof raw.name === 'string' ? raw.name : null,
       type,
-      parentId: isThread && raw.parent_id ? String(raw.parent_id) : undefined,
+      // Same shape as metaOf: thread parent or category heading (#95).
+      parentId: raw.parent_id ? String(raw.parent_id) : undefined,
       guildId: String(raw.guild_id),
       archived: isThread ? !!raw.thread_metadata?.archived : undefined,
       isThread,

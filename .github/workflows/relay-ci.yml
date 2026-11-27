@@ -3,10 +3,11 @@ name: Relay CI
 # Type-checks the relay and runs its admin-panel tests: the admin API, the
 # slash commands, the permission and invite stores, and the panel's own client
 # scripts (test/admin-spa.test.ts loads portal-admin/*.js in node:vm). It also
-# runs the channel-creation gate tests, the voice tests, the invite claim tests,
-# the history cache tests and the tests that a reply clears the ping it
-# answers. The rest of the relay suite (the gateway's among it) is not run
-# here; the gateway logging test is known to be flaky.
+# runs the channel-creation gate tests, the voice tests, the invite claim
+# tests, the history cache tests, the tests that a reply clears the ping it
+# answers, and the channel-metadata and directory-filter pins (#99). The rest
+# of the relay suite (the gateway's among it) is not run here; the gateway
+# logging test is known to be flaky.
 
 on:
   pull_request:
@@ -72,7 +73,7 @@ jobs:
           npm ci
           npx tsc --noEmit -p .
 
-      # Later phases add their new admin test files to this list.
+      # Later phases add their new test files to this list.
       - name: Admin tests
         working-directory: portal-relay
         run: >-
@@ -83,6 +84,8 @@ jobs:
           test/permissions.test.ts
           test/invites.test.ts
           test/mint-invite.test.ts
+          test/channel-meta-parent.test.ts
+          test/directory-caps.test.ts
 
       # The gate on create_text_channel (#16): what lets a persona have the
       # shared bot create a channel.

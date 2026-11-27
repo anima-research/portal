@@ -271,7 +271,13 @@ outside any access role — what `/add` sets.
 - **Nothing is served that was not granted** (portal#27). The directory
   (`ready`, `list_guilds`, `list_channels`) is capability-filtered: guilds the
   persona holds some capability in, channels it holds at least one in (threads
-  follow their parent). Guild-level reads (`list_members`, `resolve_mentions`,
+  follow their parent). One deliberate asymmetry since portal#95: a channel's
+  `parentId` may name a category outside the persona's directory (a
+  category is listed exactly when the persona holds some capability on the
+  category itself; nothing flows up from the channels under it, so a
+  persona granted channel by channel sees no category entries). The id
+  alone is served — no name,
+  and every gate refuses a dangling id as a target. Guild-level reads (`list_members`, `resolve_mentions`,
   `list_roles`, `list_emojis`) are `FORBIDDEN` elsewhere; `set_typing` gates
   like `send_message`, `unreact` like `react`; identify-time subscriptions pass
   the `subscribe_channel` gate. And **every** delivery — addressed or ambient —
