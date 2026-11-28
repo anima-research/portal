@@ -1464,7 +1464,7 @@ export class Relay implements GatewayHooks {
         // parent are distinct pages (live invalidation already keys this way:
         // convert() reports a thread message's channelId as the thread id).
         const container = target.threadId ?? target.parentChannelId;
-const raw = await this.history.read({ channelId: container, limit, before, after, forward }, () =>
+        const raw = await this.history.read({ channelId: container, limit, before, after, forward }, () =>
           this.bot.fetchHistory(container, limit, before, after, forward),
         );
         const messages = raw.map((m) => this.buildPortalMessage(m).message);
