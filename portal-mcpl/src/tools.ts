@@ -187,9 +187,11 @@ const definitions: ToolDefinition[] = [
     description:
       'Fetch recent messages from a channel or thread. Page with before/after ' +
       '(exclusive cursors — a relay message id or a raw Discord snowflake): pass ' +
-      '`before` to scroll back, `after` to scroll forward. A channel\'s own history ' +
-      'holds none of its threads\' messages: to read a thread, pass its id as ' +
-      'threadId with its parent as channelId, or directly as channelId.',
+      '`before` to scroll back, `after` alone to scroll forward (the oldest page ' +
+      'just above the cursor; on an older relay, the newest page above it). ' +
+      'A channel\'s own history holds none of its threads\' messages: to read a ' +
+      'thread, pass its id as threadId with its parent as channelId, or directly ' +
+      'as channelId.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -205,10 +207,13 @@ const definitions: ToolDefinition[] = [
   {
     name: 'fetch_around',
     description:
-      'Fetch a window of messages centred on a message id — the older and newer ' +
-      'halves of context around it. Useful to expand context around a missed ' +
-      'mention or a referenced message. If the message is in a thread, target ' +
-      'that thread, as for fetch_history.',
+      'Fetch a window of messages around a message id — the older and newer ' +
+      'halves of context beside it. The anchor itself is excluded (both ' +
+      'cursors paginate exclusively); on an older relay the newer half may ' +
+      'be the channel\'s newest messages rather than the ones adjacent to ' +
+      'the anchor. Useful to expand context around a missed mention or a ' +
+      'referenced message. If the message is in a thread, target that ' +
+      'thread, as for fetch_history.',
     inputSchema: {
       type: 'object',
       properties: {

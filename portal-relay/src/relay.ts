@@ -1455,15 +1455,20 @@ export class Relay implements GatewayHooks {
         const before = this.cursorToSnowflake(p.before);
         const after = this.cursorToSnowflake(p.after);
         const limit = p.limit ?? 50;
+        // The forward walk (portal#98) is served only when asked for AND
+        // applicable; the echo below tells the caller which contract the
+        // messages follow, so a consumer that needs forward pagination can
+        // detect an older relay by its absence.
+        const forward = p.direction === 'forward' && !!after && !before;
         // The cache key is the actual container being read — a thread and its
         // parent are distinct pages (live invalidation already keys this way:
         // convert() reports a thread message's channelId as the thread id).
         const container = target.threadId ?? target.parentChannelId;
-        const raw = await this.history.read({ channelId: container, limit, before, after }, () =>
-          this.bot.fetchHistory(container, limit, before, after),
+        const raw = await this.history.read({ channelId: container, limit, before, after, forward }, () =>
+          this.bot.fetchHistory(container, limit, before, after, forward),
         );
         const messages = raw.map((m) => this.buildPortalMessage(m).message);
-        return { messages };
+        return { messages, ...(forward ? { forward: true as const } : {}) };
       }
       // Directory reads are capability-filtered like ready (issue #27): guilds
       // the persona has rights in, channels it holds a capability in. Guild-

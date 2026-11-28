@@ -127,3 +127,11 @@ test('a read still under way when another read of its place ends is overtaken by
   assert.equal((await c.read(page('chan'), next.fetch)).length, 2);
   assert.equal(next.calls(), 1, 'the overtaken page was not stored');
 });
+
+test('distinct keys for walk direction (portal#98)', async () => {
+  const c = new HistoryCache(5000, 500, () => 0);
+  await c.read(page('chan', 50, undefined, 'a1'), bot(1).fetch);
+  await c.read({ ...page('chan', 50, undefined, 'a1'), forward: true }, bot(2).fetch);
+  assert.equal((await c.read(page('chan', 50, undefined, 'a1'), cachedOnly)).length, 1);
+  assert.equal((await c.read({ ...page('chan', 50, undefined, 'a1'), forward: true }, cachedOnly)).length, 2);
+});
